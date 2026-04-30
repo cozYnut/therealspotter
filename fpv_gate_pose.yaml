@@ -1,0 +1,14 @@
+# fpv_gate_pose.yaml
+# YOLOv8 data config for FPV gates - Pose/Keypoint task
+
+path: /Users/eyalcozac/FPV DATA-SETS/datastuff/pose     # Pose dataset root
+
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+kpt_shape: [4, 3]
+flip_idx: [0, 1, 2, 3]
+
+nc: 2
+names: ['flagpole', 'square']

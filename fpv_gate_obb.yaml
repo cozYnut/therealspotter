@@ -1,0 +1,11 @@
+# fpv_gate_obb.yaml
+# YOLOv8 data config for FPV gates - OBB (Oriented Bounding Box) task
+
+path: ./datastuff/fpv_dataset/obb      # OBB dataset root
+
+train: images/train
+val: images/val
+test: images/test
+
+nc: 4
+names: ['square', 'arch', 'circle', 'flagpole']

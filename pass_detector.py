@@ -398,3 +398,39 @@ class PassDetector:
         for k in list(self._just_passed.keys()):
             return self._just_passed.pop(k)
         return None
+
+    def process_detection(det, frame_shape):
+        """Process OBB detection for pass detection"""
+        # Extract OBB parameters
+        x, y, w, h, rotation = det['x'], det['y'], det['w'], det['h'], det['rotation']
+        
+        # Create rotated bounding box
+        center = (x, y)
+        size = (w, h)
+        angle = rotation
+        
+        # Store OBB info alongside standard bbox
+        bbox_info = {
+            'center': center,
+            'size': size,
+            'rotation': angle,
+            'x': x,
+            'y': y,
+            'w': w,
+            'h': h,
+            'conf': det['conf'],
+            'cls': det['cls']
+        }
+        
+        return bbox_info
+
+    def check_gate_pass_obb(prev_det, curr_det, frame_center_x):
+        """Check if drone passed through OBB gate"""
+        # Account for rotation when calculating pass logic
+        prev_center = prev_det['center']
+        curr_center = curr_det['center']
+        
+        # Standard center-crossing logic (works with rotated boxes too)
+        crossed = (prev_center[0] - frame_center_x) * (curr_center[0] - frame_center_x) < 0
+        
+        return crossed

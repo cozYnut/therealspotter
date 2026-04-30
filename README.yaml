@@ -57,8 +57,8 @@ YT video demonstration: https://www.youtube.com/watch?v=6A2gmpzc6iU
 Work inside a Python virtual environment:
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+python3 -m venv my_env
+source my_env/bin/activate
 pip install -r requirements.txt
 
 
@@ -157,46 +157,60 @@ python pipeline_sanity_train_eval.py \
   --print-paths
 
 #evaluate (mAP and precision/recall scores)
-python pipeline_sanity_train_eval.py \
+##python pipeline_sanity_train_eval.py \
   --data-root ./datastuff/fpv_dataset \
   --data-yaml ./fpv_gate.yaml \
   --nc 4 \
   --weights runs/detect/fpv_gate_more_annot2/weights/best.pt \
   --eval-split test \
   --print-paths
+##
+python3 pipeline_sanity_train_eval.py  --data-root ./datastuff/fpv_dataset \
+  --data-yaml ./fpv_gate.yaml \
+  --nc 4 \
+  --train \
+  --epochs 50 \
+  --device mps \
+  --name fpv_gate_train
+
 
 #run just detector
-python3 inspect_gate_model_video.py \
-  --model runs/detect/train/weights/best.pt \
-  --video /path/to/test.mp4 \
-  --conf 0.25
+python3 inspect_gate_model_video.py 
+  --model runs/detect/fpv_gate_more_annot2/weights/best.pt \
+  --video '/Users/eyalcozac/FPV Videos/hdz_021.mp4' \
+  --conf 0.31
 
 
 #generate yolo dataset from videos (mp4):
-python fpv_pseudo_label.py \
-  --video_dir ./videos \
+python fpv_pseudo_label.py --video_dir /Users/eyalcozac/Documents/Code/GitHub/therealspotter/datastuff/Videos \
   --out_dir ./dataset \
   --yolo_model current_best_non_vocab.pt \
   --conf 0.25 \
   --maxdet 50 \
+  --obb \
   --min_area_ratio 0.002
 
 #visualize / manage labels on images:
-python visualize_fpvgates.py \ 
-  --images_dir datastuff/fpv_dataset/images/train \
+python visualize_fpvgates.py \
+  --images_dir datastuff/fpv_dataset/images/train \ 
   --labels_dir datastuff/fpv_dataset/labels/train \
   --max_images 4000
 
-#manual annotation tool
-python video_labeler_yolo.py \ 
-  --video ~/Downloads/1/Rosh.mp4 \
+python3 inspect_gate_model_video.py \
+  --model runs/detect/runs/detect/fpv_gate_train/weights/best.pt \
+  --video '/Users/eyalcozac/FPV Videos/hdz_021.mp4' \
+  --conf 0.25
+
+#manual annotation tool for YOLO:
+python video_labeler_yolo.py \
+  --video '/Users/eyalcozac/FPV Videos/hdz_006.mp4' \
   --out ./datastuff/fpv_dataset_labeled \
   --split train \
   --classes "square,arch,circle,flagpole" \
   --start 0 \
   --step 1 \
-  --resize 1280x720
-
+  --resize 1280x720 \
+  --obb
 
   #parameters that i often tune between tracks/video res/detector quality on a set of gates:
   aligned_shrink_reset_frac #how sensitive we are to gate that is already in "aligned" but moving away from it

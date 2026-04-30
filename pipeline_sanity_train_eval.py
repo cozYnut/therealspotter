@@ -34,7 +34,10 @@ from typing import List, Tuple, Optional
 
 # ultralytics must be installed in the venv you run this with
 from ultralytics import YOLO
+import yaml
 
+# Model configuration system
+from model_config import ModelRegistry, ModelType, ModelConfig
 
 # ----------------------------
 # Sanity checking
@@ -99,13 +102,18 @@ def sanity_split(data_root: str, split: str, nc: int, print_paths: bool = True) 
         for i, line in enumerate(txt.splitlines()):
             raw = line
             parts = line.strip().split()
-            if len(parts) != 5:
-                invalid_lines.append(InvalidLine(lab, i, "wrong column count (!= 5)", raw))
+            # Support multiple formats: BB (5 cols), OBB (6 cols), Pose (5 + kp×3)
+            valid_pose = (len(parts) >= 8 and (len(parts) - 5) % 3 == 0)
+            if not (len(parts) == 5 or len(parts) == 6 or valid_pose):
+                invalid_lines.append(InvalidLine(lab, i, "wrong column count (expected 5, 6, or 5+keypoints×3)", raw))
                 continue
 
             try:
                 cls = int(float(parts[0]))
-                x, y, w, h = map(float, parts[1:])
+                x, y, w, h = map(float, parts[1:5])
+                # Optional: angle for OBB format (6th column)
+                if len(parts) == 6:
+                    angle = float(parts[5])
             except Exception:
                 invalid_lines.append(InvalidLine(lab, i, "non-numeric values", raw))
                 continue
@@ -161,11 +169,23 @@ def run_train(
     device: str,
     project: str,
     name: str,
+    task: str = "detect",
 ) -> str:
     """
     Trains and returns best weights path.
     """
+    # Auto-select base model based on task if not explicitly provided
+    if not base_model:
+        if task == "obb":
+            base_model = "yolov8m-obb.pt"
+        elif task == "pose":
+            base_model = "yolov8n-pose.pt"
+        else:
+            base_model = "yolov8n.pt"
+    
+    # Initialize model normally - trainer will be detect trainer
     model = YOLO(base_model)
+    
     results = model.train(
         data=data_yaml,
         epochs=int(epochs),
@@ -174,6 +194,7 @@ def run_train(
         device=device,
         project=project,
         name=name,
+        task=task,
     )
 
     # Ultralytics convention: best.pt is in runs/<task>/<name>/weights/best.pt
@@ -196,7 +217,7 @@ def run_train(
     return best_pt
 
 
-def run_eval(weights: str, data_yaml: str, split: str, imgsz: int, batch: int, device: str):
+def run_eval(weights: str, data_yaml: str, split: str, imgsz: int, batch: int, device: str, task: str = "detect"):
     """
     Evaluates and prints precision/recall + mAP.
     """
@@ -207,6 +228,7 @@ def run_eval(weights: str, data_yaml: str, split: str, imgsz: int, batch: int, d
         imgsz=int(imgsz),
         batch=int(batch),
         device=device,
+        task=task,
     )
 
     # Ultralytics metrics object structure:
@@ -245,6 +267,40 @@ def run_eval(weights: str, data_yaml: str, split: str, imgsz: int, batch: int, d
             print(f"Recall   : {r}")
 
 
+# def train_model(args):
+#     """Train model (detect, obb, or pose)"""
+#     # Select base model based on task
+#     if args.task == "obb":
+#         base_model = "yolov8m-obb.pt"
+#     elif args.task == "pose":
+#         base_model = "yolov8n-pose.pt"
+#     else:
+#         base_model = "yolov8n.pt"
+    
+#     model = YOLO(base_model)
+    
+#     results = model.train(
+#         data=args.data_yaml,
+#         epochs=args.epochs,
+#         imgsz=args.imgsz,
+#         batch=args.batch,
+#         device=args.device,
+#         name=args.name,
+#         task=args.task
+#     )
+#     return results
+
+# def evaluate_model(args):
+#     """Evaluate model (detect, obb, or pose)"""
+#     model = YOLO(args.weights) 
+#     metrics = model.val(
+#         data=args.data_yaml,
+#         device=args.device,
+#         task=args.task
+#     )
+#     return metrics
+
+
 def main():
     ap = argparse.ArgumentParser(description="Sanity check -> (optional) train -> eval (precision/recall)")
 
@@ -257,7 +313,8 @@ def main():
 
     # training toggle
     ap.add_argument("--train", action="store_true", help="Actually train (if omitted, just sanity+eval)")
-    ap.add_argument("--base-model", default="yolov8n.pt", help="Base model or pretrained weights for training")
+    ap.add_argument("--task", default="detect", choices=["detect", "obb", "pose"], help="Task type: detect, obb, or pose (keypoint)")
+    ap.add_argument("--base-model", default="", help="Base model or pretrained weights for training (auto-selected if empty based on task)")
 
     # evaluation weights (used if --train is NOT set, or to override)
     ap.add_argument("--weights", default=None, help="Weights to evaluate (e.g., runs/detect/.../best.pt). If --train, ignored unless --eval-weights is set.")
@@ -271,7 +328,7 @@ def main():
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--device", default="", help="Ultralytics device string: '' (auto), 'cpu', '0', 'mps', etc.")
 
-    ap.add_argument("--project", default="runs/detect", help="Training output base folder")
+    ap.add_argument("--project", default="", help="Training output base folder (auto by task if empty)")
     ap.add_argument("--name", default="fpv_gate_train", help="Training run name")
 
     args = ap.parse_args()
@@ -283,6 +340,8 @@ def main():
     splits = [s.strip() for s in args.splits.split(",") if s.strip()]
     if not splits:
         splits = ["train", "val", "test"]
+    
+    project = args.project if args.project else ("runs/obb" if args.task == "obb" else "runs/pose" if args.task == "pose" else "runs/detect")
 
     # 1) sanity check
     print("Running sanity checks...")
@@ -308,8 +367,9 @@ def main():
             imgsz=args.imgsz,
             batch=args.batch,
             device=args.device,
-            project=args.project,
+            project=project,
             name=args.name,
+            task=args.task,
         )
         print(f"\nTraining complete. Best weights: {best_weights}")
 
@@ -339,6 +399,7 @@ def main():
         imgsz=args.imgsz,
         batch=args.batch,
         device=args.device,
+        task=args.task,
     )
 
     print("\nDone.")

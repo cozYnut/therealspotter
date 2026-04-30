@@ -8,8 +8,4 @@ val: images/val           # Validation images
 test: images/test           # Validation images
 
 nc: 4
-names:
-  - square
-  - arch
-  - circle
-  - flagpole
+names: ['square', 'arch', 'circle', 'flagpole']

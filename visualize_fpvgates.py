@@ -1,6 +1,7 @@
 import os
 import cv2
 import glob
+import numpy as np
 
 # --------------------------------------------------
 # Update this if you add / reorder classes in YAML
@@ -23,7 +24,12 @@ COLORS = [
 def load_yolo_labels(label_path, img_w, img_h):
     """
     Load YOLO-format labels and convert to pixel coordinates
-    Returns: list of (class_id, x1, y1, x2, y2)
+    Supports three formats:
+    - Standard YOLO (5 values): class_id x_center y_center width height
+    - OBB (6 values): class_id x_center y_center width height angle
+    - Pose/Keypoints (5 + kp×3): class_id x_center y_center width height kpt_x kpt_y kpt_conf ...
+    
+    Returns: list of dicts with appropriate keys for each type
     """
     boxes = []
     if not os.path.exists(label_path):
@@ -32,20 +38,125 @@ def load_yolo_labels(label_path, img_w, img_h):
     with open(label_path, "r") as f:
         for line in f:
             parts = line.strip().split()
-            if len(parts) != 5:
-                continue
-
-            class_id, x_center, y_center, width, height = map(float, parts)
-
-            x1 = int((x_center - width / 2) * img_w)
-            y1 = int((y_center - height / 2) * img_h)
-            x2 = int((x_center + width / 2) * img_w)
-            y2 = int((y_center + height / 2) * img_h)
-
-            boxes.append((int(class_id), x1, y1, x2, y2))
+            
+            # Standard YOLO format: class_id x_center y_center width height
+            if len(parts) == 5:
+                class_id, x_center, y_center, width, height = map(float, parts)
+                x1 = int((x_center - width / 2) * img_w)
+                y1 = int((y_center - height / 2) * img_h)
+                x2 = int((x_center + width / 2) * img_w)
+                y2 = int((y_center + height / 2) * img_h)
+                boxes.append({
+                    'type': 'standard',
+                    'class_id': int(class_id),
+                    'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2
+                })
+            # OBB format: class_id x_center y_center width height angle
+            elif len(parts) == 6:
+                class_id, x_center, y_center, width, height, angle = map(float, parts)
+                boxes.append({
+                    'type': 'obb',
+                    'class_id': int(class_id),
+                    'x_center': int(x_center * img_w),
+                    'y_center': int(y_center * img_h),
+                    'width': int(width * img_w),
+                    'height': int(height * img_h),
+                    'angle': float(angle)
+                })
+            # Pose/Keypoint format: class_id x_center y_center width height kpt_x kpt_y kpt_conf ...
+            elif len(parts) >= 8 and (len(parts) - 5) % 3 == 0:
+                class_id, x_center, y_center, width, height = map(float, parts[:5])
+                x1 = int((x_center - width / 2) * img_w)
+                y1 = int((y_center - height / 2) * img_h)
+                x2 = int((x_center + width / 2) * img_w)
+                y2 = int((y_center + height / 2) * img_h)
+                
+                # Extract keypoints (x, y, confidence triplets)
+                keypoints = []
+                for j in range(5, len(parts), 3):
+                    if j + 2 < len(parts):
+                        kpt_x = float(parts[j]) * img_w
+                        kpt_y = float(parts[j + 1]) * img_h
+                        kpt_conf = float(parts[j + 2])
+                        keypoints.append({'x': int(kpt_x), 'y': int(kpt_y), 'conf': kpt_conf})
+                
+                boxes.append({
+                    'type': 'pose',
+                    'class_id': int(class_id),
+                    'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
+                    'keypoints': keypoints
+                })
 
     return boxes
 
+
+def _draw_obb(img, x_center, y_center, width, height, angle, color, thickness=2):
+    """
+    Draw an oriented bounding box (OBB) on the image.
+    Angle is in degrees (0-180 or -90 to 90).
+    """
+    # Convert angle to radians
+    angle_rad = np.radians(angle)
+    
+    # Create the four corners of the rotated rectangle
+    cos_a = np.cos(angle_rad)
+    sin_a = np.sin(angle_rad)
+    
+    # Half dimensions
+    hw = width / 2
+    hh = height / 2
+    
+    # Corners relative to center (before rotation)
+    corners_local = np.array([
+        [-hw, -hh],
+        [hw, -hh],
+        [hw, hh],
+        [-hw, hh]
+    ])
+    
+    # Rotation matrix
+    rotation_matrix = np.array([
+        [cos_a, -sin_a],
+        [sin_a, cos_a]
+    ])
+    
+    # Apply rotation and translation
+    corners_rotated = corners_local @ rotation_matrix.T
+    corners = corners_rotated + np.array([x_center, y_center])
+    corners = corners.astype(np.int32)
+    
+    # Draw the rotated rectangle
+    cv2.polylines(img, [corners], isClosed=True, color=color, thickness=thickness)
+
+
+def _draw_pose(img, x1, y1, x2, y2, keypoints, color, thickness=2):
+    """
+    Draw a pose/keypoint annotation on the image.
+    - Draws bounding box around the object
+    - Draws keypoints as circles with confidence coloring
+    - Draws skeleton connections if applicable
+    """
+    # Draw bounding box
+    cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+    
+    # Draw keypoints
+    for kpt in keypoints:
+        x = kpt['x']
+        y = kpt['y']
+        conf = kpt['conf']
+        
+        # Color keypoints by confidence: high confidence = brighter, low = dimmer
+        if conf > 0.7:
+            kpt_color = (0, 255, 0)  # Green - high confidence
+        elif conf > 0.3:
+            kpt_color = (0, 255, 255)  # Yellow - medium confidence
+        else:
+            kpt_color = (0, 0, 255)  # Red - low confidence
+        
+        # Draw circle for keypoint
+        cv2.circle(img, (x, y), 4, kpt_color, -1)
+        # Draw outline
+        cv2.circle(img, (x, y), 4, color, 1)
 
 def _draw_help_overlay(img):
     """
@@ -101,15 +212,33 @@ def visualize_dataset(images_dir, labels_dir, max_images=50):
         h, w = img.shape[:2]
         boxes = load_yolo_labels(label_path, w, h)
 
-        for class_id, x1, y1, x2, y2 in boxes:
+        for box in boxes:
+            class_id = box['class_id']
             color = COLORS[class_id % len(COLORS)]
             class_name = CLASS_NAMES[class_id] if class_id < len(CLASS_NAMES) else f"id{class_id}"
 
-            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+            if box['type'] == 'standard':
+                x1, y1, x2, y2 = box['x1'], box['y1'], box['x2'], box['y2']
+                cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+                label_x, label_y = x1, max(20, y1 - 5)
+            elif box['type'] == 'obb':
+                x_center = box['x_center']
+                y_center = box['y_center']
+                width = box['width']
+                height = box['height']
+                angle = box['angle']
+                _draw_obb(img, x_center, y_center, width, height, angle, color, thickness=2)
+                label_x, label_y = x_center, max(20, y_center - 5)
+            elif box['type'] == 'pose':
+                x1, y1, x2, y2 = box['x1'], box['y1'], box['x2'], box['y2']
+                keypoints = box['keypoints']
+                _draw_pose(img, x1, y1, x2, y2, keypoints, color, thickness=2)
+                label_x, label_y = x1, max(20, y1 - 5)
+            
             cv2.putText(
                 img,
                 f"{class_name} ({class_id})",
-                (x1, max(20, y1 - 5)),
+                (label_x, label_y),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
                 color,

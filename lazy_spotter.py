@@ -23,6 +23,9 @@ from pass_detector import PassDetector
 # GateDB (NEW learn=append-to-index, race=match-only)
 from gate_db import GateDB, build_gate_db_panel, compute_track_gate_hints, build_race_stats_panel
 
+# Model configuration system
+from model_config import ModelRegistry, ModelType, ModelConfig
+
 
 # ============================================================
 # DEBUG VISUALIZATION SWITCH
@@ -793,9 +796,16 @@ def main():
     parser.add_argument("--max-candidates", type=int, default=10, help="Max detections per frame after filtering/sort")
     parser.add_argument("--min-type-score", type=float, default=0.20, help="Min detector confidence to accept class; else NONE")
 
-    parser.add_argument("--det-model", type=str, required=True, help="Path to your trained YOLO .pt model")
-    parser.add_argument("--det-conf", type=float, default=0.25, help="YOLO confidence threshold")
-    parser.add_argument("--det-maxdet", type=int, default=50, help="YOLO max detections per frame")
+    # Model selection (new unified model configuration)
+    parser.add_argument("--model", type=str, default="fpv_gate_bb", 
+                       help="Model key from registry (e.g., 'fpv_gate_bb', 'fpv_gate_obb', 'yolov8n'). "
+                            "Use --list-models to see available options.")
+    parser.add_argument("--list-models", action="store_true", help="List all available models and exit")
+    
+    # Legacy arguments (for backwards compatibility)
+    parser.add_argument("--det-model", type=str, default=None, help="[DEPRECATED] Use --model instead. Path to YOLO .pt model")
+    parser.add_argument("--det-conf", type=float, default=None, help="YOLO confidence threshold (overrides model defaults)")
+    parser.add_argument("--det-maxdet", type=int, default=None, help="YOLO max detections per frame (overrides model defaults)")
 
     parser.add_argument("--iou-match", type=float, default=0.3, help="IOU association threshold")
     parser.add_argument("--ttl-seconds", type=float, default=0.3, help="Track TTL in seconds")
@@ -824,7 +834,56 @@ def main():
 
     args = parser.parse_args()
 
-    det = YOLO(args.det_model)
+    # Handle --list-models
+    if args.list_models:
+        print("Available Models:")
+        for key, desc in ModelRegistry.list_available_models().items():
+            print(f"  {key}: {desc}")
+        print("\nAll Registered Models (may not exist):")
+        for key, desc in ModelRegistry.list_models().items():
+            print(f"  {key}: {desc}")
+        exit(0)
+    
+    # Load model configuration
+    if args.det_model:
+        # Legacy: direct path provided
+        print(f"[WARNING] Using legacy --det-model argument. Consider using --model with registry key instead.")
+        model_config = ModelConfig(
+            model_type=ModelType.BB,
+            name="Custom Model",
+            description="Custom model loaded from path",
+            model_path=args.det_model,
+            task="detect",
+            has_rotation=False,
+            has_keypoints=False,
+            default_conf=args.det_conf or 0.25,
+            default_maxdet=args.det_maxdet or 50,
+        )
+    else:
+        # New: use registry
+        model_config = ModelRegistry.get_model(args.model)
+        if model_config is None:
+            print(f"[ERROR] Model '{args.model}' not found in registry.")
+            print("Available models:")
+            for key, desc in ModelRegistry.list_available_models().items():
+                print(f"  {key}: {desc}")
+            exit(1)
+        
+        if not model_config.exists():
+            print(f"[ERROR] Model file not found: {model_config.model_path}")
+            exit(1)
+    
+    # Override confidence/maxdet if provided
+    if args.det_conf is not None:
+        model_config.default_conf = args.det_conf
+    if args.det_maxdet is not None:
+        model_config.default_maxdet = args.det_maxdet
+    
+    print(f"Loading model: {model_config.name} ({model_config.model_type.value})")
+    print(f"  Path: {model_config.model_path}")
+    print(f"  Task: {model_config.task}")
+
+    det = YOLO(model_config.model_path)
     names = _get_yolo_names(det)
 
     tracker = TimeTracker(
@@ -932,25 +991,67 @@ def main():
 
         H, W = frame.shape[:2]
 
-        res = det(frame, conf=args.det_conf, verbose=False, max_det=int(args.det_maxdet))[0]
+        # Run detection using model config
+        res = det(frame, conf=model_config.default_conf, verbose=False, max_det=int(model_config.default_maxdet))[0]
 
         typed: List[dict] = []
-        for b in res.boxes:
-            x1, y1, x2, y2 = map(int, b.xyxy[0])
-            bb = clamp_bbox((x1, y1, x2, y2), W, H)
-
-            conf = float(b.conf[0]) if b.conf is not None else 0.0
-            cls_id = int(b.cls[0]) if b.cls is not None else -1
-            cls_name = _cls_to_name(cls_id, names)
-
-            gate_type = cls_name if conf >= args.min_type_score else "NONE"
-
-            typed.append({
-                "bbox": bb,
-                "det_conf": conf,
-                "type": gate_type,
-                "type_score": conf,
-            })
+        
+        # Process results based on model type
+        if model_config.model_type == ModelType.OBB and hasattr(res, 'obb') and res.obb is not None:
+            # OBB detections (oriented bounding boxes with rotation)
+            for b in res.obb:
+                # OBB format: xyxy + rotation
+                x1, y1, x2, y2 = map(int, b.xyxy[0])
+                bb = clamp_bbox((x1, y1, x2, y2), W, H)
+                
+                conf = float(b.conf[0]) if b.conf is not None else 0.0
+                cls_id = int(b.cls[0]) if b.cls is not None else -1
+                cls_name = _cls_to_name(cls_id, names)
+                
+                gate_type = cls_name if conf >= args.min_type_score else "NONE"
+                
+                typed.append({
+                    "bbox": bb,
+                    "det_conf": conf,
+                    "type": gate_type,
+                    "type_score": conf,
+                })
+        elif model_config.model_type == ModelType.KEYPOINTS and hasattr(res, 'keypoints') and res.keypoints is not None:
+            # Keypoint detections (pose estimation)
+            for b in res.boxes:
+                x1, y1, x2, y2 = map(int, b.xyxy[0])
+                bb = clamp_bbox((x1, y1, x2, y2), W, H)
+                
+                conf = float(b.conf[0]) if b.conf is not None else 0.0
+                cls_id = int(b.cls[0]) if b.cls is not None else -1
+                cls_name = _cls_to_name(cls_id, names)
+                
+                gate_type = cls_name if conf >= args.min_type_score else "NONE"
+                
+                typed.append({
+                    "bbox": bb,
+                    "det_conf": conf,
+                    "type": gate_type,
+                    "type_score": conf,
+                })
+        else:
+            # Standard BB detections (bounding boxes)
+            for b in res.boxes:
+                x1, y1, x2, y2 = map(int, b.xyxy[0])
+                bb = clamp_bbox((x1, y1, x2, y2), W, H)
+                
+                conf = float(b.conf[0]) if b.conf is not None else 0.0
+                cls_id = int(b.cls[0]) if b.cls is not None else -1
+                cls_name = _cls_to_name(cls_id, names)
+                
+                gate_type = cls_name if conf >= args.min_type_score else "NONE"
+                
+                typed.append({
+                    "bbox": bb,
+                    "det_conf": conf,
+                    "type": gate_type,
+                    "type_score": conf,
+                })
 
         typed_sorted = sorted(typed, key=lambda d: d["det_conf"], reverse=True)
         typed_topk = typed_sorted[:max(1, args.max_candidates)]

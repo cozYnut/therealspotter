@@ -5,6 +5,9 @@ from typing import Dict, Tuple, List
 import cv2
 from ultralytics import YOLO
 
+# Model configuration system
+from model_config import ModelRegistry, ModelType, ModelConfig
+
 
 # --- Default class-name mapping (edit if your training used different names) ---
 # If your .pt has embedded names, we’ll prefer them automatically.
@@ -50,10 +53,46 @@ def draw_legend(frame, class_names: Dict[int, str], colors: Dict[str, Tuple[int,
         y += 18
 
 
+def run_detection_on_video(model_path, video_path, conf=0.25):
+    """Run OBB detection on video"""
+    model = YOLO(model_path)
+    cap = cv2.VideoCapture(video_path)
+    
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # Run OBB inference
+        results = model(frame, conf=conf)
+        
+        for r in results:
+            if r.obb is not None:
+                # Draw OBB boxes
+                for box_data in r.obb.data:
+                    x, y, w, h, rotation = box_data[:5].cpu().numpy()
+                    
+                    center = (int(x), int(y))
+                    size = (int(w), int(h))
+                    rect = cv2.RotatedRect(center, size, float(rotation))
+                    box_points = cv2.boxPoints(rect).astype(int)
+                    
+                    cv2.polylines(frame, [box_points], True, (0, 255, 0), 2)
+        
+        cv2.imshow('OBB Detection', frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+    
+    cap.release()
+    cv2.destroyAllWindows()
+
+
 def main():
-    ap = argparse.ArgumentParser("Inspect trained FPV gate YOLO model on video (frame-by-frame)")
-    ap.add_argument("--model", required=True, help="Path to trained .pt")
-    ap.add_argument("--video", required=True, help="Path to input .mp4/.mov etc")
+    ap = argparse.ArgumentParser("Inspect trained YOLO model on video (frame-by-frame)")
+    ap.add_argument("--model", type=str, default="fpv_gate_bb", 
+                   help="Model key from registry (e.g., 'fpv_gate_bb', 'fpv_gate_obb') or direct path to .pt file")
+    ap.add_argument("--video", type=str, default=None, help="Path to input .mp4/.mov etc")
+    ap.add_argument("--list-models", action="store_true", help="List all available models and exit")
     ap.add_argument("--conf", type=float, default=0.25, help="Confidence threshold")
     ap.add_argument("--iou", type=float, default=0.45, help="NMS IoU threshold")
     ap.add_argument("--imgsz", type=int, default=640, help="Inference image size (ultralytics imgsz)")
@@ -65,8 +104,33 @@ def main():
     ap.add_argument("--play-fps", type=float, default=20.0, help="FPS while playing")
 
     args = ap.parse_args()
+    
+    # Handle --list-models
+    if args.list_models:
+        print("Available Models:")
+        for key, desc in ModelRegistry.list_available_models().items():
+            print(f"  {key}: {desc}")
+        exit(0)
+    
+    # Check video is provided
+    if not args.video:
+        print("[ERROR] --video is required (or use --list-models)")
+        exit(1)
+    
+    # Load model configuration
+    model_config = ModelRegistry.get_model(args.model)
+    if model_config is None:
+        # Assume it's a direct path
+        print(f"Model '{args.model}' not in registry, assuming direct path...")
+        model_path = args.model
+        model_config = None
+    else:
+        if not model_config.exists():
+            print(f"[ERROR] Model file not found: {model_config.model_path}")
+            exit(1)
+        model_path = model_config.model_path
 
-    model = YOLO(args.model)
+    model = YOLO(model_path)
 
     # If you want to force a mapping (in case your model names don’t match), edit DEFAULT_CLASS_NAMES above.
     class_names = get_class_names(model, override=None)
@@ -123,8 +187,56 @@ def main():
             verbose=False,
         )[0]
 
-        # Draw detections
-        if res.boxes is not None and len(res.boxes) > 0:
+        # Draw detections - auto-detect model type from results
+        if hasattr(res, 'obb') and res.obb is not None and len(res.obb) > 0:
+            # OBB format: [x_center, y_center, width, height, rotation, conf, cls_id]
+            for obb_box in res.obb.data:
+                try:
+                    x_center, y_center, width, height, rotation = obb_box[:5].cpu().numpy()
+                    conf = float(obb_box[5])
+                    cls_id = int(obb_box[6])
+                except (IndexError, AttributeError):
+                    # Fallback in case tensor layout differs
+                    continue
+                
+                name = class_names.get(cls_id, f"class_{cls_id}")
+                color = DEFAULT_COLORS.get(name, DEFAULT_COLORS["unknown"])
+                
+                # Draw rotated rectangle
+                center = (int(x_center), int(y_center))
+                size = (int(width), int(height))
+                rect = cv2.RotatedRect(center, size, float(rotation))
+                box_points = cv2.boxPoints(rect).astype(int)
+                cv2.polylines(frame, [box_points], True, color, 3)
+                
+                label = f"{name} {conf:.2f} (id={cls_id})"
+                cv2.putText(frame, label, (int(x_center), max(18, int(y_center) - 30)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+        
+        elif hasattr(res, 'keypoints') and res.keypoints is not None and len(res.keypoints) > 0:
+            # Pose/Keypoint format - draw both boxes and keypoints
+            for b in res.boxes:
+                x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
+                conf = float(b.conf[0])
+                cls_id = int(b.cls[0])
+
+                name = class_names.get(cls_id, f"class_{cls_id}")
+                color = DEFAULT_COLORS.get(name, DEFAULT_COLORS["unknown"])
+
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+                label = f"{name} {conf:.2f} (id={cls_id})"
+                cv2.putText(frame, label, (x1, max(18, y1 - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+            
+            # Draw keypoints if available
+            for keypoint_set in res.keypoints.data:
+                for kp in keypoint_set:
+                    x, y, conf = kp
+                    if conf > 0.5:  # Only draw if confidence is high
+                        cv2.circle(frame, (int(x), int(y)), 5, (0, 255, 255), -1)
+        
+        elif res.boxes is not None and len(res.boxes) > 0:
+            # Standard boxes (Bounding Box model)
             for b in res.boxes:
                 x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
                 conf = float(b.conf[0])

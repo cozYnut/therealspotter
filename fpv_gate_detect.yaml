@@ -1,0 +1,11 @@
+# fpv_gate_detect.yaml
+# YOLOv8 data config for FPV gates - Detection task
+
+path: ./datastuff/fpv_dataset/detect      # Detection dataset root
+
+train: images/train
+val: images/val
+test: images/test
+
+nc: 4
+names: ['square', 'arch', 'circle', 'flagpole']

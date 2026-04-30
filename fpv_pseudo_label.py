@@ -28,6 +28,9 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+# Model configuration system
+from model_config import ModelRegistry, ModelType, ModelConfig, detection_to_yolo_line
+
 
 # -----------------------------
 # FS helpers
@@ -88,13 +91,34 @@ def yolo_line_from_bbox(
     img_w: int,
     img_h: int,
     class_id: int,
+    use_obb: bool = False,
+    rotation_angle: float = 0.0,
 ) -> str:
+    """
+    Generate YOLO format label line from bounding box.
+    
+    Args:
+        bbox: (x1, y1, x2, y2) in pixel coordinates
+        img_w, img_h: Image dimensions
+        class_id: Class index
+        use_obb: If True, output 6-column OBB format with rotation angle
+        rotation_angle: Rotation angle in degrees (0-360, 0=0°, counterclockwise positive)
+    
+    Returns:
+        YOLO label line (5 columns standard or 6 columns OBB)
+    """
     x1, y1, x2, y2 = bbox
     x_center = ((x1 + x2) / 2.0) / float(img_w)
     y_center = ((y1 + y2) / 2.0) / float(img_h)
     width = (x2 - x1) / float(img_w)
     height = (y2 - y1) / float(img_h)
-    return f"{int(class_id)} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}"
+    
+    if use_obb:
+        # Normalize rotation angle to [0, 360)
+        angle = float(rotation_angle) % 360.0
+        return f"{int(class_id)} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f} {angle:.6f}"
+    else:
+        return f"{int(class_id)} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}"
 
 
 # -----------------------------
@@ -183,9 +207,8 @@ def process_video(
     out_image_dir: str,
     out_label_dir: str,
     model: YOLO,
+    model_config: ModelConfig,
     *,
-    conf: float,
-    maxdet: int,
     single_class: bool,
     min_area_ratio: float,
     aspect_min: float,
@@ -224,8 +247,7 @@ def process_video(
             continue
 
         img_h, img_w = frame.shape[:2]
-
-        dets = detect_with_ultralytics(model, frame, conf=conf, maxdet=maxdet)
+        dets = detect_with_ultralytics(model, frame, conf=model_config.default_conf, maxdet=model_config.default_maxdet)
         dets = filter_dets(
             dets,
             img_w=img_w,
@@ -255,14 +277,14 @@ def process_video(
         txt_filename = f"{frame_idx:06d}.txt"
         img_path = os.path.join(out_image_dir, img_filename)
         txt_path = os.path.join(out_label_dir, txt_filename)
-
         cv2.imwrite(img_path, frame)
 
         # Write multiple lines (YOLO multi-object labels)
         lines = []
         for d in dets:
             cls_out = 0 if single_class else int(d["cls"])
-            lines.append(yolo_line_from_bbox(d["bbox"], img_w, img_h, cls_out))
+            # Use the model_config-aware label generation
+            lines.append(detection_to_yolo_line(d["bbox"], img_w, img_h, cls_out, model_config))
 
         with open(txt_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
@@ -273,10 +295,7 @@ def process_video(
         frame_idx += 1
 
     cap.release()
-    return saved_count
-
-
-# -----------------------------
+    return saved_count# -----------------------------
 # Train/val split by videos
 # -----------------------------
 def list_videos(video_dir: str) -> List[str]:
@@ -291,12 +310,20 @@ def list_videos(video_dir: str) -> List[str]:
 def main():
     parser = argparse.ArgumentParser(description="FPV pseudo-label dataset generator (multi-box per frame, YOLO format)")
 
-    parser.add_argument("--video_dir", required=True, help="Folder with videos")
-    parser.add_argument("--out_dir", required=True, help="Output dataset folder")
-    parser.add_argument("--yolo_model", default="yolov8n.pt", help="Ultralytics YOLO model path (.pt)")
+    parser.add_argument("--video_dir", type=str, default=None, help="Folder with videos")
+    parser.add_argument("--out_dir", type=str, default=None, help="Output dataset folder")
+    
+    # Model selection (new unified model configuration)
+    parser.add_argument("--model", type=str, default="yolov8n", 
+                       help="Model key from registry (e.g., 'yolov8n', 'yolov8m', 'yolov8n-pose'). "
+                            "Use --list-models to see available options.")
+    parser.add_argument("--list-models", action="store_true", help="List all available models and exit")
+    
+    # Legacy argument (for backwards compatibility)
+    parser.add_argument("--yolo_model", type=str, default=None, help="[DEPRECATED] Use --model instead. YOLO model path (.pt)")
 
-    parser.add_argument("--conf", type=float, default=0.25, help="YOLO confidence threshold")
-    parser.add_argument("--maxdet", type=int, default=50, help="YOLO max detections per frame")
+    parser.add_argument("--conf", type=float, default=None, help="YOLO confidence threshold (overrides model defaults)")
+    parser.add_argument("--maxdet", type=int, default=None, help="YOLO max detections per frame (overrides model defaults)")
 
     parser.add_argument("--single_class", action="store_true", help="Write all labels as class 0 (single class dataset)")
     parser.add_argument("--train_split", type=float, default=0.8, help="Train split fraction by videos (sorted order)")
@@ -319,6 +346,18 @@ def main():
 
     args = parser.parse_args()
 
+    # Handle --list-models
+    if args.list_models:
+        print("Available Models:")
+        for key, desc in ModelRegistry.list_available_models().items():
+            print(f"  {key}: {desc}")
+        exit(0)
+    
+    # Check required arguments
+    if not args.video_dir or not args.out_dir:
+        print("[ERROR] --video_dir and --out_dir are required (or use --list-models)")
+        exit(1)
+    
     # Setup output folders
     images_train = os.path.join(args.out_dir, "images", "train")
     labels_train = os.path.join(args.out_dir, "labels", "train")
@@ -330,13 +369,59 @@ def main():
     mkdir(images_val)
     mkdir(labels_val)
 
+    # Handle --list-models
+    if args.list_models:
+        print("Available Models:")
+        for key, desc in ModelRegistry.list_available_models().items():
+            print(f"  {key}: {desc}")
+        exit(0)
+    
+    # Load model configuration
+    if args.yolo_model:
+        # Legacy: direct path provided
+        print(f"[WARNING] Using legacy --yolo_model argument. Consider using --model with registry key instead.")
+        model_config = ModelConfig(
+            model_type=ModelType.BB,
+            name="Custom Model",
+            description="Custom model loaded from path",
+            model_path=args.yolo_model,
+            task="detect",
+            has_rotation=False,
+            has_keypoints=False,
+            default_conf=args.conf or 0.25,
+            default_maxdet=args.maxdet or 50,
+        )
+    else:
+        # New: use registry
+        model_config = ModelRegistry.get_model(args.model)
+        if model_config is None:
+            print(f"[ERROR] Model '{args.model}' not found in registry.")
+            print("Available models:")
+            for key, desc in ModelRegistry.list_available_models().items():
+                print(f"  {key}: {desc}")
+            exit(1)
+        
+        if not model_config.exists():
+            print(f"[ERROR] Model file not found: {model_config.model_path}")
+            exit(1)
+    
+    # Override confidence/maxdet if provided
+    if args.conf is not None:
+        model_config.default_conf = args.conf
+    if args.maxdet is not None:
+        model_config.default_maxdet = args.maxdet
+    
+    print(f"Loading model: {model_config.name} ({model_config.model_type.value})")
+    print(f"  Path: {model_config.model_path}")
+    print(f"  Task: {model_config.task}")
+
     videos = list_videos(args.video_dir)
     if not videos:
         raise RuntimeError(f"No videos found in {args.video_dir}")
 
     n_train = int(len(videos) * float(args.train_split))
 
-    model = YOLO(args.yolo_model)
+    model = YOLO(model_config.model_path)
 
     total_saved = 0
     for i, vid in enumerate(videos):
@@ -349,8 +434,7 @@ def main():
             out_image_dir=out_img_dir,
             out_label_dir=out_lbl_dir,
             model=model,
-            conf=float(args.conf),
-            maxdet=int(args.maxdet),
+            model_config=model_config,
             single_class=bool(args.single_class),
             min_area_ratio=float(args.min_area_ratio),
             aspect_min=float(args.aspect_min),
