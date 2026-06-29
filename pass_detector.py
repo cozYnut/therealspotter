@@ -2,6 +2,8 @@
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, Any
 
+import numpy as np
+
 
 def _center(b: Tuple[int, int, int, int]) -> Tuple[float, float]:
     x1, y1, x2, y2 = b
@@ -22,6 +24,56 @@ def _is_flag(t: str) -> bool:
     return ("flag" in t) or ("pole" in t)
 
 
+def detect_camera_edges(frame: np.ndarray, black_thresh: int = 15) -> Tuple[float, float]:
+    """
+    Scan the first video frame column-by-column to find where real camera
+    content starts and ends (handles 4:3-in-16:9 black bar letterboxing).
+    Returns (left_norm, right_norm) in [0.0, 1.0].
+    Falls back to (0.0, 1.0) if no black bars are detected.
+    """
+    gray = frame if frame.ndim == 2 else frame.mean(axis=2)
+    W = gray.shape[1]
+    col_means = gray.mean(axis=0)
+
+    left = 0
+    for i in range(W):
+        if col_means[i] > black_thresh:
+            left = i
+            break
+
+    right = W - 1
+    for i in range(W - 1, -1, -1):
+        if col_means[i] > black_thresh:
+            right = i
+            break
+
+    return (float(left) / W, float(right) / W)
+
+
+def _count_edges_near_real_frame(
+    x1: int, y1: int, x2: int, y2: int,
+    frame_w: int, frame_h: int,
+    cam_left_norm: float, cam_right_norm: float,
+    tol: float,
+) -> int:
+    """
+    Count how many of the 4 bbox edges are within tol (as a fraction of frame
+    dimensions) of the real camera boundary. Left/right edges account for black
+    bars; top/bottom use the full frame height.
+    """
+    cam_left_px  = cam_left_norm  * frame_w
+    cam_right_px = cam_right_norm * frame_w
+    tol_px_x = tol * frame_w
+    tol_px_y = tol * frame_h
+
+    count = 0
+    if x1 <= cam_left_px  + tol_px_x:  count += 1
+    if x2 >= cam_right_px - tol_px_x:  count += 1
+    if y1 <= tol_px_y:                  count += 1
+    if y2 >= frame_h - tol_px_y:       count += 1
+    return count
+
+
 @dataclass
 class TrackPassState:
     track_id: int
@@ -35,9 +87,8 @@ class TrackPassState:
     last_cx: float = 0.0
     last_cy: float = 0.0
 
-    # flag heuristics (normalized x span)
-    min_cx: float = 1e9
-    max_cx: float = -1e9
+    # flag heuristic: was the flag ever near frame center while close enough?
+    flag_was_centered: bool = False
 
     # cooldown / pass bookkeeping
     passed_time: float = 0.0
@@ -66,6 +117,9 @@ class TrackPassState:
     area_vel_ema: float = 0.0      # smoothed velocity
     aligned_area_ratio: float = 0.0
     aligned_time: float = 0.0
+    aligned_frames: int = 0
+    gate_area_peaked: bool = False
+    gate_peaked_area_ratio: float = 0.0
 
 
 class PassDetector:
@@ -83,33 +137,47 @@ class PassDetector:
 
     def __init__(
         self,
-        min_track_score: float = 0.22,
-        min_area_ratio: float = 0.030,     # gate is "close enough" (3% of frame is typical)
-        center_tol: float = 0.18,          # normalized distance to center for "aligned"
-        disappear_timeout: float = 0.25,   # seconds after alignment to count disappearance as pass
-        flag_cross_min_frac: float = 0.45, # flag center should span this fraction of width to count as wrap
+        min_track_score: float = 0.2,
+        min_area_ratio: float = 0.03,
+        center_tol: float = 0.51,
+        disappear_timeout: float = 0.09,
+
+        # flagpole pass knobs
+        flag_center_tol: float = 0.15,
+        flag_edge_tol: float = 0.11,
+        flag_min_edges: int = 2,
 
         # cooldown knobs
-        pass_cooldown_sec: float = 0.6,
-        type_cooldown_sec: float = 0.6,
-        track_cooldown_sec: float = 5.5,
+        pass_cooldown_sec: float = 0.09,
+        type_cooldown_sec: float = 0.09,
+        track_cooldown_sec: float = 0.2,
 
         # behavior switches
         ignore_flagpoles: bool = False,
 
-        # ----------------------------
-        # NEW: growth-based alignment knobs
-        # ----------------------------
-        area_vel_ema_alpha: float = 0.35,     # smoothing for area velocity
-        min_area_vel_ema: float = 0.015,      # min growth rate (area_ratio/sec) to arm alignment
-        aligned_shrink_reset_frac: float = 0.14,  # if area drops by this fraction from aligned_area => reset to idle
-        aligned_max_age_sec: float = 10,     # if aligned too long without pass, reset to idle (optional safety)
+        # growth-based alignment knobs
+        area_vel_ema_alpha: float = 0.36,
+        min_area_vel_ema: float = 0.015,
+        aligned_shrink_reset_frac: float = 0.14,
+        aligned_max_age_sec: float = 2,
+        min_aligned_frames: int = 2,
+        flag_aligned_shrink_reset_frac: float = 0.0,
+        gate_pass_area_thresh: float = 0.3,
     ):
         self.min_track_score = float(min_track_score)
         self.min_area_ratio = float(min_area_ratio)
         self.center_tol = float(center_tol)
         self.disappear_timeout = float(disappear_timeout)
-        self.flag_cross_min_frac = float(flag_cross_min_frac)
+
+        self.flag_center_tol = float(flag_center_tol)
+        self.flag_edge_tol   = float(flag_edge_tol)
+        self.flag_min_edges  = int(flag_min_edges)
+
+        # camera edges — default full frame; call set_camera_edges() after auto-detection
+        self.cam_left_norm:  float = 0.0
+        self.cam_right_norm: float = 1.0
+        self._frame_w: int = 1
+        self._frame_h: int = 1
 
         self.pass_cooldown_sec = float(pass_cooldown_sec)
         self.type_cooldown_sec = float(type_cooldown_sec)
@@ -121,6 +189,9 @@ class PassDetector:
         self.min_area_vel_ema = float(min_area_vel_ema)
         self.aligned_shrink_reset_frac = float(aligned_shrink_reset_frac)
         self.aligned_max_age_sec = float(aligned_max_age_sec)
+        self.min_aligned_frames = int(min_aligned_frames)
+        self.flag_aligned_shrink_reset_frac = float(flag_aligned_shrink_reset_frac)
+        self.gate_pass_area_thresh = float(gate_pass_area_thresh)
 
         self.states: Dict[int, TrackPassState] = {}
         self._just_passed: Dict[int, dict] = {}
@@ -155,7 +226,7 @@ class PassDetector:
                 "nx": float(st.last_nx),
                 "ny": float(st.last_ny),
 
-                "flag_span": float(st.last_flag_span),
+                "flag_was_centered": bool(st.flag_was_centered),
 
                 # growth-based debug
                 "area_vel": float(st.area_vel),
@@ -168,7 +239,11 @@ class PassDetector:
                 "min_area_ratio": float(self.min_area_ratio),
                 "center_tol": float(self.center_tol),
                 "disappear_timeout": float(self.disappear_timeout),
-                "flag_cross_min_frac": float(self.flag_cross_min_frac),
+                "flag_center_tol": float(self.flag_center_tol),
+                "flag_edge_tol": float(self.flag_edge_tol),
+                "flag_min_edges": int(self.flag_min_edges),
+                "cam_left_norm": float(self.cam_left_norm),
+                "cam_right_norm": float(self.cam_right_norm),
                 "aligned_shrink_reset_frac": float(self.aligned_shrink_reset_frac),
                 "aligned_max_age_sec": float(self.aligned_max_age_sec),
 
@@ -183,11 +258,20 @@ class PassDetector:
             }
         return out
 
+    def set_camera_edges(self, left_norm: float, right_norm: float):
+        """Set the real camera left/right edges (normalized 0..1), used for flagpole edge detection."""
+        self.cam_left_norm  = float(left_norm)
+        self.cam_right_norm = float(right_norm)
+        print(f"[PassDetector] camera edges: left={left_norm:.3f}  right={right_norm:.3f}"
+              f"  (real width = {(right_norm - left_norm) * 100:.1f}% of video width)")
+
     # ----------------------------
     # Main logic
     # ----------------------------
     def update(self, tracks, now: float, frame_w: int, frame_h: int):
         frame_area = float(frame_w * frame_h)
+        self._frame_w = frame_w
+        self._frame_h = frame_h
         seen_ids = set()
 
         # update seen tracks
@@ -261,59 +345,86 @@ class PassDetector:
             st.prev_area_ratio = area_ratio
 
             # --------------------------------
-            # flag logic
+            # flag logic — enters aligned when centered (no growth requirement)
             # --------------------------------
             if _is_flag(ttype):
-                st.min_cx = min(st.min_cx, nx)
-                st.max_cx = max(st.max_cx, nx)
-                span = st.max_cx - st.min_cx
-                st.last_flag_span = span
+                if st.stage == "idle":
+                    if area_ratio >= (self.min_area_ratio * 0.60) and abs(nx - 0.5) <= self.flag_center_tol:
+                        st.stage = "aligned"
+                        st.aligned_area_ratio = area_ratio
+                        st.aligned_time = now
+                        st.aligned_frames = 1
+                        st.flag_was_centered = True
 
-                # require being close-ish at some point + wide span
-                if area_ratio >= (self.min_area_ratio * 0.60):
-                    if span >= self.flag_cross_min_frac:
-                        st.last_reason_attempted = "flag_wrap"
-                        self._mark_passed(st, now, reason="flag_wrap")
+                elif st.stage == "aligned":
+                    st.aligned_frames += 1
+
+                    # max age safety
+                    if self.aligned_max_age_sec > 0:
+                        if st.aligned_time > 0 and (now - st.aligned_time) > self.aligned_max_age_sec:
+                            st.stage = "idle"
+                            st.aligned_area_ratio = 0.0
+                            st.aligned_time = 0.0
+                            st.aligned_frames = 0
+                            st.flag_was_centered = False
                 continue
 
             st.last_flag_span = 0.0
 
             # --------------------------------
-            # Growth-based alignment logic
+            # Growth-based alignment logic (gates only)
             # --------------------------------
             growth_ok = (st.area_vel_ema >= self.min_area_vel_ema)
 
             if st.stage == "idle":
-                # Only arm alignment if we're approaching (growing) + centered + close enough
                 if area_ratio >= self.min_area_ratio and center_dist <= self.center_tol and growth_ok:
                     st.stage = "aligned"
                     st.aligned_area_ratio = area_ratio
                     st.aligned_time = now
+                    st.aligned_frames = 1
 
             elif st.stage == "aligned":
-                # If it's shrinking significantly relative to when we aligned, we're likely looking at the gate behind us.
-                #print("aligned id ", tid)
-                #print("aligned area ratio ", st.aligned_area_ratio)
+                st.aligned_frames += 1
 
-                if st.aligned_area_ratio > 0:
+                if st.aligned_area_ratio > 0 and not st.gate_area_peaked:
                     drop_frac = (st.aligned_area_ratio - area_ratio) / max(st.aligned_area_ratio, 1e-9)
-                    #print("aligned drop frac  ", drop_frac)
-
                     if drop_frac >= self.aligned_shrink_reset_frac:
-                        #print("shrink reset reached to  id ", tid)
-                        # disarm: moving away, don't let disappearance count as pass
                         st.stage = "idle"
                         st.aligned_area_ratio = 0.0
                         st.aligned_time = 0.0
+                        st.aligned_frames = 0
+                        st.gate_area_peaked = False
+                        st.gate_peaked_area_ratio = 0.0
 
-                # Optional: if aligned too long, reset (prevents stale aligned tracks)
+                # in-frame pass: gate peaked above threshold (with good edges), now shrinking
+                if st.stage == "aligned" and self.gate_pass_area_thresh > 0:
+                    if area_ratio >= self.gate_pass_area_thresh and not st.gate_area_peaked:
+                        # latch only if edges are good RIGHT NOW at the peak
+                        x1, y1, x2, y2 = bbox
+                        edges_near = _count_edges_near_real_frame(
+                            x1, y1, x2, y2,
+                            frame_w, frame_h,
+                            self.cam_left_norm, self.cam_right_norm,
+                            self.flag_edge_tol,
+                        )
+                        if edges_near >= self.flag_min_edges:
+                            st.gate_area_peaked = True
+                            st.gate_peaked_area_ratio = area_ratio
+                    if (st.gate_area_peaked
+                            and area_ratio < st.gate_peaked_area_ratio
+                            and st.aligned_frames >= self.min_aligned_frames):
+                        st.last_reason_attempted = "area_peak_shrink"
+                        self._mark_passed(st, now, reason="area_peak_shrink")
+
                 if st.stage == "aligned" and self.aligned_max_age_sec > 0:
-                    #print("is aligned too long? id ", tid)
                     if st.aligned_time > 0 and (now - st.aligned_time) > self.aligned_max_age_sec:
                         print(" aligned too long reset  id ", tid)
                         st.stage = "idle"
                         st.aligned_area_ratio = 0.0
                         st.aligned_time = 0.0
+                        st.aligned_frames = 0
+                        st.gate_area_peaked = False
+                        st.gate_peaked_area_ratio = 0.0
 
         # handle disappeared tracks: if aligned recently => PASS
         for tid, st in list(self.states.items()):
@@ -321,17 +432,32 @@ class PassDetector:
                 continue
 
             if st.stage == "aligned":
-                # disappeared quickly after alignment => likely passed through
-                if (now - st.last_seen_time) <= self.disappear_timeout:
-                    #print(" dissapear track id ", tid)
-
-                    st.last_reason_attempted = "disappear_after_align"
-                    self._mark_passed(st, now, reason="disappear_after_align")
+                elapsed = now - st.last_seen_time
+                if elapsed <= self.disappear_timeout:
+                    if st.aligned_frames >= self.min_aligned_frames:
+                        x1, y1, x2, y2 = st.last_bbox
+                        edges_near = _count_edges_near_real_frame(
+                            x1, y1, x2, y2,
+                            self._frame_w, self._frame_h,
+                            self.cam_left_norm, self.cam_right_norm,
+                            self.flag_edge_tol,
+                        )
+                        if edges_near >= self.flag_min_edges:
+                            reason = "flag_disappear_edge" if _is_flag(st.ttype) else "disappear_after_align"
+                            st.last_reason_attempted = reason
+                            self._mark_passed(st, now, reason=reason)
+                else:
+                    # disappear window expired without firing — reset to idle so ghost bbox disappears
+                    st.stage = "idle"
+                    st.aligned_frames = 0
+                    st.aligned_area_ratio = 0.0
+                    st.aligned_time = 0.0
+                    st.flag_was_centered = False
+                    st.gate_area_peaked = False
+                    st.gate_peaked_area_ratio = 0.0
 
             # cleanup old states
             if (now - st.last_seen_time) > 2.0:
-                #print(" aging track id ", tid)
-
                 self.states.pop(tid, None)
 
         self._gc_cooldowns(now)
@@ -377,6 +503,30 @@ class PassDetector:
             "time": now,
             "reason": reason,
         }
+
+        # Reset every other aligned track to idle so they must re-establish
+        # alignment from scratch after a pass fires.
+        for other_tid, other_st in self.states.items():
+            if other_tid != st.track_id and other_st.stage == "aligned":
+                other_st.stage = "idle"
+                other_st.aligned_area_ratio = 0.0
+                other_st.aligned_time = 0.0
+                other_st.aligned_frames = 0
+                other_st.flag_was_centered = False
+                other_st.gate_area_peaked = False
+                other_st.gate_peaked_area_ratio = 0.0
+
+    def clear_all_aligned(self):
+        """Reset every aligned track to idle. Call on sibling instances after a pass fires."""
+        for st in self.states.values():
+            if st.stage == "aligned":
+                st.stage = "idle"
+                st.aligned_area_ratio = 0.0
+                st.aligned_time = 0.0
+                st.aligned_frames = 0
+                st.flag_was_centered = False
+                st.gate_area_peaked = False
+                st.gate_peaked_area_ratio = 0.0
 
     def _gc_cooldowns(self, now: float):
         horizon = max(5.0, self.track_cooldown_sec * 4.0)

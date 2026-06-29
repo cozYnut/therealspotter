@@ -1,0 +1,17 @@
+# Core vision + ML
+numpy
+opencv-python
+ultralytics
+Pillow
+
+# CLIP embeddings
+# PyTorch: install the right build for your hardware first:
+#   CPU:        pip install torch torchvision
+#   Apple MPS:  pip install torch torchvision   (MPS is included on macOS ≥ 12)
+#   CUDA:       pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+torch
+torchvision
+open-clip-torch
+
+# Learning UI (Phase 2 only — not needed for lazy_spotter.py)
+PyQt6

@@ -1,249 +1,381 @@
-# FPV therealspotter  🏁  
+# FPV therealspotter  🏁
 **Vision-based FPV race analysis, gate learning, and lap timing**
 
-therealspotter / lazyspoter is a **computer-vision tool for FPV drone racing** that detects gates from video, identifies gate passes, learns track layouts, and produces **lap timing and gate-to-gate performance statistics**.
+therealspotter / lazyspotter is a **computer-vision tool for FPV drone racing** that detects gates from video, identifies gate passes, learns track layouts, and produces **lap timing and gate-to-gate performance statistics**.
 
-The project is designed for:
+Designed for:
 - FPV pilots who want to analyze race footage
 - Track builders who want automatic gate ordering
 - Dataset creation and model training
 - Research and experimentation in vision-based racing analytics
 
-All processing runs **locally on the client** (no cloud), and the project is written entirely in **Python**.
+All processing runs **locally** (no cloud), written entirely in **Python**.
 
 YT video demonstration: https://www.youtube.com/watch?v=6A2gmpzc6iU
 
 ---
 
-## ✨ Key Features
-
-- 🎯 Gate detection using YOLO (custom-trained or generic models)
-- 🧠 Gate re-identification (Re-ID) using CLIP embeddings
-- 🏗️ **Learn mode** – build a gate order from video
-- 🏁 **Race mode** – match passes against a known track
-- 🤖 **Auto mode** – freestyle: auto-create or match gates on the fly
-- ⏱️ Lap timing & per-gate timing
-- 🧪 Rich debug panels for pass detector & GateDB
-- 🏷️ Pseudo-label generation for YOLO datasets
-- 🖊️ Manual video annotation tools
+## Current Gaps
+- Circle gate class not supported (insufficient training data)
+- Model trained on a limited dataset with some auto-annotation errors
+- Live feed not tested
 
 ---
 
-## Current Gaps:
-* not supporting circle class type (no data to train with)
-* flag pole pass logic is too strict - need modifying
-* trained on very limited dataset, not enough annotations. used auto annotation which has large errors
-* live feed support not tested
+## 📁 Project Structure
 
-
-## 📁 Project Structure (high level)
-
-.
-├── vocab_spotter.py # Vocabulary-based detector (experimental)
-├── lazy_spotter.py # Main FPV gate spotter (recommended)
-├── gate_db.py # Gate memory, ordering, laps, race logic
-├── pass_detector.py # Vision-only gate pass detection
-├── fpv_pseudo_label*.py # Dataset auto-labeling tools
-├── visualize_fpvgates.py # Dataset visualization
-├── video_labeler_yolo.py # Manual annotator
-├── vocab/ # Optional vocabulary embeddings
-└── datastuff/ # Datasets, videos, outputs
-
+```
+therealspotter/
+├── learn_ui.py              # Phase 2: interactive gate learning UI
+├── extract_candidates.py    # Phase 1: headless candidate extraction (for learn_ui)
+├── race_ui.py               # Race review UI (timeline, lap timing, match candidates)
+├── extract_race.py          # Headless race analysis (runs inside race_ui)
+├── debug_ui.py              # Pass detector tuning UI
+├── debug_ui_defaults.json   # Default parameter values for debug_ui / race_ui
+├── lazy_spotter.py          # Main FPV gate spotter (legacy real-time mode)
+├── gate_db.py               # Gate memory, ordering, laps, race logic
+├── pass_detector.py         # Vision-only gate pass detection
+├── fpv_pseudo_label*.py     # Dataset auto-labeling tools
+├── visualize_fpvgates.py    # Dataset visualization
+├── video_labeler_yolo.py    # Manual YOLO annotator
+└── vocab/                   # Optional vocabulary embeddings
+```
 
 ---
 
 ## 🧰 Environment Setup
 
-Work inside a Python virtual environment:
-
 ```bash
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+```
 
+Requires PyQt6 for all UI tools:
+```bash
+pip install PyQt6
+```
 
+---
 
-Main Tool – Non-Vocabulary Pipeline (lazy_spotter.py)
+## 🏗️ learn_ui.py — Gate Learning UI
 
-This is the primary entrypoint for learning tracks, racing, and freestyle analysis.
+Two-phase workflow. Phase 1 runs headlessly to extract pass candidates; Phase 2 is an interactive UI where you assign candidates to gate slots and build the track memory.
 
-🏗️ LEARN mode – build a track layout
+### Phase 1 — extract_candidates.py
 
-Creates an ordered gate memory from video.
+Runs YOLO + TimeTracker + PassDetector + CLIP on the video without any display.
+Saves every detected gate-pass candidate (embedding + cropped image) to JSON.
+Run once per video; reuse the JSON as many times as needed in Phase 2.
 
-python lazy_spotter.py \
-  --mode learn \
+```bash
+python extract_candidates.py \
+  --video ~/races/video1.mp4 \
   --det-model current_best_non_vocab.pt \
-  --video ~/Downloads/1/Kfar\ Hess\ disaster.mp4 \
-  --pass-enable \
-  --save-pass-crops \
-  --gate-memory gate_memory.json
+  --output candidates.json \
+  --crops-dir candidate_crops \
+  --clip-device mps
+```
 
+Output:
+- `candidates.json`   — detected pass events with CLIP embeddings + bbox
+- `candidate_crops/`  — gate crop image for each candidate
 
-Gates are detected
-Passes are detected visually
-You confirm / skip gates
-Multiple embeddings per gate are collected
-Track order is learned
+**How the crop is taken:**
+The embedding and saved image use the frame **4 frames before the pass fires**, cropped to the gate's bounding box with 50% padding on each side. This captures the gate + surrounding environment at the moment of approach, which is what distinguishes one gate from another visually.
 
+Key flags:
+```
+--clip-device     cpu / mps / cuda  (mps recommended on Apple Silicon)
+--det-conf        YOLO confidence threshold (default 0.25)
+```
 
-RACE mode – analyze a known track
+---
 
-Matches detected passes against a previously learned track.
+### Phase 2 — learn_ui.py
 
-python lazy_spotter.py \
-  --mode race \
-  --det-model current_best_non_vocab.pt \
-  --video ~/Downloads/1/Kfar\ Hess\ disaster.mp4 \
-  --pass-enable \
-  --save-pass-crops \
-  --gate-memory gate_memory.json
+Interactive PyQt6 UI. No command-line arguments needed — open everything from inside the UI.
 
-Gate-by-gate matching
-Lap detection
-Lap times
-Per-gate timing statistics
+```bash
+python learn_ui.py
+```
 
-AUTO mode – freestyle / unknown tracks
+**UI layout:**
+- Left  — video player + seekable timeline + action buttons
+- Right — gate order list + matched crop preview
 
-Automatically creates or matches gates without enforcing order.
+**Timeline legend:**
+- Coloured thin ticks  = pass candidates detected in Phase 1 (blue=square, cyan=arch, green=circle, magenta=flagpole)
+- Coloured diamond     = user-placed gate marker
+- Red playhead line    = current position
 
-python lazy_spotter.py \
-  --mode auto \
-  --det-model current_best_non_vocab.pt \
-  --video datastuff/fpv_videos/test/ROSH\ HAAYIN\ WITH\ GQ.mp4 \
-  --pass-enable \
-  --save-pass-crops
+**Keyboard shortcuts:**
+```
+Space            Play / Pause
+Up / Down        Seek ±1 frame
+Left / Right     Seek ±1 second
+Shift+Left/Right Seek ±10 seconds
+G                Mark gate pass (auto-detect type from nearest candidate)
+1 / 2 / 3 / 4   Mark gate pass with explicit type (square/arch/circle/flagpole)
+L                Mark Start/Finish gate (G1) — see below
+D                Delete last marker  (DEFINE mode only)
+S                Save gate_memory.json
+```
 
+**Toolbar:**
+- `Match ±` spinner — search window in frames (default 120f). G picks the nearest unused candidate within this window.
+- MODE badge — shows current mode and next expected gate.
 
-Debug/Viz tunings:
-ENABLE_GATE_DB = True          # Enable GateDB logic
-GATE_ID_VIZ = True             # Show GateID hints on screen
-DEBUG_PASS_PANEL_VIZ = True    # Pass detector debug window
-SAVE_PASS_CROPS_TODISK = True  # Save CLIP embedding crops
-GATE_DB_RACE_STATS = True      # Race statistics panel
+---
 
-Tunings:
-These are the most impactful parameters for pass detection quality
-(found in pass_detector.py):
+### Workflow — Single Video (multiple laps)
 
-aligned_shrink_reset_frac	- Sensitivity to gates that are already aligned but moving away
-pass_cooldown_sec	 - Cooldown between gate passes (depends on pilot speed)
-aligned_max_age_sec	 - How long a gate may remain aligned without passing (often up to ~10s)
+The **Start/Finish** button (L key) marks the Start/Finish gate, which is always **G1**. It also resets the gate queue so the next G press targets G2.
 
+```
+1. Seek to the Start/Finish gate crossing
+2. Press L  →  creates G1 (Start/Finish), status: "press G for G2, G3…"
+3. Seek to each subsequent gate
+4. Press G  →  creates G2, G3, G4… in sequence
+5. When you cross Start/Finish again at the end of the lap:
+   Press L  →  adds a 2nd embedding to G1, resets queue to G2
+              MODE badge changes to "DEFINE (Lap 2)  Next: G2"
+6. Press G for each gate again (lap 2) — adds 2nd embeddings to G2, G3, G4…
+7. Repeat for more laps (up to 6 embeddings per gate)
+8. Press S  →  save gate_memory.json
+```
 
+The gate list shows embedding progress:
+```
+▶ G1  square   [3/6]   ← ▶ = next in queue; 3 embeddings so far
+  G2  flagpole [2/6]
+  ⚠ G3  arch   [0/6]   ← ⚠ = no candidate found, won't match in race
+  G4  square   [4/6]
+```
 
--------------------------
-Training a YOLO Detector
+---
 
-#sanity only
+### Workflow — Multiple Videos (ADD mode)
+
+Open each additional video from inside the UI. Because gate slots already exist, it enters ADD mode automatically (L and D are disabled; G cycles through existing slots G1→G2→…→GN→G1).
+
+```
+Video 1 (DEFINE mode):
+  1. Open Video → load video 1  (extraction runs automatically in background)
+  2. Press L for Start/Finish, then G for each gate, L at end of each lap
+  → Defines the track structure AND stores first embeddings
+
+Video 2+ (ADD mode):
+  3. Open Video → load video 2 → confirm ADD mode prompt
+     (extraction runs automatically for video 2)
+  4. Press G for each gate in the same order
+  → Embeddings are added to existing slots (up to 6 per gate)
+
+Save:
+  5. Press S → gate_memory.json written with all embeddings from all videos
+```
+
+---
+
+## 🏁 race_ui.py — Race Review UI
+
+Reviews a race video against a learned track. Runs extraction in the background and shows a timeline with pass markers, lap list, and a Match Candidates panel.
+
+```bash
+python race_ui.py
+```
+
+No command-line arguments. Open everything from inside the UI.
+
+**Workflow:**
+1. `📂 Open Video`        — select race video
+2. `🧠 Open Gate Memory`  — select gate_memory.json
+3. Adjust **Sim ≥** and **Margin ≥** spinboxes if needed (see below)
+4. `▶ Run Race Analysis`  — extraction runs in background, results load automatically
+5. Scrub the timeline to review gate passes, lap splits, and match candidates
+
+**Toolbar controls:**
+```
+Sim ≥       Minimum cosine similarity for a gate to count as MATCH (default 0.88)
+Margin ≥    Minimum gap between best and second-best gate similarity (default 0.03)
+```
+Both defaults are loaded from `debug_ui_defaults.json` at startup. Edit that file to change the persistent defaults.
+
+**Timeline legend:**
+```
+Green tick   = gate pass matched (RACE)
+Red tick     = gate detected, no match (NOMATCH)
+Orange tick  = duplicate gate within a lap (DUP)
+Yellow line  = lap boundary
+Red line     = playhead
+```
+
+**Keyboard shortcuts:**
+```
+Space            Play / Pause
+Up / Down        Seek ±1 frame
+Left / Right     Seek ±1 second
+Shift+Left/Right Seek ±10 seconds
+```
+
+**Right panel:**
+- **Laps** — list of completed laps; click a lap to jump to its start and see gate-by-gate splits
+- **Frame Info** — tracks, pass events, and lap markers at the current frame
+- **Match Candidates** — thumbnail strip showing the query frame (what the drone saw 4 frames before the pass) alongside the stored reference clips for each gate in the comparison window. Green border = matched gate, blue = no-match, gray = other candidates in window.
+
+**⊞ Detail popup:**
+Click the ⊞ button next to "Match Candidates" to open a **resizable standalone window** with full-size images. Images preserve aspect ratio. Each reference clip shows its **cosine similarity percentage** to the query frame (e.g. `87.4%`). The matched gate header shows `best 92.1% MATCH`; unmatched gates show their best score so you can see how close they came.
+
+> Requires re-running race analysis after changing Sim/Margin values or after updating gate_memory.json.
+
+---
+
+## 🔧 debug_ui.py — Pass Detector Tuning UI
+
+Standalone tool for tuning PassDetector parameters. Load a video, mark your observed gate passes as ground truth, then run the detector and compare on the timeline.
+
+```bash
+python debug_ui.py
+```
+
+**Workflow:**
+1. `📂 Open Video`   — select video
+2. `🔧 Set Model`    — select YOLO .pt model
+3. Scrub to each gate pass → press **P** to place a ground-truth mark
+4. Adjust parameters in the right panel
+5. `▶ Run Detector`  — runs pass detection in background, results appear on timeline
+6. Compare detected passes (coloured ticks) against your ground-truth marks (green lines)
+7. `💾 Save Defaults` — writes current parameters to `debug_ui_defaults.json`
+
+**Keyboard shortcuts:**
+```
+Space            Play / Pause
+Up / Down        Seek ±1 frame
+Left / Right     Seek ±1 second
+Shift+Left/Right Seek ±10 seconds
+P                Place ground-truth pass mark
+D                Delete last ground-truth mark
+R                Run pass detector with current parameters
+```
+
+**Parameter panel:**
+All PassDetector parameters are loaded automatically from the class signature — adding a new parameter to PassDetector makes it appear in the UI immediately. Parameters are grouped into **Gates** and **Flags** tabs. The most impactful ones:
+
+```
+Gates:
+  disappear_timeout         How long after a gate disappears before a pass fires (seconds)
+  pass_cooldown_sec         Minimum time between consecutive passes on the same gate
+  aligned_max_age_sec       Max time a gate stays in "aligned" state (seconds)
+  aligned_shrink_reset_frac Sensitivity to a gate moving away while aligned
+  gate_pass_area_thresh     Area peak threshold for in-frame pass detection
+  min_aligned_frames        Minimum consecutive frames to enter aligned state
+
+Flags (flagpoles):
+  flag_center_tol           How close to frame center the pole must be (fraction)
+  flag_edge_tol             How close to real frame edge on disappear (fraction)
+  flag_min_edges            How many bbox edges must be near the frame edge
+  disappear_timeout         Shared with gate disappear logic
+```
+
+**Timeline legend:**
+```
+Green tall line   = user ground-truth mark
+Coloured ticks    = detected passes (colour = gate type)
+Orange ticks      = "aligned" state events
+Red line          = playhead
+```
+
+**Saving defaults:**
+`💾 Save Defaults` writes to `debug_ui_defaults.json`. This file is also read by `race_ui.py` at startup to set the Sim and Margin spinbox defaults.
+
+---
+
+## 🎯 CLIP Embedding System
+
+Gate matching uses **CLIP (ViT-B-32)** embeddings — 512-dimensional normalized vectors where cosine similarity (dot product) measures visual similarity.
+
+**What gets embedded:**
+The frame taken **4 frames before the pass fires**, cropped to the gate bounding box + 50% padding. Using the full gate + surroundings (not just the gate itself) is intentional: all gates of the same shape look identical front-on, but their surrounding environment (trees, sky, ground, other structures) is what makes each gate visually unique.
+
+**GateDB matching (race mode):**
+Each gate slot stores up to **6 embeddings** (from different laps or videos). On each detected pass, the query embedding is compared against all clips in each gate in the lookahead window (default: 3 gates ahead). A pass is counted as RACE if:
+1. Best clip similarity ≥ `sim_thresh` (default 0.88)
+2. Best gate score beats second-best gate by ≥ `min_match_margin` (default 0.03)
+
+Both thresholds are adjustable in `race_ui.py` and `debug_ui_defaults.json`.
+
+---
+
+## 🏷️ Flagpole Pass Detection
+
+Flagpoles use different logic because you fly *past* them rather than *through* them.
+
+**Algorithm:**
+1. While visible: check whether the flag was ever near horizontal frame center (nx within `flag_center_tol` of 0.5) with sufficient area. This confirms the pole was actually in front of the drone.
+2. On disappearance: if the flag was centered AND disappeared within `disappear_timeout` seconds AND at least `flag_min_edges` bounding-box edges were close to real frame edges → **PASS** (reason: `flag_disappear_edge`).
+
+**Black bar handling (4:3 camera in 16:9 video):**
+At startup, `detect_camera_edges()` scans the first frame to find where real content begins and ends. "Near the edge" is measured against the actual camera boundary, not the video container edge.
+
+---
+
+## 🗃️ Training a YOLO Detector
+
+```bash
+# Sanity check only
 python pipeline_sanity_train_eval.py \
   --data-root ./datastuff/fpv_dataset \
   --data-yaml ./fpv_gate.yaml \
-  --nc 4 \
-  --print-paths
+  --nc 4 --print-paths
 
-#sanity + train
+# Train
 python pipeline_sanity_train_eval.py \
   --data-root ./datastuff/fpv_dataset \
   --data-yaml ./fpv_gate.yaml \
-  --nc 4 \
-  --train \
+  --nc 4 --train \
   --base-model yolov8m.pt \
-  --epochs 20 \
-  --imgsz 416 \
-  --batch 16 --device mps --name tempdelete \
-  --eval-split test \
-  --print-paths
+  --epochs 20 --imgsz 416 --batch 16 \
+  --device mps --name tempdelete \
+  --eval-split test --print-paths
 
-#evaluate (mAP and precision/recall scores)
+# Evaluate (mAP / precision / recall)
 python pipeline_sanity_train_eval.py \
   --data-root ./datastuff/fpv_dataset \
   --data-yaml ./fpv_gate.yaml \
   --nc 4 \
   --weights runs/detect/fpv_gate_more_annot2/weights/best.pt \
-  --eval-split test \
-  --print-paths
+  --eval-split test --print-paths
 
-#run just detector
+# Run detector on video
 python3 inspect_gate_model_video.py \
   --model runs/detect/train/weights/best.pt \
   --video /path/to/test.mp4 \
   --conf 0.25
+```
 
+---
 
-#generate yolo dataset from videos (mp4):
+## 🖊️ Dataset Tools
+
+```bash
+# Generate YOLO dataset from videos (auto pseudo-label)
 python fpv_pseudo_label.py \
   --video_dir ./videos \
   --out_dir ./dataset \
   --yolo_model current_best_non_vocab.pt \
-  --conf 0.25 \
-  --maxdet 50 \
-  --min_area_ratio 0.002
+  --conf 0.25 --maxdet 50 --min_area_ratio 0.002
 
-#visualize / manage labels on images:
-python visualize_fpvgates.py \ 
+# Visualize / manage labels on images
+python visualize_fpvgates.py \
   --images_dir datastuff/fpv_dataset/images/train \
   --labels_dir datastuff/fpv_dataset/labels/train \
   --max_images 4000
 
-#manual annotation tool
-python video_labeler_yolo.py \ 
+# Manual annotation tool
+python video_labeler_yolo.py \
   --video ~/Downloads/1/Rosh.mp4 \
   --out ./datastuff/fpv_dataset_labeled \
   --split train \
   --classes "square,arch,circle,flagpole" \
-  --start 0 \
-  --step 1 \
-  --resize 1280x720
-
-
-  #parameters that i often tune between tracks/video res/detector quality on a set of gates:
-  aligned_shrink_reset_frac #how sensitive we are to gate that is already in "aligned" but moving away from it
-  pass_cooldown_sec #cooldown between gate passes (per how much the pilot is fast basically)
-  aligned_max_age_sec #how long should we keep align as long as its seen, i set it to maximum 10sec for now
-
-
-
-OBSOLETE - Vocabulary-Based Spotter (experimental)
-
-Uses predefined CLIP embeddings stored under vocab/.
-
-python vocab_spotter.py \
-  --mode learn \
-  --video ~/Downloads/1/Rosh.mp4 \
-  --vocab ./vocab \
-  --device mps \
-  --ttl-seconds 0.3 \
-  --hide-after 0.1 \
-  --max-candidates 4 \
-  --det-conf 0.08 \
-  --pass-enable
-
-
-#README
-#work inside python3 venv
-
-
-############## vocab based:
-#vocabulary in vocab/
-
-############ non vocab based:
-
-
-
-
-#train the model on mac for Mac M2:
-
-#sanity check on the folders and labels
-
-
-
-
-
-
-
-
-
-#--------------------
-# utilities
+  --start 0 --step 1 --resize 1280x720
+```

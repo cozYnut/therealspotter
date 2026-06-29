@@ -18,7 +18,7 @@ import open_clip
 from PIL import Image
 
 # Your separate pass detector module
-from pass_detector import PassDetector
+from pass_detector import PassDetector, detect_camera_edges
 
 # GateDB (NEW learn=append-to-index, race=match-only)
 from gate_db import GateDB, build_gate_db_panel, compute_track_gate_hints, build_race_stats_panel
@@ -416,10 +416,10 @@ class Track:
 class TimeTracker:
     def __init__(
         self,
-        iou_match_thresh: float = 0.3,
-        ttl_seconds: float = 0.6,
-        lock_min_score: float = 0.20,
-        lock_hysteresis: float = 0.10,
+        iou_match_thresh: float = 0.05,
+        ttl_seconds: float = 0.03,
+        lock_min_score: float = 0.2,
+        lock_hysteresis: float = 0.1,
         lock_streak: int = 3,
         ema_alpha: float = 0.4,
     ):
@@ -603,9 +603,7 @@ def build_pass_debug_panel(
 
         score = float(tr.score_ema) if tr is not None else -1.0
 
-        min_cx = float(getattr(st, "min_cx", 0.0))
-        max_cx = float(getattr(st, "max_cx", 0.0))
-        span = max_cx - min_cx
+        flag_centered = bool(getattr(st, "flag_was_centered", False))
 
         color = PASS_DEBUG_PANEL_TEXT
         if stage == "aligned":
@@ -616,7 +614,7 @@ def build_pass_debug_panel(
         short_type = (ttype[:9] + "…") if len(ttype) > 10 else ttype.ljust(10)
         short_stage = stage.ljust(7)[:7]
 
-        misc = f"span={span:.2f}"
+        misc = f"ctr={'Y' if flag_centered else 'N'}" if ("flag" in ttype.lower() or "pole" in ttype.lower()) else ""
         line = f"{tid:>3d}  {short_type} {short_stage} {score:>5.2f}  {area_ratio*100:>5.2f}  {cdist:>6.3f}  {seen_ago:>6.2f}  {misc}"
 
         cv2.putText(panel, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.50, color, 2, cv2.LINE_AA)
@@ -884,6 +882,13 @@ def main():
     cap = cv2.VideoCapture(0 if args.video is None else args.video)
     if not cap.isOpened():
         raise RuntimeError("Failed to open video source")
+
+    if passdet is not None:
+        ok, first_frame = cap.read()
+        if ok:
+            left_norm, right_norm = detect_camera_edges(first_frame)
+            passdet.set_camera_edges(left_norm, right_norm)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     print(f"Detector model: {args.det_model}")
     print(f"Classes: {list(names.values()) if names else '(unknown names)'}")
