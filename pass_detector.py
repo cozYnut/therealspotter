@@ -163,6 +163,7 @@ class PassDetector:
         min_aligned_frames: int = 2,
         flag_aligned_shrink_reset_frac: float = 0.0,
         gate_pass_area_thresh: float = 0.3,
+        peak_area_max_jump: float = 6.0,
     ):
         self.min_track_score = float(min_track_score)
         self.min_area_ratio = float(min_area_ratio)
@@ -192,6 +193,7 @@ class PassDetector:
         self.min_aligned_frames = int(min_aligned_frames)
         self.flag_aligned_shrink_reset_frac = float(flag_aligned_shrink_reset_frac)
         self.gate_pass_area_thresh = float(gate_pass_area_thresh)
+        self.peak_area_max_jump = float(peak_area_max_jump)
 
         self.states: Dict[int, TrackPassState] = {}
         self._just_passed: Dict[int, dict] = {}
@@ -398,7 +400,10 @@ class PassDetector:
 
                 # in-frame pass: gate peaked above threshold (with good edges), now shrinking
                 if st.stage == "aligned" and self.gate_pass_area_thresh > 0:
-                    if area_ratio >= self.gate_pass_area_thresh and not st.gate_area_peaked:
+                    jump_ratio = area_ratio / prev if prev > 0 else 1.0
+                    if (area_ratio >= self.gate_pass_area_thresh
+                            and not st.gate_area_peaked
+                            and jump_ratio <= self.peak_area_max_jump):
                         # latch only if edges are good RIGHT NOW at the peak
                         x1, y1, x2, y2 = bbox
                         edges_near = _count_edges_near_real_frame(
@@ -410,6 +415,9 @@ class PassDetector:
                         if edges_near >= self.flag_min_edges:
                             st.gate_area_peaked = True
                             st.gate_peaked_area_ratio = area_ratio
+                    if st.gate_area_peaked:
+                        # track the true running maximum so fire triggers on real shrink
+                        st.gate_peaked_area_ratio = max(st.gate_peaked_area_ratio, area_ratio)
                     if (st.gate_area_peaked
                             and area_ratio < st.gate_peaked_area_ratio
                             and st.aligned_frames >= self.min_aligned_frames):
