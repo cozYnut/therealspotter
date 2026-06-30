@@ -486,6 +486,8 @@ class VideoPlayer(QWidget):
         self._annotation_fn = None   # Optional[Callable[[float], List[dict]]]
         self._cam_left_norm: Optional[float] = None
         self._cam_right_norm: Optional[float] = None
+        self._show_aligned: bool = True
+        self._show_not_aligned: bool = True
 
         lv = QVBoxLayout(self)
         lv.setContentsMargins(0, 0, 0, 0)
@@ -560,6 +562,16 @@ class VideoPlayer(QWidget):
     def clear_overlay(self):
         self.set_overlay()
 
+    def set_show_aligned(self, on: bool):
+        self._show_aligned = bool(on)
+        if self._last_frame is not None:
+            self._push(self._last_frame)
+
+    def set_show_not_aligned(self, on: bool):
+        self._show_not_aligned = bool(on)
+        if self._last_frame is not None:
+            self._push(self._last_frame)
+
     def set_annotation_fn(self, fn):
         """fn(t: float) -> List[dict] — called each frame to get live track boxes."""
         self._annotation_fn = fn
@@ -608,6 +620,11 @@ class VideoPlayer(QWidget):
         # Live track annotations (from last run)
         if self._annotation_fn is not None:
             for ann in (self._annotation_fn(self._current_t) or []):
+                is_aligned = ann.get("stage", "idle") in ("aligned", "passed")
+                if is_aligned and not self._show_aligned:
+                    continue
+                if not is_aligned and not self._show_not_aligned:
+                    continue
                 _draw_track_box(frame, ann)
         # Single-event overlay (clicked in event list)
         if self._overlay_bbox and len(self._overlay_bbox) == 4:
@@ -1120,6 +1137,24 @@ class MainWindow(QMainWindow):
                 continue
             h.addWidget(self._lbl(f"◆ {name}", color=col))
         h.addWidget(self._lbl("│ aligned", color=_ALIGNED_COLOR))
+
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.VLine)
+        sep2.setStyleSheet("color:#444;")
+        h.addWidget(sep2)
+
+        self._show_aligned_cb = QCheckBox("aligned")
+        self._show_aligned_cb.setChecked(True)
+        self._show_aligned_cb.setStyleSheet("font-size:10px; color:#ccc;")
+        self._show_aligned_cb.toggled.connect(self._video.set_show_aligned)
+        h.addWidget(self._show_aligned_cb)
+
+        self._show_not_aligned_cb = QCheckBox("not aligned")
+        self._show_not_aligned_cb.setChecked(True)
+        self._show_not_aligned_cb.setStyleSheet("font-size:10px; color:#ccc;")
+        self._show_not_aligned_cb.toggled.connect(self._video.set_show_not_aligned)
+        h.addWidget(self._show_not_aligned_cb)
+
         h.addStretch()
         return w
 
