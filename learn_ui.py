@@ -44,7 +44,7 @@ try:
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QPushButton, QLabel, QListWidget, QListWidgetItem, QFileDialog,
         QSizePolicy, QMessageBox, QToolBar, QStatusBar, QFrame, QSpinBox,
-        QProgressBar,
+        QProgressBar, QScrollArea,
     )
     from PyQt6.QtCore import Qt, QTimer, QRect, QPoint, pyqtSignal, QProcess
     from PyQt6.QtGui import (
@@ -76,6 +76,16 @@ _POINTER_COLOR  = QColor( 60, 220, 120)
 
 def _gate_color(gate_type: str) -> QColor:
     return _GATE_COLORS.get((gate_type or "").lower(), _GATE_COLORS["unknown"])
+
+
+def _crop_padded(frame: np.ndarray, bbox: list, pad_frac: float = 0.5):
+    x1, y1, x2, y2 = map(int, bbox)
+    H, W = frame.shape[:2]
+    bw, bh = x2 - x1, y2 - y1
+    px, py = int(bw * pad_frac), int(bh * pad_frac)
+    nx1, ny1 = max(0, x1 - px), max(0, y1 - py)
+    nx2, ny2 = min(W, x2 + px), min(H, y2 + py)
+    return frame[ny1:ny2, nx1:nx2], [nx1, ny1, nx2, ny2]
 
 
 def _auto_clip_device() -> str:
@@ -398,6 +408,140 @@ class VideoPlayer(QWidget):
 
 
 # ──────────────────────────────────────────────────────────────
+# Manage Clips window
+# ──────────────────────────────────────────────────────────────
+
+class ManageClipsDialog(QWidget):
+    """Standalone window listing every stored clip across all gate slots.
+    The user can delete individual clips; changes apply immediately."""
+
+    clips_changed = pyqtSignal()
+
+    def __init__(self, gate_slots, parent=None):
+        super().__init__(parent, Qt.WindowType.Window)
+        self.setWindowTitle("Manage Clips")
+        self.resize(980, 620)
+        self.setStyleSheet("background:#1a1a1a;")
+        self._gate_slots = gate_slots
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        hint = QLabel(
+            "Click  × Delete  to remove a clip from a gate slot. "
+            "Deletes the image and its embedding. Changes are immediate."
+        )
+        hint.setStyleSheet("color:#888; font-size:11px;")
+        layout.addWidget(hint)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setStyleSheet("QScrollArea{border:none;}")
+        layout.addWidget(self._scroll)
+
+        self._content = QWidget()
+        self._vbox = QVBoxLayout(self._content)
+        self._vbox.setContentsMargins(4, 4, 4, 4)
+        self._vbox.setSpacing(8)
+        self._scroll.setWidget(self._content)
+
+        self._refresh()
+
+    def refresh(self):
+        self._refresh()
+
+    def _refresh(self):
+        while self._vbox.count():
+            item = self._vbox.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        for slot in self._gate_slots:
+            hdr = QLabel(
+                f"G{slot.slot_idx + 1}  —  {slot.gate_type}  "
+                f"[{slot.embed_count}/{GateSlot.MAX_EMBEDS} embeddings  |  "
+                f"{len(slot.crop_paths)} crops]"
+            )
+            hdr.setStyleSheet(
+                "font-weight:bold; font-size:13px; color:#60dc78; "
+                "background:#252525; padding:5px 6px; border-radius:3px;"
+            )
+            self._vbox.addWidget(hdr)
+
+            if not slot.crop_paths:
+                lbl = QLabel("   (no clips)")
+                lbl.setStyleSheet("color:#444; font-size:11px;")
+                self._vbox.addWidget(lbl)
+                continue
+
+            row_w = QWidget()
+            row_h = QHBoxLayout(row_w)
+            row_h.setContentsMargins(0, 0, 0, 0)
+            row_h.setSpacing(8)
+
+            n_embeds = len(slot.embeddings)
+            for i, crop_path in enumerate(list(slot.crop_paths)):
+                cell = QWidget()
+                cell.setFixedWidth(152)
+                cell.setStyleSheet(
+                    "background:#222; border:1px solid #3a3a3a; border-radius:4px;"
+                )
+                cv = QVBoxLayout(cell)
+                cv.setContentsMargins(4, 4, 4, 4)
+                cv.setSpacing(3)
+
+                img_lbl = QLabel()
+                img_lbl.setFixedSize(140, 98)
+                img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                img_lbl.setStyleSheet("background:#111; border:none;")
+                if os.path.exists(crop_path):
+                    img_lbl.setPixmap(
+                        QPixmap(crop_path).scaled(
+                            140, 98,
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation,
+                        )
+                    )
+                else:
+                    img_lbl.setText("file missing")
+                    img_lbl.setStyleSheet("background:#111; color:#555; border:none;")
+                cv.addWidget(img_lbl)
+
+                has_embed = i < n_embeds
+                info = QLabel(f"Clip {i + 1}" + ("" if has_embed else "  ⚠ no embed"))
+                info.setStyleSheet(
+                    f"color:{'#bbb' if has_embed else '#a06020'}; font-size:9px; border:none;"
+                )
+                info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                cv.addWidget(info)
+
+                del_btn = QPushButton("× Delete")
+                del_btn.setFixedHeight(22)
+                del_btn.setStyleSheet(
+                    "background:#5a2020; color:white; font-size:10px; "
+                    "border:none; border-radius:2px;"
+                )
+                del_btn.clicked.connect(lambda _, s=slot, idx=i: self._delete_clip(s, idx))
+                cv.addWidget(del_btn)
+
+                row_h.addWidget(cell)
+
+            row_h.addStretch()
+            self._vbox.addWidget(row_w)
+
+        self._vbox.addStretch()
+
+    def _delete_clip(self, slot: "GateSlot", idx: int):
+        if idx < len(slot.embeddings):
+            slot.embeddings.pop(idx)
+        if idx < len(slot.crop_paths):
+            slot.crop_paths.pop(idx)
+        self.clips_changed.emit()
+        self._refresh()
+
+
+# ──────────────────────────────────────────────────────────────
 # Main window
 # ──────────────────────────────────────────────────────────────
 
@@ -428,6 +572,10 @@ class MainWindow(QMainWindow):
         # ── Background extraction (QProcess) ─────────────────
         self._proc: Optional[QProcess] = None
         self._proc_json_path: str = ""
+
+        # ── Force Clip CLIP embedder (lazy-loaded on first use) ─
+        self._clip_embedder = None
+        self._manage_clips_win: Optional[ManageClipsDialog] = None
 
         self._build_ui()
         self._build_shortcuts()
@@ -557,6 +705,14 @@ class MainWindow(QMainWindow):
         self._stats_label.setStyleSheet("color:#777; font-size:10px;")
         rv.addWidget(self._stats_label)
 
+        self._manage_clips_btn = QPushButton("🗂  Manage Clips")
+        self._manage_clips_btn.setFixedHeight(26)
+        self._manage_clips_btn.setStyleSheet(
+            "background:#2a2a2a; color:#ccc; font-size:11px; border:1px solid #444;"
+        )
+        self._manage_clips_btn.clicked.connect(self._on_manage_clips)
+        rv.addWidget(self._manage_clips_btn)
+
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet("color:#444;")
@@ -642,6 +798,26 @@ class MainWindow(QMainWindow):
         self._delete_btn.clicked.connect(self._on_delete_last)
         row.addWidget(self._delete_btn)
 
+        self._skip_btn = QPushButton("Skip  [K]")
+        self._skip_btn.setFixedHeight(34)
+        self._skip_btn.setStyleSheet("background:#1e3f6a; color:white;")
+        self._skip_btn.setToolTip(
+            "Skip current gate slot without assigning a clip.\n"
+            "The next G/Force Clip will go to the following gate."
+        )
+        self._skip_btn.clicked.connect(self._on_skip)
+        row.addWidget(self._skip_btn)
+
+        self._force_btn = QPushButton("Force Clip  [F]")
+        self._force_btn.setFixedHeight(34)
+        self._force_btn.setStyleSheet("background:#4a3a0a; color:white;")
+        self._force_btn.setToolTip(
+            "Embed the current frame directly (no candidate search).\n"
+            "Uses gate bbox + padding if one is visible, otherwise full frame."
+        )
+        self._force_btn.clicked.connect(self._on_force_clip)
+        row.addWidget(self._force_btn)
+
         self._cancel_btn = QPushButton("⏹ Cancel Extraction")
         self._cancel_btn.setFixedHeight(34)
         self._cancel_btn.setStyleSheet("background:#5a3000; color:white;")
@@ -679,6 +855,8 @@ class MainWindow(QMainWindow):
             ("4",            lambda: self._on_mark_gate(gate_type="flagpole")),
             ("L",            self._on_mark_start_finish),
             ("D",            self._on_delete_last),
+            ("K",            self._on_skip),
+            ("F",            self._on_force_clip),
             ("S",            self._on_save),
             ("Up",           lambda: self._seek_frame(+1)),
             ("Down",         lambda: self._seek_frame(-1)),
@@ -1092,6 +1270,139 @@ class MainWindow(QMainWindow):
         self._refresh_gate_list()
         self._status.showMessage("Last marker deleted")
         self._update_mode_ui()
+
+    # ── Skip / Force Clip ─────────────────────────────────────
+
+    def _on_skip(self):
+        """Advance the slot pointer by one without assigning any clip.
+        In first-lap DEFINE mode, creates an empty placeholder slot instead."""
+        t = self._video.current_t
+
+        if self._mode == "define" and not self._define_second_lap:
+            # First lap: create an empty slot so the sequence stays intact
+            slot_idx = len(self._gate_slots)
+            slot = GateSlot(slot_idx=slot_idx, gate_type="unknown")
+            self._gate_slots.append(slot)
+            self._session_markers.append(SessionMarker(t=t, slot_idx=slot_idx))
+            self._timeline.set_session_markers(self._session_markers)
+            self._status.showMessage(
+                f"Skipped — empty G{slot_idx + 1} placeholder created  "
+                f"(assign clips later via ADD mode or Force Clip)"
+            )
+        else:
+            if not self._gate_slots:
+                self._status.showMessage("No gates defined yet.")
+                return
+            ptr = self._slot_pointer % len(self._gate_slots)
+            self._slot_pointer += 1
+            next_ptr = self._slot_pointer % max(1, len(self._gate_slots))
+            self._status.showMessage(
+                f"Skipped G{ptr + 1}  →  Next: G{next_ptr + 1}"
+            )
+
+        self._update_mode_ui()
+
+    def _on_force_clip(self):
+        """Embed the current displayed frame directly and assign it to the next slot.
+        Uses gate bbox+padding from the nearest visible candidate; falls back to full frame."""
+        frame = self._video._last_frame
+        if frame is None:
+            self._status.showMessage("No frame loaded.")
+            return
+
+        t = self._video.current_t
+        fps = max(self._video.fps, 1.0)
+
+        # Find nearest candidate for bbox + gate_type hint (ignores used_idxs and match window)
+        nearest = min(self._candidates, key=lambda c: abs(c.t - t), default=None)
+        use_bbox = nearest and nearest.bbox and abs(nearest.t - t) * fps <= 60
+        gate_type_hint = nearest.gate_type if nearest else "unknown"
+
+        crop, _ = _crop_padded(frame, nearest.bbox) if use_bbox else (frame, [])
+
+        embedder = self._get_clip_embedder()
+        if embedder is None:
+            return
+
+        self._status.showMessage("Embedding current frame…")
+        QApplication.processEvents()
+        emb = embedder.embed_bgr(crop)
+
+        # Save crop image alongside other candidates
+        stem = Path(self._current_video_path).stem if self._current_video_path else "force"
+        crops_dir = Path(__file__).parent / f"candidate_crops_{stem}"
+        crops_dir.mkdir(parents=True, exist_ok=True)
+        crop_path = str(crops_dir / f"force_{int(t * 1000)}.jpg")
+        cv2.imwrite(crop_path, crop)
+
+        if self._mode == "define" and not self._define_second_lap:
+            # First lap: create a new slot
+            slot_idx = len(self._gate_slots)
+            slot = GateSlot(slot_idx=slot_idx, gate_type=gate_type_hint)
+            slot.embeddings.append(emb.tolist())
+            slot.crop_paths.append(crop_path)
+            self._gate_slots.append(slot)
+            self._session_markers.append(SessionMarker(t=t, slot_idx=slot_idx))
+            self._status.showMessage(
+                f"Force Clip → G{slot_idx + 1} [{gate_type_hint}]  "
+                f"({'bbox+pad' if use_bbox else 'full frame'})"
+            )
+        else:
+            if not self._gate_slots:
+                self._status.showMessage("No gates defined yet.")
+                return
+            ptr = self._slot_pointer % len(self._gate_slots)
+            slot = self._gate_slots[ptr]
+            if slot.is_full:
+                self._status.showMessage(f"G{slot.slot_idx + 1} is full (6/6). Skipping.")
+                self._slot_pointer += 1
+                self._update_mode_ui()
+                return
+            if len(slot.embeddings) < GateSlot.MAX_EMBEDS:
+                slot.embeddings.append(emb.tolist())
+            if crop_path not in slot.crop_paths:
+                slot.crop_paths.append(crop_path)
+            is_extra = (self._mode == "define")
+            self._session_markers.append(
+                SessionMarker(t=t, slot_idx=slot.slot_idx, is_extra_lap=is_extra)
+            )
+            self._slot_pointer += 1
+            self._status.showMessage(
+                f"Force Clip → G{slot.slot_idx + 1} "
+                f"({slot.embed_count}/{GateSlot.MAX_EMBEDS})  "
+                f"({'bbox+pad' if use_bbox else 'full frame'})"
+            )
+
+        self._show_crop(slot)
+        self._timeline.set_session_markers(self._session_markers)
+        self._update_mode_ui()
+
+    def _get_clip_embedder(self):
+        if self._clip_embedder is None:
+            try:
+                from lazy_spotter import ClipEmbedder
+                self._status.showMessage("Loading CLIP model… (first Force Clip use only)")
+                QApplication.processEvents()
+                self._clip_embedder = ClipEmbedder(device=self._clip_device)
+            except Exception as e:
+                self._status.showMessage(f"CLIP load failed: {e}")
+                return None
+        return self._clip_embedder
+
+    def _on_manage_clips(self):
+        if not self._gate_slots:
+            self._status.showMessage("No gates defined yet.")
+            return
+        if self._manage_clips_win is None or not self._manage_clips_win.isVisible():
+            self._manage_clips_win = ManageClipsDialog(self._gate_slots)
+            self._manage_clips_win.clips_changed.connect(self._on_clips_changed)
+            self._manage_clips_win.show()
+        else:
+            self._manage_clips_win.raise_()
+            self._manage_clips_win.activateWindow()
+
+    def _on_clips_changed(self):
+        self._refresh_gate_list()
 
     # ── Candidate matching ────────────────────────────────────
 
