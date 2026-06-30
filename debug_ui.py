@@ -835,10 +835,13 @@ class RunnerThread(QThread):
                             })
 
             # emit per-frame track snapshot for bbox overlay in video player
+            # (only tracks actually present this frame — pd.states keeps stale
+            # entries alive for up to 2s after a track disappears)
+            visible_tids = {int(tr.track_id) for tr in tracks}
             snapshot = []
             for pd in (passdet_gates, passdet_flags):
                 for tid, st in pd.states.items():
-                    if st.stage != "aligned":
+                    if tid not in visible_tids:
                         continue
                     snapshot.append({
                         "bbox":          list(st.last_bbox),
