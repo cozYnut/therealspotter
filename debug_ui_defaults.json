@@ -1,0 +1,43 @@
+{
+  "tracker": {
+    "iou_match_thresh": 0.05,
+    "ttl_seconds": 0.03,
+    "lock_min_score": 0.2,
+    "lock_hysteresis": 0.1,
+    "lock_streak": 3,
+    "ema_alpha": 0.4
+  },
+  "gates": {
+    "min_track_score": 0.2,
+    "min_area_ratio": 0.03,
+    "center_tol": 0.3,
+    "disappear_timeout": 0.09,
+    "flag_edge_tol": 0.07,
+    "flag_min_edges": 2,
+    "pass_cooldown_sec": 0.09,
+    "type_cooldown_sec": 0.09,
+    "track_cooldown_sec": 0.2,
+    "area_vel_ema_alpha": 0.36,
+    "min_area_vel_ema": 0.015,
+    "aligned_shrink_reset_frac": 0.14,
+    "aligned_max_age_sec": 2,
+    "min_aligned_frames": 2,
+    "gate_pass_area_thresh": 0.3,
+    "peak_area_max_jump": 7.0
+  },
+  "flags": {
+    "min_track_score": 0.14,
+    "min_area_ratio": 0.01,
+    "disappear_timeout": 0.15,
+    "flag_center_tol": 0.15,
+    "flag_edge_tol": 0.07000000000000003,
+    "flag_min_edges": 2,
+    "pass_cooldown_sec": 0.09,
+    "type_cooldown_sec": 0.09,
+    "track_cooldown_sec": 0.2,
+    "ignore_flagpoles": false,
+    "aligned_max_age_sec": 2,
+    "min_aligned_frames": 3,
+    "peak_area_max_jump": 6.0
+  }
+}
