@@ -118,8 +118,6 @@ class TrackPassState:
     aligned_area_ratio: float = 0.0
     aligned_time: float = 0.0
     aligned_frames: int = 0
-    gate_area_peaked: bool = False
-    gate_peaked_area_ratio: float = 0.0
 
 
 class PassDetector:
@@ -162,8 +160,10 @@ class PassDetector:
         aligned_max_age_sec: float = 2,
         min_aligned_frames: int = 2,
         flag_aligned_shrink_reset_frac: float = 0.0,
-        gate_pass_area_thresh: float = 0.3,
-        peak_area_max_jump: float = 6.0,
+        aligned_shrink_disappear_frac: float = 0.0,
+        pass_area_ratio: float = 0.0,
+        aligned_area_jump_frac: float = 0.0,
+        flag_aligned_area_jump_frac: float = 0.0,
     ):
         self.min_track_score = float(min_track_score)
         self.min_area_ratio = float(min_area_ratio)
@@ -192,8 +192,10 @@ class PassDetector:
         self.aligned_max_age_sec = float(aligned_max_age_sec)
         self.min_aligned_frames = int(min_aligned_frames)
         self.flag_aligned_shrink_reset_frac = float(flag_aligned_shrink_reset_frac)
-        self.gate_pass_area_thresh = float(gate_pass_area_thresh)
-        self.peak_area_max_jump = float(peak_area_max_jump)
+        self.aligned_shrink_disappear_frac = float(aligned_shrink_disappear_frac)
+        self.pass_area_ratio = float(pass_area_ratio)
+        self.aligned_area_jump_frac = float(aligned_area_jump_frac)
+        self.flag_aligned_area_jump_frac = float(flag_aligned_area_jump_frac)
 
         self.states: Dict[int, TrackPassState] = {}
         self._just_passed: Dict[int, dict] = {}
@@ -248,6 +250,7 @@ class PassDetector:
                 "cam_right_norm": float(self.cam_right_norm),
                 "aligned_shrink_reset_frac": float(self.aligned_shrink_reset_frac),
                 "aligned_max_age_sec": float(self.aligned_max_age_sec),
+                "pass_area_ratio": float(self.pass_area_ratio),
 
                 "cooldown_remaining_global": float(rem_global),
                 "cooldown_remaining_type": float(rem_type),
@@ -271,7 +274,8 @@ class PassDetector:
     # Main logic
     # ----------------------------
     def update(self, tracks, now: float, frame_w: int, frame_h: int):
-        frame_area = float(frame_w * frame_h)
+        real_w = (self.cam_right_norm - self.cam_left_norm) * frame_w
+        frame_area = real_w * frame_h
         self._frame_w = frame_w
         self._frame_h = frame_h
         seen_ids = set()
@@ -304,6 +308,14 @@ class PassDetector:
                 st.last_updated_time = now
                 self.states[tid] = st
 
+            # passed stage lasts exactly 1 frame, then returns to idle
+            if st.stage == "passed" and now > st.passed_time:
+                st.stage = "idle"
+                st.aligned_area_ratio = 0.0
+                st.aligned_time = 0.0
+                st.aligned_frames = 0
+                st.flag_was_centered = False
+
             # time delta for velocity
             dt = max(1e-6, float(now - st.last_updated_time))
             st.last_updated_time = now
@@ -311,6 +323,7 @@ class PassDetector:
             st.last_seen_time = now
             st.last_score_ema = score_ema
 
+            prev_bbox = st.last_bbox
             bbox = tr.bbox
             st.last_bbox = bbox
 
@@ -345,6 +358,61 @@ class PassDetector:
             st.area_vel = vel
             st.area_vel_ema = (1.0 - self.area_vel_ema_alpha) * st.area_vel_ema + self.area_vel_ema_alpha * vel
             st.prev_area_ratio = area_ratio
+
+            # --------------------------------
+            # Sudden single-frame shrink while aligned => treat as disappeared.
+            # A real flythrough exit (or occlusion) often shows up as one huge
+            # frame-to-frame area drop while the track is still technically
+            # tracked (IoU kept matching). Without this, aligned_shrink_reset_frac
+            # only compares against the entry-time area, so a track that peaked
+            # huge and then shrank back can self-reset to idle long before it
+            # ever reaches the disappear-fire check, even though it was clearly
+            # near the camera edge at its peak.
+            # --------------------------------
+            if (
+                st.stage == "aligned"
+                and self.aligned_shrink_disappear_frac > 0
+                and prev > 0
+            ):
+                frame_drop_frac = (prev - area_ratio) / max(prev, 1e-9)
+                if frame_drop_frac >= self.aligned_shrink_disappear_frac:
+                    fired = False
+                    if st.aligned_frames >= self.min_aligned_frames:
+                        px1, py1, px2, py2 = prev_bbox
+                        edges_near = _count_edges_near_real_frame(
+                            px1, py1, px2, py2,
+                            frame_w, frame_h,
+                            self.cam_left_norm, self.cam_right_norm,
+                            self.flag_edge_tol,
+                        )
+                        if edges_near >= self.flag_min_edges:
+                            if self.pass_area_ratio > 0 and prev < self.pass_area_ratio:
+                                pass  # bbox area too small at fire time
+                            else:
+                                reason = "flag_frame_shrink" if _is_flag(ttype) else "gate_frame_shrink"
+                                st.last_reason_attempted = reason
+                                self._mark_passed(st, now, reason=reason)
+                                fired = (st.stage == "passed")
+                    if not fired:
+                        st.stage = "idle"
+                        st.aligned_area_ratio = 0.0
+                        st.aligned_time = 0.0
+                        st.aligned_frames = 0
+                        st.flag_was_centered = False
+                    continue
+
+            # --------------------------------
+            # Sudden area jump while aligned => likely bbox error, reset to idle
+            # --------------------------------
+            if st.stage == "aligned":
+                jump_frac = self.flag_aligned_area_jump_frac if _is_flag(ttype) else self.aligned_area_jump_frac
+                if jump_frac > 0 and prev > 0 and (area_ratio / max(prev, 1e-9)) >= jump_frac:
+                    st.stage = "idle"
+                    st.aligned_area_ratio = 0.0
+                    st.aligned_time = 0.0
+                    st.aligned_frames = 0
+                    st.flag_was_centered = False
+                    continue
 
             # --------------------------------
             # flag logic — enters aligned when centered (no growth requirement)
@@ -388,41 +456,11 @@ class PassDetector:
             elif st.stage == "aligned":
                 st.aligned_frames += 1
 
-                if st.aligned_area_ratio > 0 and not st.gate_area_peaked:
+                if st.aligned_area_ratio > 0:
                     drop_frac = (st.aligned_area_ratio - area_ratio) / max(st.aligned_area_ratio, 1e-9)
                     if drop_frac >= self.aligned_shrink_reset_frac:
-                        st.stage = "idle"
-                        st.aligned_area_ratio = 0.0
-                        st.aligned_time = 0.0
-                        st.aligned_frames = 0
-                        st.gate_area_peaked = False
-                        st.gate_peaked_area_ratio = 0.0
-
-                # in-frame pass: gate peaked above threshold (with good edges), now shrinking
-                if st.stage == "aligned" and self.gate_pass_area_thresh > 0:
-                    jump_ratio = area_ratio / prev if prev > 0 else 1.0
-                    if (area_ratio >= self.gate_pass_area_thresh
-                            and not st.gate_area_peaked
-                            and jump_ratio <= self.peak_area_max_jump):
-                        # latch only if edges are good RIGHT NOW at the peak
-                        x1, y1, x2, y2 = bbox
-                        edges_near = _count_edges_near_real_frame(
-                            x1, y1, x2, y2,
-                            frame_w, frame_h,
-                            self.cam_left_norm, self.cam_right_norm,
-                            self.flag_edge_tol,
-                        )
-                        if edges_near >= self.flag_min_edges:
-                            st.gate_area_peaked = True
-                            st.gate_peaked_area_ratio = area_ratio
-                    if st.gate_area_peaked:
-                        # track the true running maximum so fire triggers on real shrink
-                        st.gate_peaked_area_ratio = max(st.gate_peaked_area_ratio, area_ratio)
-                    if (st.gate_area_peaked
-                            and area_ratio < st.gate_peaked_area_ratio
-                            and st.aligned_frames >= self.min_aligned_frames):
-                        st.last_reason_attempted = "area_peak_shrink"
-                        self._mark_passed(st, now, reason="area_peak_shrink")
+                        self.states.pop(tid, None)
+                        continue
 
                 if st.stage == "aligned" and self.aligned_max_age_sec > 0:
                     if st.aligned_time > 0 and (now - st.aligned_time) > self.aligned_max_age_sec:
@@ -431,8 +469,6 @@ class PassDetector:
                         st.aligned_area_ratio = 0.0
                         st.aligned_time = 0.0
                         st.aligned_frames = 0
-                        st.gate_area_peaked = False
-                        st.gate_peaked_area_ratio = 0.0
 
         # handle disappeared tracks: if aligned recently => PASS
         for tid, st in list(self.states.items()):
@@ -451,9 +487,12 @@ class PassDetector:
                             self.flag_edge_tol,
                         )
                         if edges_near >= self.flag_min_edges:
-                            reason = "flag_disappear_edge" if _is_flag(st.ttype) else "disappear_after_align"
-                            st.last_reason_attempted = reason
-                            self._mark_passed(st, now, reason=reason)
+                            if self.pass_area_ratio > 0 and st.last_area_ratio < self.pass_area_ratio:
+                                pass  # bbox area too small at fire time
+                            else:
+                                reason = "flag_disappear_edge" if _is_flag(st.ttype) else "disappear_after_align"
+                                st.last_reason_attempted = reason
+                                self._mark_passed(st, now, reason=reason)
                 else:
                     # disappear window expired without firing — reset to idle so ghost bbox disappears
                     st.stage = "idle"
@@ -461,8 +500,6 @@ class PassDetector:
                     st.aligned_area_ratio = 0.0
                     st.aligned_time = 0.0
                     st.flag_was_centered = False
-                    st.gate_area_peaked = False
-                    st.gate_peaked_area_ratio = 0.0
 
             # cleanup old states
             if (now - st.last_seen_time) > 2.0:
@@ -512,17 +549,14 @@ class PassDetector:
             "reason": reason,
         }
 
-        # Reset every other aligned track to idle so they must re-establish
-        # alignment from scratch after a pass fires.
+        # Reset all aligned tracks (including the one that just fired) to idle.
         for other_tid, other_st in self.states.items():
-            if other_tid != st.track_id and other_st.stage == "aligned":
+            if other_st.stage == "aligned":
                 other_st.stage = "idle"
                 other_st.aligned_area_ratio = 0.0
                 other_st.aligned_time = 0.0
                 other_st.aligned_frames = 0
                 other_st.flag_was_centered = False
-                other_st.gate_area_peaked = False
-                other_st.gate_peaked_area_ratio = 0.0
 
     def clear_all_aligned(self):
         """Reset every aligned track to idle. Call on sibling instances after a pass fires."""
@@ -533,8 +567,6 @@ class PassDetector:
                 st.aligned_time = 0.0
                 st.aligned_frames = 0
                 st.flag_was_centered = False
-                st.gate_area_peaked = False
-                st.gate_peaked_area_ratio = 0.0
 
     def _gc_cooldowns(self, now: float):
         horizon = max(5.0, self.track_cooldown_sec * 4.0)

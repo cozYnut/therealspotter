@@ -101,7 +101,10 @@ _PARAM_META: Dict[str, Dict] = {
     "aligned_shrink_reset_frac": {"min": 0.0,  "max": 1.0,  "step": 0.01,  "dec": 2},
     "aligned_max_age_sec":       {"min": 0.0,  "max": 60.0, "step": 0.5,   "dec": 1},
     "flag_aligned_shrink_reset_frac": {"min": 0.0, "max": 1.0, "step": 0.01, "dec": 2},
-    "gate_pass_area_thresh":          {"min": 0.0, "max": 1.0, "step": 0.005, "dec": 3},
+    "aligned_shrink_disappear_frac": {"min": 0.0, "max": 1.0,  "step": 0.01,  "dec": 2},
+    "pass_area_ratio":               {"min": 0.0, "max": 1.0,  "step": 0.005, "dec": 3},
+    "aligned_area_jump_frac":        {"min": 0.0, "max": 10.0, "step": 0.1,   "dec": 1},
+    "flag_aligned_area_jump_frac":   {"min": 0.0, "max": 10.0, "step": 0.1,   "dec": 1},
 }
 
 
@@ -146,10 +149,19 @@ _PARAM_DOCS: Dict[str, str] = {
         "the alignment logic."
     ),
     "min_area_ratio": (
-        "Minimum fraction of frame area the bbox must cover before a gate is considered "
-        "close enough to align.\n\n"
+        "Align area Threshold — minimum fraction of frame area the bbox must cover before "
+        "a gate is considered close enough to align.\n\n"
         "Example: 0.03 = gate must cover at least 3 % of the frame. "
         "Increase to ignore distant gates."
+    ),
+    "pass_area_ratio": (
+        "Pass area Threshold — minimum fraction of frame area the bbox must cover at the "
+        "moment a pass fires. Checked against the pre-shrink bbox for gate_frame_shrink, "
+        "and against last known area for disappear-based passes.\n\n"
+        "0.0 (default) = disabled — no area check at fire time.\n\n"
+        "Example: 0.10 → pass only fires if the gate covered at least 10 % of the frame "
+        "at the moment the pass event is evaluated. Prevents stale/shrunken bboxes from "
+        "triggering a pass after the gate has nearly left view."
     ),
     "center_tol": (
         "Maximum normalised distance from frame centre for a gate to be considered aligned.\n\n"
@@ -216,15 +228,6 @@ _PARAM_DOCS: Dict[str, str] = {
         "Filters out single-frame glitch alignments.\n\n"
         "Example: 3 → gate must be aligned across 3 frames (~100 ms at 30 fps)."
     ),
-    "gate_pass_area_thresh": (
-        "Two-step in-frame pass trigger for gates:\n"
-        "1. Gate's area_ratio (shown in bbox overlay as 'ar=') rises above this threshold.\n"
-        "2. Area then starts shrinking (area velocity EMA < 0) AND edges are near the "
-        "camera boundary → pass fires immediately, no disappearance needed.\n\n"
-        "0.0 (default) = disabled — only disappear-based passes fire.\n\n"
-        "Example: 0.35 → gate must first cover 35 % of the frame, then as soon as it "
-        "starts shrinking and is near the edges, pass fires."
-    ),
     "flag_aligned_shrink_reset_frac": (
         "Flag-specific shrink reset threshold. If the flag's bbox area drops by this "
         "fraction relative to when it entered aligned, reset to idle.\n\n"
@@ -232,10 +235,32 @@ _PARAM_DOCS: Dict[str, str] = {
         "past them (not through them) so the bbox may shrink as you pass.\n\n"
         "Example: 0.30 → if the flag bbox shrinks 30 % from its aligned size, disarm."
     ),
+    "aligned_shrink_disappear_frac": (
+        "If the area shrinks by this fraction in a SINGLE frame while aligned, treat the "
+        "track as if it disappeared at the end of the previous frame, and evaluate a pass "
+        "using that previous (larger) bbox — instead of waiting for aligned_shrink_reset_frac "
+        "to silently disarm it over several frames.\n\n"
+        "0.0 (default) = disabled.\n\n"
+        "Example: 0.50 → a gate that loses more than half its area in one frame (e.g. a fast "
+        "flythrough exit that's still technically tracked) fires a pass right then if it was "
+        "near the camera edge, instead of shrinking back to nothing unnoticed."
+    ),
     "ignore_flagpoles": (
         "Skip all flagpole detections in this pass detector instance.\n\n"
         "Example: enable this in the GATES detector and disable in the FLAGS detector "
         "so each handles only its own type."
+    ),
+    "aligned_area_jump_frac": (
+        "If a gate's bbox area grows by this multiplier in a single frame while aligned, "
+        "reset to idle — likely a bbox glitch or wrong detection merged in.\n\n"
+        "0.0 (default) = disabled.\n\n"
+        "Example: 2.5 → if the bbox becomes 2.5× larger than the previous frame, disarm."
+    ),
+    "flag_aligned_area_jump_frac": (
+        "Same as Aligned Area Jump, but for flagpoles.\n\n"
+        "0.0 (default) = disabled.\n\n"
+        "Example: 2.5 → if the flag bbox becomes 2.5× larger than the previous frame while "
+        "aligned, reset to idle."
     ),
 }
 
@@ -262,7 +287,7 @@ _GATE_SKIP: set = {
     "flag_center_tol",
     "flag_aligned_shrink_reset_frac",
     "ignore_flagpoles",
-    "flag_aligned_shrink_reset_frac",
+    "flag_aligned_area_jump_frac",
 }
 
 # Params that only make sense for gates — hide from the FLAGS section
@@ -271,8 +296,9 @@ _FLAG_SKIP: set = {
     "min_area_vel_ema",
     "area_vel_ema_alpha",
     "aligned_shrink_reset_frac",
-    "gate_pass_area_thresh",
     "flag_aligned_shrink_reset_frac",
+    "aligned_shrink_disappear_frac",
+    "aligned_area_jump_frac",
 }
 
 
@@ -811,11 +837,6 @@ class RunnerThread(QThread):
                         evt["bbox"] = list(st.last_bbox)
                     n_events += 1
                     self.event_found.emit(evt)
-
-            # if any pass fired, clear aligned tracks across both instances
-            if pass_fired:
-                passdet_gates.clear_all_aligned()
-                passdet_flags.clear_all_aligned()
 
             # alignment events from both passdets
             for pd in (passdet_gates, passdet_flags):
