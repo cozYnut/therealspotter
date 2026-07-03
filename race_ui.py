@@ -38,7 +38,7 @@ try:
         QPushButton, QLabel, QListWidget, QListWidgetItem, QFileDialog,
         QSizePolicy, QMessageBox, QToolBar, QStatusBar, QFrame,
         QProgressBar, QTableWidget, QTableWidgetItem, QHeaderView,
-        QScrollArea, QSplitter, QDoubleSpinBox,
+        QScrollArea, QSplitter, QDoubleSpinBox, QSpinBox,
     )
     from PyQt6.QtCore import Qt, QTimer, QRect, QPoint, pyqtSignal, QProcess
     from PyQt6.QtGui import (
@@ -569,6 +569,7 @@ class MainWindow(QMainWindow):
         self._det_model_path: Optional[str] = self._find_model_auto()
         self._clip_device: str = _auto_clip_device()
         self._sim_thresh, self._min_match_margin = self._load_gatedb_defaults()
+        self._min_gates_between_laps: int = 7
 
         # Race data
         self._race_data: Optional[dict] = None
@@ -635,9 +636,9 @@ class MainWindow(QMainWindow):
 
         tb.addWidget(QLabel("  Sim ≥ "))
         self._sim_spin = QDoubleSpinBox()
-        self._sim_spin.setRange(0.50, 0.99)
-        self._sim_spin.setSingleStep(0.01)
-        self._sim_spin.setDecimals(2)
+        self._sim_spin.setRange(0.50, 0.999)
+        self._sim_spin.setSingleStep(0.001)
+        self._sim_spin.setDecimals(3)
         self._sim_spin.setValue(self._sim_thresh)
         self._sim_spin.setFixedWidth(68)
         self._sim_spin.setToolTip("Minimum cosine similarity for a gate to count as MATCH")
@@ -654,6 +655,16 @@ class MainWindow(QMainWindow):
         self._margin_spin.setToolTip("Minimum gap between best and second-best gate similarity")
         self._margin_spin.valueChanged.connect(lambda v: setattr(self, "_min_match_margin", v))
         tb.addWidget(self._margin_spin)
+
+        tb.addWidget(QLabel("  Min gates/lap "))
+        self._gates_spin = QSpinBox()
+        self._gates_spin.setRange(1, 50)
+        self._gates_spin.setSingleStep(1)
+        self._gates_spin.setValue(self._min_gates_between_laps)
+        self._gates_spin.setFixedWidth(50)
+        self._gates_spin.setToolTip("Minimum gates that must match before G1 can start a new lap")
+        self._gates_spin.valueChanged.connect(lambda v: setattr(self, "_min_gates_between_laps", int(v)))
+        tb.addWidget(self._gates_spin)
 
         tb.addSeparator()
 
@@ -963,8 +974,9 @@ class MainWindow(QMainWindow):
             "--gate-memory",        self._gate_memory_path,
             "--output",             out_json,
             "--clip-device",        self._clip_device,
-            "--sim-thresh",         str(round(self._sim_thresh, 2)),
-            "--min-match-margin",   str(round(self._min_match_margin, 2)),
+            "--sim-thresh",              str(round(self._sim_thresh, 3)),
+            "--min-match-margin",        str(round(self._min_match_margin, 2)),
+            "--min-gates-between-laps",  str(int(self._min_gates_between_laps)),
         ]
         self._proc.start(sys.executable, args)
 
@@ -1213,7 +1225,7 @@ class MainWindow(QMainWindow):
             else:
                 gid_to_pos = {int(g["gate_id"]): i for i, g in enumerate(self._gate_mem)}
                 exp = gid_to_pos.get(matched_gid, 0)
-            idxs = list(dict.fromkeys([exp, (exp + 1) % n, 0]))
+            idxs = list(dict.fromkeys([exp, (exp - 1) % n, 0]))
             window = [self._gate_mem[i] for i in idxs]
         else:
             window = []

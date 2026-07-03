@@ -280,7 +280,7 @@ class GateDB:
 
         exp = int(self._expected_idx) % n
         seen: List[int] = []
-        for idx in [exp, (exp + 1) % n, 0]:
+        for idx in [exp, (exp - 1) % n, 0]:
             if idx not in seen:
                 seen.append(idx)
         return seen
@@ -767,6 +767,7 @@ class GateDB:
         source:
           - "RACE" if above threshold
           - "NOMATCH" otherwise
+          - "DUP" if all valid candidates were already seen this lap
         """
         gate_type = str(gate_type)
         embn = self._l2norm(emb)
@@ -787,12 +788,53 @@ class GateDB:
         if not candidates:
             return -1, 0.0, "NOMATCH", 0.0, 0.0, exp_before, window_size
 
+        # Determine which candidates are valid (not already seen this lap).
+        # The start gate (G1) is only valid when both the time gap AND the
+        # minimum gate count since the last lap are satisfied.  This prevents
+        # G1 from silently "winning" mid-course and resetting expected_idx.
+        def _is_valid(m: MemoryGate) -> bool:
+            gid = int(m.gate_id)
+            if gid == int(self.start_gate_id):
+                first_ever = self._last_lap_t < 0  # very first lap start
+                gap_ok = (now - self._last_lap_t) >= self.min_lap_gap_sec
+                gates_ok = self._passes_since_lap >= self.min_gates_between_laps
+                return first_ever or (gap_ok and gates_ok)
+            return gid not in self._seen_gate_ids_this_lap
+
+        valid_candidates = [m for m in candidates if _is_valid(m)]
+
+        # Score over valid candidates only so that G1/G2 (when already seen)
+        # can't steal the match from the genuinely expected next gate.
+        if not valid_candidates:
+            # All window gates already seen; compute best sim for diagnostics.
+            best_sim_all = -1.0
+            best_m_all: Optional[MemoryGate] = None
+            for m in candidates:
+                if not m.embeds:
+                    continue
+                s = self._max_sim_to_bank(embn, m.embeds)
+                if s > best_sim_all:
+                    best_sim_all = s
+                    best_m_all = m
+            gid_ui = int(best_m_all.gate_id) if best_m_all else -1
+            print(" match best candidate is  ", gid_ui)
+            if best_m_all is not None:
+                proto = self._update_gate_proto_from_bank(best_m_all)
+                g = self._ensure_gateinfo(gid_ui, best_m_all.gate_type, proto, now=float(now))
+                g.last_seen_t = float(now)
+                g.last_sim = float(best_sim_all)
+                g.last_match_source = "DUP"
+                g.last_second_sim = 0.0
+                g.last_margin = 0.0
+                g.last_expected_idx = exp_before
+                g.last_window_size = window_size
+            return -1, float(max(best_sim_all, 0.0)), "DUP", 0.0, 0.0, exp_before, window_size
+
         best_sim = -1.0
         second_sim = -1.0
         best_m: Optional[MemoryGate] = None
 
-        for m in candidates:
-
+        for m in valid_candidates:
             if not m.embeds:
                 continue
             smax = self._max_sim_to_bank(embn, m.embeds)
@@ -803,7 +845,6 @@ class GateDB:
             elif smax > second_sim:
                 second_sim = smax
 
-
         if best_m is None:
             return -1, 0.0, "NOMATCH", 0.0, 0.0, exp_before, window_size
 
@@ -813,14 +854,9 @@ class GateDB:
         gid = int(best_m.gate_id)
 
         if ok and gid == int(self.start_gate_id):
-            # optional debounce (keep your knob)
-            if (now - self._last_lap_t) >= self.min_lap_gap_sec:
-                self._start_new_lap_after_start_gate(now=float(now))
+            # Lap conditions verified by _is_valid(); safe to start new lap.
+            self._start_new_lap_after_start_gate(now=float(now))
             src = "RACE"
-        # Enforce: each gate can only be counted once per lap
-        elif ok and gid in self._seen_gate_ids_this_lap:
-            ok = False
-            src = "DUP"   # duplicate within lap
         else:
             src = "RACE" if ok else "NOMATCH"
 
