@@ -23,7 +23,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-from pass_detector import PassDetector, detect_camera_edges, _is_flag
+from pass_detector import PassDetector, detect_camera_edges
 from gate_db import GateDB
 from collections import deque
 from lazy_spotter import (
@@ -33,16 +33,6 @@ from lazy_spotter import (
     _get_yolo_names,
     _cls_to_name,
 )
-
-_DEFAULTS_PATH = Path(__file__).parent / "debug_ui_defaults.json"
-
-
-def _load_defaults() -> dict:
-    try:
-        with open(_DEFAULTS_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"tracker": {}, "gates": {}, "flags": {}}
 
 
 def _crop_padded(frame: np.ndarray, bbox: list, pad_frac: float = 0.5):
@@ -66,22 +56,19 @@ def run_race_extraction(
     pass_offset_sec: float = 0.0,
     sim_thresh: float = 0.88,
     min_match_margin: float = 0.03,
-    min_gates_between_laps: int = 7,
 ):
     print(f"Loading detector: {det_model_path}")
     det = YOLO(det_model_path)
     names = _get_yolo_names(det)
     print(f"Classes: {list(names.values())}")
 
-    defs = _load_defaults()
-    tracker       = TimeTracker(**defs.get("tracker", {}))
-    passdet_gates = PassDetector(**defs.get("gates", {}))
-    passdet_flags = PassDetector(**defs.get("flags", {}))
+    tracker = TimeTracker()
+    passdet = PassDetector()
     clip = ClipEmbedder(device=clip_device)
 
     gatedb = GateDB(
         sim_thresh=sim_thresh, require_same_type=False,
-        min_lap_gap_sec=6.0, min_gates_between_laps=min_gates_between_laps,
+        min_lap_gap_sec=6.0, min_gates_between_laps=2,
         min_match_margin=min_match_margin, race_lookahead=3, max_embeds_per_gate=6,
     )
     gatedb.set_mode("race")
@@ -95,8 +82,7 @@ def run_race_extraction(
     ok, first_frame = cap.read()
     if ok:
         left_norm, right_norm = detect_camera_edges(first_frame)
-        passdet_gates.set_camera_edges(left_norm, right_norm)
-        passdet_flags.set_camera_edges(left_norm, right_norm)
+        passdet.set_camera_edges(left_norm, right_norm)
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -140,13 +126,10 @@ def run_race_extraction(
         # ── Track + pass detector ───────────────────────────────
         frame_buffer.append(frame)
         tracks = tracker.update(typed, t)
-        gate_tracks = [tr for tr in tracks if not _is_flag(tr.locked_type or "")]
-        flag_tracks  = [tr for tr in tracks if     _is_flag(tr.locked_type or "")]
-        passdet_gates.update(gate_tracks, t, frame_w=W, frame_h=H)
-        passdet_flags.update(flag_tracks,  t, frame_w=W, frame_h=H)
+        passdet.update(tracks, t, frame_w=W, frame_h=H)
         bbox_buffer.append({int(tr.track_id): list(tr.bbox) for tr in tracks})
 
-        st_map = {**getattr(passdet_gates, "states", {}), **getattr(passdet_flags, "states", {})}
+        st_map = getattr(passdet, "states", {}) or {}
 
         # ── Per-frame track info ────────────────────────────────
         frame_tracks = []
@@ -173,65 +156,64 @@ def run_race_extraction(
         frame_passes = []
         frame_laps = []
 
-        for pd in (passdet_gates, passdet_flags):
-            while True:
-                evt = pd.pop_any_passed()
-                if evt is None:
-                    break
+        while True:
+            evt = passdet.pop_any_passed()
+            if evt is None:
+                break
 
-                tid = int(evt.get("track_id", -1))
-                evt_type = str(evt.get("type", "UNKNOWN"))
+            tid = int(evt.get("track_id", -1))
+            evt_type = str(evt.get("type", "UNKNOWN"))
 
-                frames  = list(frame_buffer)
-                bboxes  = list(bbox_buffer)
-                embed_frame = frames[0] if frames else frame   # 4 frames before fire
+            frames  = list(frame_buffer)
+            bboxes  = list(bbox_buffer)
+            embed_frame = frames[0] if frames else frame   # 4 frames before fire
 
-                # Crop to gate bbox from that same frame; fall back to full frame
-                past_bbox = bboxes[0].get(tid) if bboxes else None
-                if past_bbox:
-                    embed_crop, _ = _crop_padded(embed_frame, past_bbox)
-                else:
-                    embed_crop = embed_frame
+            # Crop to gate bbox from that same frame; fall back to full frame
+            past_bbox = bboxes[0].get(tid) if bboxes else None
+            if past_bbox:
+                embed_crop, _ = _crop_padded(embed_frame, past_bbox)
+            else:
+                embed_crop = embed_frame
 
-                emb = clip.embed_bgr(embed_crop)
+            emb = clip.embed_bgr(embed_crop)
 
-                q_fname = f"q_{frame_idx:06d}_{int(t * 1000)}.jpg"
-                query_img_path = str(Path(query_frames_dir) / q_fname)
-                cv2.imwrite(query_img_path, embed_crop)
+            q_fname = f"q_{frame_idx:06d}_{int(t * 1000)}.jpg"
+            query_img_path = str(Path(query_frames_dir) / q_fname)
+            cv2.imwrite(query_img_path, embed_crop)
 
-                prev_race_laps = len(getattr(gatedb, "_race_laps", []))
+            prev_race_laps = len(getattr(gatedb, "_race_laps", []))
 
-                gid, sim, source, _s2, _mg, exp_before, _wsz = gatedb.race_match(
-                    now=t, gate_type=evt_type, emb=emb
+            gid, sim, source, _s2, _mg, exp_before, _wsz = gatedb.race_match(
+                now=t, gate_type=evt_type, emb=emb
+            )
+            if source != "RACE":
+                gid = -1
+            else:
+                gatedb.on_pass(
+                    now=t, gate_id=gid, gate_type=evt_type,
+                    sim=sim, reason=str(evt.get("reason", "")),
+                    track_id=tid,
                 )
-                if source != "RACE":
-                    gid = -1
-                else:
-                    gatedb.on_pass(
-                        now=t, gate_id=gid, gate_type=evt_type,
-                        sim=sim, reason=str(evt.get("reason", "")),
-                        track_id=tid,
-                    )
 
-                new_race_laps = len(getattr(gatedb, "_race_laps", []))
-                if new_race_laps > prev_race_laps:
-                    closed = gatedb._race_laps[-1]
-                    frame_laps.append({"lap": int(closed.get("lap", 0)), "t": float(closed.get("t1", t))})
+            new_race_laps = len(getattr(gatedb, "_race_laps", []))
+            if new_race_laps > prev_race_laps:
+                closed = gatedb._race_laps[-1]
+                frame_laps.append({"lap": int(closed.get("lap", 0)), "t": float(closed.get("t1", t))})
 
-                pass_entry = {
-                    "t": round(t, 4),
-                    "gate_id": int(gid),
-                    "gate_type": evt_type,
-                    "sim": round(float(sim), 4),
-                    "source": source,
-                    "reason": str(evt.get("reason", "")),
-                    "track_id": tid,
-                    "exp_before": int(exp_before),
-                    "query_img":  query_img_path,
-                    "query_embedding": emb.tolist(),
-                }
-                frame_passes.append(pass_entry)
-                all_passes.append(dict(pass_entry))  # copy — offset shift must not affect frames_data
+            pass_entry = {
+                "t": round(t, 4),
+                "gate_id": int(gid),
+                "gate_type": evt_type,
+                "sim": round(float(sim), 4),
+                "source": source,
+                "reason": str(evt.get("reason", "")),
+                "track_id": tid,
+                "exp_before": int(exp_before),
+                "query_img":  query_img_path,
+                "query_embedding": emb.tolist(),
+            }
+            frame_passes.append(pass_entry)
+            all_passes.append(dict(pass_entry))  # copy — offset shift must not affect frames_data
 
         # ── Save frame entry (skip empty frames to save space) ──
         entry = {"idx": frame_idx, "t": round(t, 4)}
@@ -290,8 +272,6 @@ def main():
                         help="Minimum cosine similarity for a gate to count as matched (default: 0.88)")
     parser.add_argument("--min-match-margin",  type=float, default=0.03,
                         help="Minimum gap between best and second-best gate similarity (default: 0.03)")
-    parser.add_argument("--min-gates-between-laps", type=int, default=7,
-                        help="Minimum number of gates that must be matched before G1 can start a new lap (default: 7)")
     args = parser.parse_args()
 
     run_race_extraction(
@@ -304,7 +284,6 @@ def main():
         pass_offset_sec=args.pass_offset_sec,
         sim_thresh=args.sim_thresh,
         min_match_margin=args.min_match_margin,
-        min_gates_between_laps=args.min_gates_between_laps,
     )
 
 
