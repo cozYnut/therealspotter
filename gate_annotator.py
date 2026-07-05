@@ -1811,8 +1811,8 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Open a video to begin, or browse the Full Dataset tab.")
 
-        self.addAction(QAction(self, shortcut=Qt.Key.Key_Left,        triggered=self._prev_frame))
-        self.addAction(QAction(self, shortcut=Qt.Key.Key_Right,       triggered=self._next_frame))
+        self.addAction(QAction(self, shortcut=Qt.Key.Key_Left,        triggered=self._global_prev))
+        self.addAction(QAction(self, shortcut=Qt.Key.Key_Right,       triggered=self._global_next))
         self.addAction(QAction(self, shortcut=QKeySequence("Ctrl+S"), triggered=self._save_frame))
         self.addAction(QAction(self, shortcut=Qt.Key.Key_Delete,      triggered=self._canvas.delete_selected))
 
@@ -2205,6 +2205,36 @@ class MainWindow(QMainWindow):
 
     def _prev_frame(self) -> None: self._go_to_frame(self._frame_idx - 1)
     def _next_frame(self) -> None: self._go_to_frame(self._frame_idx + 1)
+
+    def _global_prev(self) -> None:
+        if self._mode == "dataset":
+            self._ds_step(-1)
+        else:
+            self._prev_frame()
+
+    def _global_next(self) -> None:
+        if self._mode == "dataset":
+            self._ds_step(1)
+        else:
+            self._next_frame()
+
+    def _ds_step(self, delta: int) -> None:
+        """Move selection by one step in the thumbnail grid, skipping hidden items."""
+        lst = self._ds_image_list
+        n   = lst.count()
+        if n == 0:
+            return
+        selected = lst.selectedItems()
+        current  = lst.row(selected[0]) if selected else (-1 if delta > 0 else n)
+        row = current + delta
+        while 0 <= row < n:
+            item = lst.item(row)
+            if item and not item.isHidden():
+                lst.clearSelection()
+                item.setSelected(True)
+                lst.scrollToItem(item)
+                return
+            row += delta
     def _on_frame_spin(self) -> None: self._go_to_frame(self._frame_spin.value())
 
     # ── inference ─────────────────────────────────────────────────────────────
