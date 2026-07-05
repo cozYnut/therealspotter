@@ -4,14 +4,19 @@ opencv-python
 ultralytics
 Pillow
 
-# CLIP embeddings
-# PyTorch: install the right build for your hardware first:
-#   CPU:        pip install torch torchvision
-#   Apple MPS:  pip install torch torchvision   (MPS is included on macOS ≥ 12)
+# PyTorch — install the right build for your hardware FIRST, then pip install -r requirements.txt
+#   Apple MPS:  pip install torch torchvision          (MPS included on macOS ≥ 12)
+#   CPU only:   pip install torch torchvision
 #   CUDA:       pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 torch
 torchvision
+
+# CLIP embeddings (used by learn_ui / race_ui)
 open-clip-torch
 
-# Learning UI (Phase 2 only — not needed for lazy_spotter.py)
+# Gate annotation tool (gate_annotator.py)
+PySide6
+PyYAML
+
+# Learning UI — legacy (learn_ui.py still imports PyQt6)
 PyQt6
