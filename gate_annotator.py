@@ -456,6 +456,89 @@ class DatasetManager:
         payload["bbox_approved"] = True
         lbl.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
+    def copy_video_frames_to_pool(
+        self,
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+    ) -> tuple[int, int, list[str]]:
+        """Copy every saved video frame into the imported pool (originals kept).
+
+        Preserves all annotation data, bbox_approved, and kpt_approved.
+        Deduplicates by MD5 hash so running twice is safe.
+        """
+        errors: list[str] = []
+
+        prov_path = self.root / "provenance.json"
+        prov: dict = json.loads(prov_path.read_text()) if prov_path.exists() else {}
+        known_hashes = {v.get("file_hash") for v in prov.values() if v.get("file_hash")}
+
+        # Collect all video-frame label JSONs (skip the imported subdir)
+        lbl_root = self.root / "labels"
+        all_labels: list[tuple[Path, str]] = []
+        if lbl_root.exists():
+            for vdir in sorted(lbl_root.iterdir()):
+                if not vdir.is_dir() or vdir.name == self._IMPORTED:
+                    continue
+                for lf in sorted(vdir.glob("*.json")):
+                    all_labels.append((lf, vdir.name))
+
+        total = len(all_labels)
+        copied = skipped = 0
+
+        for i, (lf, video_stem) in enumerate(all_labels):
+            if progress_cb:
+                progress_cb(i, total)
+            try:
+                payload  = json.loads(lf.read_text(encoding="utf-8"))
+                img_path = Path(payload["image_path"])
+                if not img_path.exists():
+                    errors.append(f"Image missing: {img_path.name}")
+                    skipped += 1
+                    continue
+
+                raw = img_path.read_bytes()
+                h   = hashlib.md5(raw).hexdigest()[:8]
+                if h in known_hashes:
+                    skipped += 1
+                    continue
+
+                fi = payload["frame_idx"]
+                pool_stem = (f"{video_stem}_{fi:06d}_{h}"
+                             if isinstance(fi, int) else f"{video_stem}_{fi}_{h}")
+
+                out_img = self.root / "frames" / self._IMPORTED / f"{pool_stem}.jpg"
+                out_img.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(str(img_path), str(out_img))
+
+                out_lbl = self.root / "labels" / self._IMPORTED / f"{pool_stem}.json"
+                out_lbl.parent.mkdir(parents=True, exist_ok=True)
+                out_lbl.write_text(json.dumps({
+                    "video_stem":    self._IMPORTED,
+                    "frame_idx":     pool_stem,
+                    "image_path":    str(out_img),
+                    "bbox_approved": payload.get("bbox_approved", True),
+                    "kpt_approved":  payload.get("kpt_approved",  False),
+                    "gates":         payload.get("gates", []),
+                }, indent=2), encoding="utf-8")
+
+                prov[f"{self._IMPORTED}/{pool_stem}"] = {
+                    "source":              "video_frame",
+                    "original_video":      video_stem,
+                    "original_frame_idx":  fi,
+                    "original_path":       str(img_path),
+                    "file_hash":           h,
+                    "date_added":          datetime.now().isoformat(),
+                }
+                known_hashes.add(h)
+                copied += 1
+            except Exception as e:
+                errors.append(f"{lf.name}: {e}")
+                skipped += 1
+
+        if progress_cb:
+            progress_cb(total, total)
+        prov_path.write_text(json.dumps(prov, indent=2), encoding="utf-8")
+        return copied, skipped, errors
+
     def set_image_approval(
         self,
         label_path: "str | Path",
@@ -1518,6 +1601,25 @@ class _ImportWorker(QObject):
         self.finished.emit(imported, skipped, errors)
 
 
+class _CopyWorker(QObject):
+    """Copies saved video frames into the imported pool in a background thread."""
+    progress = Signal(int, int)         # done, total
+    finished = Signal(int, int, list)   # copied, skipped, errors
+
+    def __init__(self, dm: DatasetManager) -> None:
+        super().__init__()
+        self._dm = dm
+
+    def run(self) -> None:
+        def cb(done: int, total: int) -> None:
+            self.progress.emit(done, total)
+        try:
+            copied, skipped, errors = self._dm.copy_video_frames_to_pool(cb)
+        except Exception as e:
+            copied, skipped, errors = 0, 0, [str(e)]
+        self.finished.emit(copied, skipped, errors)
+
+
 class _ThumbLoader(QObject):
     """Background worker: generates / reads cached thumbnails and emits them."""
     thumb_ready = Signal(str, object)   # (label_path, QImage) — QImage is thread-safe
@@ -1689,6 +1791,8 @@ class MainWindow(QMainWindow):
         self._ds_frame: Optional[np.ndarray] = None
         self._import_worker: Optional[_ImportWorker] = None
         self._import_thread: Optional[QThread]       = None
+        self._copy_worker:   Optional[_CopyWorker]   = None
+        self._copy_thread:   Optional[QThread]       = None
         self._ds_folder: Optional[str]               = None  # last browsed folder path
         self._label_to_row: dict[str, int]           = {}
         self._thumb_worker: Optional[_ThumbLoader]   = None
@@ -1897,6 +2001,14 @@ class MainWindow(QMainWindow):
         self._btn_import.setEnabled(False)
         self._btn_import.clicked.connect(self._import_dataset)
         top.addWidget(self._btn_import)
+
+        self._btn_copy_video = QPushButton("Copy Video Frames to Pool")
+        self._btn_copy_video.setToolTip(
+            "Copy every saved video frame into the imported pool.\n"
+            "Originals are kept — safe to run multiple times."
+        )
+        self._btn_copy_video.clicked.connect(self._copy_video_frames)
+        top.addWidget(self._btn_copy_video)
 
         btn_refresh = QPushButton("↻ Refresh")
         btn_refresh.clicked.connect(self._refresh_dataset_list)
@@ -2320,6 +2432,45 @@ class MainWindow(QMainWindow):
     def _on_import_progress(self, done: int, total: int) -> None:
         self.statusBar().showMessage(f"Importing dataset images… {done}/{total}")
 
+    def _copy_video_frames(self) -> None:
+        if self._copy_thread and self._copy_thread.isRunning():
+            return
+        self._btn_copy_video.setEnabled(False)
+        self._ds_status.setText("Copying video frames…")
+        self._ds_status.setStyleSheet("color: #daa800; font-size: 11px;")
+
+        self._copy_worker = _CopyWorker(self._dm)
+        thread = QThread(self)
+        self._copy_worker.moveToThread(thread)
+        thread.started.connect(self._copy_worker.run)
+        self._copy_worker.progress.connect(self._on_copy_progress)
+        self._copy_worker.finished.connect(self._on_copy_finished)
+        self._copy_worker.finished.connect(thread.quit)
+        thread.finished.connect(thread.deleteLater)
+        self._copy_thread = thread
+        thread.start()
+
+    def _on_copy_progress(self, done: int, total: int) -> None:
+        self.statusBar().showMessage(f"Copying video frames to pool… {done}/{total}")
+
+    def _on_copy_finished(self, copied: int, skipped: int, errors: list) -> None:
+        self._copy_worker = None
+        self._copy_thread = None
+        self._btn_copy_video.setEnabled(True)
+
+        msg = f"✓ {copied} copied, {skipped} skipped"
+        if errors:
+            msg += f", {len(errors)} errors"
+        self._ds_status.setText(msg)
+        self._ds_status.setStyleSheet("color: #37c837; font-size: 11px;")
+        self.statusBar().showMessage(f"Copy done — {msg}")
+
+        if errors:
+            QMessageBox.warning(self, "Copy Warnings",
+                                "\n".join(errors[:20]) +
+                                (f"\n…and {len(errors)-20} more" if len(errors) > 20 else ""))
+        self._refresh_dataset_list()
+
     def _on_import_finished(self, imported: int, skipped: int, errors: list) -> None:
         self._import_worker = None
         self._import_thread = None
@@ -2708,6 +2859,9 @@ class MainWindow(QMainWindow):
             self._worker.stop()
         if self._thumb_worker:
             self._thumb_worker.stop()
+        if self._copy_thread and self._copy_thread.isRunning():
+            self._copy_thread.quit()
+            self._copy_thread.wait(1000)
         if self._unsaved:
             self._save_frame(silent=True)
         if self._video:
