@@ -555,6 +555,26 @@ class DatasetManager:
             data["kpt_approved"] = kpt_approved
         p.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
+    def delete_images(self, items: list[dict]) -> tuple[int, list[str]]:
+        """Delete label + image files and clean up val_split. Returns (deleted_count, errors)."""
+        entry_ids = {e["entry_id"] for e in items}
+        errors: list[str] = []
+        deleted = 0
+        for entry in items:
+            try:
+                lp = Path(entry["label_path"])
+                ip = Path(entry["image_path"])
+                if lp.exists():
+                    lp.unlink()
+                if ip.exists():
+                    ip.unlink()
+                deleted += 1
+            except Exception as exc:
+                errors.append(f"{entry['stem']}: {exc}")
+        # clean up val_split
+        self.remove_from_val_split(entry_ids)
+        return deleted, errors
+
     def list_all_images(self) -> list[dict]:
         """Return all annotated images from every subdir, with approval + source metadata."""
         root = self.root / "labels"
@@ -568,6 +588,10 @@ class DatasetManager:
             for lf in sorted(vdir.glob("*.json")):
                 try:
                     data = json.loads(lf.read_text(encoding="utf-8"))
+                    vs = data.get("video_stem", "")
+                    fi = data.get("frame_idx",  lf.stem)
+                    eid = (f"{vs}/{fi:06d}" if isinstance(fi, int)
+                           else f"{vs}/{fi}")
                     results.append({
                         "label_path":    str(lf),
                         "image_path":    data.get("image_path", ""),
@@ -575,6 +599,7 @@ class DatasetManager:
                         "kpt_approved":  data.get("kpt_approved",  False),
                         "source":        src,
                         "stem":          lf.stem,
+                        "entry_id":      eid,
                     })
                 except Exception:
                     pass
@@ -591,6 +616,18 @@ class DatasetManager:
     def get_val_split(self) -> set[str]:
         p = self.root / "val_split.json"
         return set(json.loads(p.read_text())) if p.exists() else set()
+
+    def add_to_val_split(self, entry_ids: set) -> None:
+        p = self.root / "val_split.json"
+        current = set(json.loads(p.read_text())) if p.exists() else set()
+        current |= set(entry_ids)
+        p.write_text(json.dumps(sorted(current), indent=2), encoding="utf-8")
+
+    def remove_from_val_split(self, entry_ids: set) -> None:
+        p = self.root / "val_split.json"
+        current = set(json.loads(p.read_text())) if p.exists() else set()
+        current -= set(entry_ids)
+        p.write_text(json.dumps(sorted(current), indent=2), encoding="utf-8")
 
     def create_val_split(self, val_frac: float = 0.15) -> set[str]:
         entries = self._collect_all_labels()
@@ -669,6 +706,55 @@ class DatasetManager:
         )
         print(f"[Dataset] detect → {out}  ({len(train_e)} train / {len(val_e)} val)")
         return out
+
+    def export_filtered_dataset(
+        self,
+        label_paths: list[str],
+        output_dir: str,
+        frozen_val_ids: Optional[set] = None,
+    ) -> tuple[int, int]:
+        """Export a YOLO detect dataset from an explicit list of label paths.
+        Respects the frozen val split; returns (train_count, val_count)."""
+        out = Path(output_dir)
+        for split in ("train", "val"):
+            (out / "images" / split).mkdir(parents=True, exist_ok=True)
+            (out / "labels" / split).mkdir(parents=True, exist_ok=True)
+
+        val_ids = frozen_val_ids if frozen_val_ids is not None else self.get_val_split()
+
+        train_n = val_n = 0
+        for lp in label_paths:
+            try:
+                p = Path(lp)
+                data = json.loads(p.read_text(encoding="utf-8"))
+                eid  = self._entry_id(data)
+                fi   = data["frame_idx"]
+                stem = (f"{data['video_stem']}_{fi:06d}"
+                        if isinstance(fi, int)
+                        else f"{data['video_stem']}_{fi}")
+                split_name = "val" if eid in val_ids else "train"
+                img_src = Path(data.get("image_path", ""))
+                if img_src.exists():
+                    shutil.copy(img_src, out / "images" / split_name / f"{stem}.jpg")
+                txt = self._detect_txt(data)
+                if txt:
+                    (out / "labels" / split_name / f"{stem}.txt").write_text(
+                        txt, encoding="utf-8"
+                    )
+                if split_name == "val":
+                    val_n += 1
+                else:
+                    train_n += 1
+            except Exception as exc:
+                print(f"[Dataset] skip {lp}: {exc}")
+
+        (out / "data.yaml").write_text(
+            f"path: {out.resolve()}\ntrain: images/train\nval: images/val\n"
+            f"nc: {len(CLASS_INDICES)}\nnames: {list(CLASS_INDICES.keys())}\n",
+            encoding="utf-8",
+        )
+        print(f"[Dataset] filtered export → {out}  ({train_n} train / {val_n} val)")
+        return train_n, val_n
 
     def export_keypoint_dataset(
         self,
@@ -936,6 +1022,23 @@ class Trainer:
         self._save_manifest()
 
     # ── evaluation helpers ────────────────────────────────────────────────────
+
+    def validate_detect(self) -> dict:
+        """Export the frozen val split and evaluate the active detect model against it."""
+        val_ids = self.dm.get_val_split()
+        if not val_ids:
+            return {"error": "No frozen val split exists. Run fine-tune first to create one."}
+        dataset = self.dm.export_detect_dataset(frozen_val_ids=val_ids)
+        data_yaml = str(dataset / "data.yaml")
+        n_val = len([e for e in self.dm._collect_all_labels()
+                     if self.dm._entry_id(e) in val_ids])
+        map_score = self.eval_on_val(self._active_detect, data_yaml)
+        return {
+            "map5095":   map_score,
+            "n_val":     n_val,
+            "weights":   self._active_detect,
+            "data_yaml": data_yaml,
+        }
 
     def eval_on_val(self, weights_path: str, data_yaml: str) -> float:
         try:
@@ -1620,6 +1723,22 @@ class _CopyWorker(QObject):
         self.finished.emit(copied, skipped, errors)
 
 
+class _ValidationWorker(QObject):
+    """Runs detect model validation in a background thread."""
+    finished = Signal(dict)
+
+    def __init__(self, trainer: "Trainer") -> None:
+        super().__init__()
+        self._trainer = trainer
+
+    def run(self) -> None:
+        try:
+            result = self._trainer.validate_detect()
+        except Exception as e:
+            result = {"error": str(e)}
+        self.finished.emit(result)
+
+
 class _ThumbLoader(QObject):
     """Background worker: generates / reads cached thumbnails and emits them."""
     thumb_ready = Signal(str, object)   # (label_path, QImage) — QImage is thread-safe
@@ -1730,6 +1849,17 @@ class ThumbnailDelegate(QStyledItemDelegate):
         f.setPointSize(7)
         painter.setFont(f)
         painter.drawText(src_rect, Qt.AlignmentFlag.AlignCenter, src_label)
+
+        # V (val split) badge — top-right of thumbnail
+        in_val = bool(index.data(Qt.ItemDataRole.UserRole + 5))
+        v_rect = QRect(
+            thumb_rect.right() - self.BADGE_D - 1,
+            thumb_rect.top() + 2,
+            self.BADGE_D, self.BADGE_D,
+        )
+        painter.fillRect(v_rect, QColor(220, 180, 0) if in_val else QColor(80, 80, 80))
+        painter.setPen(Qt.GlobalColor.white)
+        painter.drawText(v_rect, Qt.AlignmentFlag.AlignCenter, "V")
 
         # B + K approval badges — bottom-right of thumbnail
         bbox_ok = bool(index.data(Qt.ItemDataRole.UserRole + 1))
@@ -1856,6 +1986,16 @@ class MainWindow(QMainWindow):
         self._btn_tune = QPushButton("Fine-tune…")
         self._btn_tune.clicked.connect(self._show_finetune_dialog)
         tb.addWidget(self._btn_tune)
+
+        self._btn_validate = QPushButton("Validate…")
+        self._btn_validate.setToolTip("Evaluate the active detect model against the frozen val split")
+        self._btn_validate.clicked.connect(self._run_validation)
+        tb.addWidget(self._btn_validate)
+
+        act_set_model = QAction("🔧 Set Model", self)
+        act_set_model.setToolTip("Override the active detection model for this session")
+        act_set_model.triggered.connect(self._on_set_model)
+        tb.addAction(act_set_model)
         tb.addSeparator()
 
         self._btn_show_bbox = QPushButton("BBox")
@@ -1966,6 +2106,10 @@ class MainWindow(QMainWindow):
 
         blay.addLayout(nav)
 
+        self._infer_summary_label = QLabel("")
+        self._infer_summary_label.setStyleSheet("color: #9cf; font-size: 11px;")
+        blay.addWidget(self._infer_summary_label)
+
         self._timeline = TimelineWidget()
         self._timeline_scroll = QScrollArea()
         self._timeline_scroll.setWidget(self._timeline)
@@ -2010,6 +2154,14 @@ class MainWindow(QMainWindow):
         self._btn_copy_video.clicked.connect(self._copy_video_frames)
         top.addWidget(self._btn_copy_video)
 
+        btn_export = QPushButton("⬆ Export Visible")
+        btn_export.setToolTip(
+            "Export a YOLO dataset from the images currently visible in the grid.\n"
+            "Val split membership is preserved."
+        )
+        btn_export.clicked.connect(self._export_visible_dataset)
+        top.addWidget(btn_export)
+
         btn_refresh = QPushButton("↻ Refresh")
         btn_refresh.clicked.connect(self._refresh_dataset_list)
         top.addWidget(btn_refresh)
@@ -2051,6 +2203,20 @@ class MainWindow(QMainWindow):
             lambda _id, chk: self._apply_filter() if chk else None)
 
         filter_row.addSpacing(12)
+        filter_row.addWidget(QLabel("Val:"))
+        self._val_filter_grp = QButtonGroup(tab)
+        self._val_filter_grp.setExclusive(True)
+        for i, txt in enumerate(["Any", "Val", "Train"]):
+            btn = QPushButton(txt)
+            btn.setCheckable(True)
+            btn.setFixedWidth(40)
+            self._val_filter_grp.addButton(btn, i)
+            filter_row.addWidget(btn)
+        self._val_filter_grp.button(0).setChecked(True)
+        self._val_filter_grp.idToggled.connect(
+            lambda _id, chk: self._apply_filter() if chk else None)
+
+        filter_row.addSpacing(12)
         filter_row.addWidget(QLabel("Source:"))
         self._src_combo = QComboBox()
         self._src_combo.addItems(["All Sources", "Video", "Imported"])
@@ -2089,6 +2255,26 @@ class MainWindow(QMainWindow):
         self._btn_mark_kpt_no.clicked.connect(lambda: self._bulk_set_approval(kpt=False))
         self._btn_mark_kpt_no.setEnabled(False)
         bulk_row.addWidget(self._btn_mark_kpt_no)
+
+        bulk_row.addSpacing(12)
+
+        self._btn_to_val = QPushButton("→ Val")
+        self._btn_to_val.clicked.connect(lambda: self._bulk_set_val(True))
+        self._btn_to_val.setEnabled(False)
+        bulk_row.addWidget(self._btn_to_val)
+
+        self._btn_to_train = QPushButton("→ Train")
+        self._btn_to_train.clicked.connect(lambda: self._bulk_set_val(False))
+        self._btn_to_train.setEnabled(False)
+        bulk_row.addWidget(self._btn_to_train)
+
+        bulk_row.addSpacing(12)
+
+        self._btn_delete = QPushButton("🗑 Delete")
+        self._btn_delete.clicked.connect(self._bulk_delete)
+        self._btn_delete.setEnabled(False)
+        self._btn_delete.setStyleSheet("color: #ff6060;")
+        bulk_row.addWidget(self._btn_delete)
 
         bulk_row.addStretch()
         vlay.addLayout(bulk_row)
@@ -2153,13 +2339,16 @@ class MainWindow(QMainWindow):
         self._frame_label.setText(f"/ {n - 1}")
         self._frame_idx = 0
         self._inference_results.clear()
+        self._infer_summary_label.setText("")
         self._timeline.setup(n)
         self.statusBar().showMessage(
             f"Opened: {Path(path).name}  ({n} frames  {self._video.fps:.1f} fps)"
         )
         if self._engine is None:
-            self._engine  = InferenceEngine(self.DET_MODEL_PATH)
             self._trainer = Trainer(self.DET_MODEL_PATH, self._dm, self.MODELS_ROOT)
+            kpt_paths = {cls: self._trainer.active_kpt_weights(cls)
+                         for cls in KPT_NAMES if self._trainer.active_kpt_weights(cls)}
+            self._engine = InferenceEngine(self._trainer.active_detect_weights, kpt_paths)
         # Switch to video tab
         self._bottom_tabs.setCurrentIndex(0)
         self._mode = "video"
@@ -2295,6 +2484,19 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Inference complete — {n} frame(s) with detections"
         )
+        counts: dict[str, int] = {}
+        for dets in self._inference_results.values():
+            for d in dets:
+                counts[d.class_name] = counts.get(d.class_name, 0) + 1
+        if counts:
+            parts = [f"{cls}: {counts.get(cls, 0)}"
+                     for cls in CLASS_INDICES if cls in counts]
+            total = sum(counts.values())
+            self._infer_summary_label.setText(
+                f"Found across video — {' | '.join(parts)}  (total: {total})"
+            )
+        else:
+            self._infer_summary_label.setText("No detections found in video.")
 
     # ── save ──────────────────────────────────────────────────────────────────
 
@@ -2519,6 +2721,32 @@ class MainWindow(QMainWindow):
                                 (f"\n…and {len(errors)-20} more" if len(errors) > 20 else ""))
         self._refresh_dataset_list()
 
+    def _export_visible_dataset(self) -> None:
+        visible = [
+            self._ds_image_list.item(r).data(Qt.ItemDataRole.UserRole)
+            for r in range(self._ds_image_list.count())
+            if not self._ds_image_list.item(r).isHidden()
+        ]
+        if not visible:
+            QMessageBox.information(self, "Export", "No images visible — adjust filters first.")
+            return
+
+        out_dir = QFileDialog.getExistingDirectory(self, "Select export folder")
+        if not out_dir:
+            return
+
+        train_n, val_n = self._dm.export_filtered_dataset(
+            visible, out_dir, frozen_val_ids=self._dm.get_val_split()
+        )
+        QMessageBox.information(
+            self, "Export complete",
+            f"Exported {train_n + val_n} image(s) to:\n{out_dir}\n\n"
+            f"Train: {train_n}   Val: {val_n}"
+        )
+        self.statusBar().showMessage(
+            f"Exported {train_n + val_n} images ({train_n} train / {val_n} val) → {out_dir}"
+        )
+
     def _refresh_dataset_list(self) -> None:
         # stop any running thumb loader
         if self._thumb_worker:
@@ -2533,19 +2761,23 @@ class MainWindow(QMainWindow):
         self._ds_image_list.clear()
         self._label_to_row.clear()
 
-        all_imgs = self._dm.list_all_images()
+        all_imgs  = self._dm.list_all_images()
+        val_ids   = self._dm.get_val_split()
         placeholder = self._make_placeholder()
         thumb_items: list = []
 
         for row, entry in enumerate(all_imgs):
             lp      = entry["label_path"]
             ip      = entry["image_path"]
+            in_val  = entry["entry_id"] in val_ids
             item    = QListWidgetItem(entry["stem"])
             item.setData(Qt.ItemDataRole.UserRole,     lp)
             item.setData(Qt.ItemDataRole.UserRole + 1, entry["bbox_approved"])
             item.setData(Qt.ItemDataRole.UserRole + 2, entry["kpt_approved"])
             item.setData(Qt.ItemDataRole.UserRole + 3, entry["source"])
             item.setData(Qt.ItemDataRole.UserRole + 4, placeholder)
+            item.setData(Qt.ItemDataRole.UserRole + 5, in_val)
+            item.setData(Qt.ItemDataRole.UserRole + 6, entry["entry_id"])
             self._ds_image_list.addItem(item)
             self._label_to_row[lp] = row
             thumb_items.append((lp, ip))
@@ -2575,6 +2807,9 @@ class MainWindow(QMainWindow):
         self._btn_mark_bbox_no.setEnabled(has_sel)
         self._btn_mark_kpt_ok.setEnabled(has_sel)
         self._btn_mark_kpt_no.setEnabled(has_sel)
+        self._btn_to_val.setEnabled(has_sel)
+        self._btn_to_train.setEnabled(has_sel)
+        self._btn_delete.setEnabled(has_sel)
         if len(selected) == 1:
             row = self._ds_image_list.row(selected[0])
             self._load_dataset_row(row)
@@ -2619,6 +2854,7 @@ class MainWindow(QMainWindow):
     def _apply_filter(self) -> None:
         bbox_id = self._bbox_filter_grp.checkedId()   # 0=Any 1=✓ 2=✗
         kpt_id  = self._kpt_filter_grp.checkedId()    # 0=Any 1=✓ 2=✗
+        val_id  = self._val_filter_grp.checkedId()    # 0=Any 1=Val 2=Train
         src_idx = self._src_combo.currentIndex()       # 0=All 1=Video 2=Imported
         shown = total = 0
         for row in range(self._ds_image_list.count()):
@@ -2629,11 +2865,14 @@ class MainWindow(QMainWindow):
             bbox_ok = bool(item.data(Qt.ItemDataRole.UserRole + 1))
             kpt_ok  = bool(item.data(Qt.ItemDataRole.UserRole + 2))
             src     = item.data(Qt.ItemDataRole.UserRole + 3) or "video"
+            in_val  = bool(item.data(Qt.ItemDataRole.UserRole + 5))
             hide = (
                 (bbox_id == 1 and not bbox_ok) or
                 (bbox_id == 2 and     bbox_ok) or
                 (kpt_id  == 1 and not kpt_ok)  or
                 (kpt_id  == 2 and     kpt_ok)  or
+                (val_id  == 1 and not in_val)  or
+                (val_id  == 2 and     in_val)  or
                 (src_idx == 1 and src != "video")    or
                 (src_idx == 2 and src != "imported")
             )
@@ -2660,6 +2899,77 @@ class MainWindow(QMainWindow):
         self._ds_image_list.viewport().update()
         self._apply_filter()
 
+    def _bulk_set_val(self, in_val: bool) -> None:
+        entry_ids = set()
+        for item in self._ds_image_list.selectedItems():
+            eid = item.data(Qt.ItemDataRole.UserRole + 6)
+            if eid:
+                entry_ids.add(eid)
+                item.setData(Qt.ItemDataRole.UserRole + 5, in_val)
+        if not entry_ids:
+            return
+        if in_val:
+            self._dm.add_to_val_split(entry_ids)
+        else:
+            self._dm.remove_from_val_split(entry_ids)
+        self._ds_image_list.viewport().update()
+        self._apply_filter()
+
+    def _bulk_delete(self) -> None:
+        selected = self._ds_image_list.selectedItems()
+        if not selected:
+            return
+
+        n = len(selected)
+        has_imp = any(
+            (item.data(Qt.ItemDataRole.UserRole + 3) or "video") == "imported"
+            for item in selected
+        )
+        msg = f"Delete {n} image(s)? This cannot be undone."
+        if has_imp:
+            msg += "\n\nImported images have no source video — they will be permanently lost."
+
+        reply = QMessageBox.warning(
+            self, "Confirm Delete", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        entries = []
+        for item in selected:
+            entries.append({
+                "label_path": item.data(Qt.ItemDataRole.UserRole),
+                "image_path": self._label_to_image(item),
+                "entry_id":   item.data(Qt.ItemDataRole.UserRole + 6),
+                "stem":       item.text(),
+            })
+
+        deleted, errors = self._dm.delete_images(entries)
+
+        self._ds_image_list.blockSignals(True)
+        for item in selected:
+            lp = item.data(Qt.ItemDataRole.UserRole)
+            self._label_to_row.pop(lp, None)
+            self._ds_image_list.takeItem(self._ds_image_list.row(item))
+        self._ds_image_list.blockSignals(False)
+
+        self._apply_filter()
+        msg_out = f"Deleted {deleted} image(s)."
+        if errors:
+            msg_out += f"  {len(errors)} error(s): {errors[0]}"
+        self.statusBar().showMessage(msg_out)
+
+    def _label_to_image(self, item) -> str:
+        lp = item.data(Qt.ItemDataRole.UserRole)
+        if not lp:
+            return ""
+        try:
+            return json.loads(Path(lp).read_text(encoding="utf-8")).get("image_path", "")
+        except Exception:
+            return ""
+
     def _on_thumb_ready(self, label_path: str, qimg) -> None:
         row = self._label_to_row.get(label_path)
         if row is None:
@@ -2679,6 +2989,69 @@ class MainWindow(QMainWindow):
         return px
 
     # ── fine-tune ─────────────────────────────────────────────────────────────
+
+    def _run_validation(self) -> None:
+        if not self._trainer:
+            QMessageBox.information(self, "Validate", "Open a video first to initialise the trainer.")
+            return
+        self._btn_validate.setEnabled(False)
+        self._btn_validate.setText("Validating…")
+        self.statusBar().showMessage("Running validation — please wait…")
+
+        worker = _ValidationWorker(self._trainer)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_validation_finished)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _on_validation_finished(self, result: dict) -> None:
+        self._btn_validate.setEnabled(True)
+        self._btn_validate.setText("Validate…")
+        if "error" in result:
+            QMessageBox.warning(self, "Validation failed", result["error"])
+            self.statusBar().showMessage("Validation failed.")
+            return
+        map_score = result["map5095"]
+        n_val     = result["n_val"]
+        model     = self._model_display_name(result["weights"])
+        msg = (
+            f"mAP50-95:  {map_score:.4f}\n\n"
+            f"Val images: {n_val}\n"
+            f"Model: {model}"
+        )
+        QMessageBox.information(self, "Validation result", msg)
+        self.statusBar().showMessage(
+            f"Validation — mAP50-95: {map_score:.4f}  ({n_val} val images)"
+        )
+
+    def _on_set_model(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select YOLO detect model", "", "PyTorch Models (*.pt)"
+        )
+        if not path:
+            return
+        kpt_paths = {}
+        if self._trainer:
+            kpt_paths = {cls: self._trainer.active_kpt_weights(cls)
+                         for cls in KPT_NAMES if self._trainer.active_kpt_weights(cls)}
+            self._trainer._active_detect = path
+        self._engine = InferenceEngine(path, kpt_paths)
+        name = self._model_display_name(path)
+        self.statusBar().showMessage(f"Model set: {name}")
+
+    @staticmethod
+    def _model_display_name(path: str) -> str:
+        p = Path(path)
+        parts = p.parts
+        try:
+            gm_idx = next(i for i, part in enumerate(parts) if part == "gate_models")
+            return str(Path(*parts[gm_idx + 1:]))
+        except StopIteration:
+            return p.name
 
     def _show_finetune_dialog(self) -> None:
         if not self._trainer:
