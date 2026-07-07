@@ -1921,8 +1921,10 @@ class MainWindow(QMainWindow):
         self._ds_frame: Optional[np.ndarray] = None
         self._import_worker: Optional[_ImportWorker] = None
         self._import_thread: Optional[QThread]       = None
-        self._copy_worker:   Optional[_CopyWorker]   = None
-        self._copy_thread:   Optional[QThread]       = None
+        self._copy_worker:   Optional[_CopyWorker]       = None
+        self._copy_thread:   Optional[QThread]           = None
+        self._val_worker:    Optional[_ValidationWorker] = None
+        self._val_thread:    Optional[QThread]           = None
         self._ds_folder: Optional[str]               = None  # last browsed folder path
         self._label_to_row: dict[str, int]           = {}
         self._thumb_worker: Optional[_ThumbLoader]   = None
@@ -2998,15 +3000,15 @@ class MainWindow(QMainWindow):
         self._btn_validate.setText("Validating…")
         self.statusBar().showMessage("Running validation — please wait…")
 
-        worker = _ValidationWorker(self._trainer)
-        thread = QThread(self)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._on_validation_finished)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.start()
+        self._val_worker = _ValidationWorker(self._trainer)
+        self._val_thread = QThread(self)
+        self._val_worker.moveToThread(self._val_thread)
+        self._val_thread.started.connect(self._val_worker.run)
+        self._val_worker.finished.connect(self._on_validation_finished)
+        self._val_worker.finished.connect(self._val_thread.quit)
+        self._val_worker.finished.connect(self._val_worker.deleteLater)
+        self._val_thread.finished.connect(self._val_thread.deleteLater)
+        self._val_thread.start()
 
     def _on_validation_finished(self, result: dict) -> None:
         self._btn_validate.setEnabled(True)
