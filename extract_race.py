@@ -18,6 +18,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -56,6 +57,8 @@ def run_race_extraction(
     pass_offset_sec: float = 0.0,
     sim_thresh: float = 0.88,
     min_match_margin: float = 0.03,
+    g1_sim_thresh: Optional[float] = None,
+    g1_margin: Optional[float] = None,
 ):
     print(f"Loading detector: {det_model_path}")
     det = YOLO(det_model_path)
@@ -70,6 +73,7 @@ def run_race_extraction(
         sim_thresh=sim_thresh, require_same_type=False,
         min_lap_gap_sec=6.0, min_gates_between_laps=2,
         min_match_margin=min_match_margin, race_lookahead=3, max_embeds_per_gate=6,
+        g1_sim_thresh=g1_sim_thresh, g1_margin=g1_margin,
     )
     gatedb.set_mode("race")
     gatedb.load_memory(gate_memory_path)
@@ -272,6 +276,10 @@ def main():
                         help="Minimum cosine similarity for a gate to count as matched (default: 0.88)")
     parser.add_argument("--min-match-margin",  type=float, default=0.03,
                         help="Minimum gap between best and second-best gate similarity (default: 0.03)")
+    parser.add_argument("--g1-sim-thresh",     type=float, default=None,
+                        help="Minimum cosine similarity for G1 (start gate); defaults to --sim-thresh")
+    parser.add_argument("--g1-margin",         type=float, default=None,
+                        help="Minimum margin for G1 (start gate); defaults to --min-match-margin")
     args = parser.parse_args()
 
     run_race_extraction(
@@ -284,6 +292,8 @@ def main():
         pass_offset_sec=args.pass_offset_sec,
         sim_thresh=args.sim_thresh,
         min_match_margin=args.min_match_margin,
+        g1_sim_thresh=args.g1_sim_thresh,
+        g1_margin=args.g1_margin,
     )
 
 

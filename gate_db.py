@@ -84,10 +84,15 @@ class GateDB:
         min_match_margin: float = 0.0,
         race_lookahead: int = 3,     # how many *ahead* to consider, inclusive window is lookahead+1
         max_embeds_per_gate: int = 6,  # bank size per memory slot
+        # G1-specific thresholds (start/finish gate); fall back to global if None
+        g1_sim_thresh: Optional[float] = None,
+        g1_margin: Optional[float] = None,
     ):
         self.sim_thresh = float(sim_thresh)
         self.require_same_type = bool(require_same_type)
         self.min_match_margin = float(min_match_margin)
+        self.g1_sim_thresh = float(g1_sim_thresh) if g1_sim_thresh is not None else self.sim_thresh
+        self.g1_margin = float(g1_margin) if g1_margin is not None else self.min_match_margin
 
         self.min_lap_gap_sec = float(min_lap_gap_sec)
         self.min_gates_between_laps = int(min_gates_between_laps)
@@ -808,9 +813,11 @@ class GateDB:
             return -1, 0.0, "NOMATCH", 0.0, 0.0, exp_before, window_size
 
         margin = (best_sim - second_sim) if second_sim > -0.5 else 1e9
-        ok = (best_sim >= self.sim_thresh) and (margin >= self.min_match_margin)
-
         gid = int(best_m.gate_id)
+        if gid == int(self.start_gate_id):
+            ok = (best_sim >= self.g1_sim_thresh) and (margin >= self.g1_margin)
+        else:
+            ok = (best_sim >= self.sim_thresh) and (margin >= self.min_match_margin)
 
         if ok and gid == int(self.start_gate_id):
             # optional debounce (keep your knob)

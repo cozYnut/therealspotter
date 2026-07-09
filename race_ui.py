@@ -568,7 +568,7 @@ class MainWindow(QMainWindow):
         self._gate_memory_path: Optional[str] = None
         self._det_model_path: Optional[str] = self._find_model_auto()
         self._clip_device: str = _auto_clip_device()
-        self._sim_thresh, self._min_match_margin = self._load_gatedb_defaults()
+        self._sim_thresh, self._min_match_margin, self._g1_sim_thresh, self._g1_margin = self._load_gatedb_defaults()
 
         # Race data
         self._race_data: Optional[dict] = None
@@ -599,9 +599,13 @@ class MainWindow(QMainWindow):
             with open(defaults_path, encoding="utf-8") as f:
                 d = json.load(f)
             gdb = d.get("gatedb", {})
-            return float(gdb.get("sim_thresh", 0.88)), float(gdb.get("min_match_margin", 0.03))
+            sim   = float(gdb.get("sim_thresh", 0.88))
+            marg  = float(gdb.get("min_match_margin", 0.03))
+            g1sim = float(gdb.get("g1_sim_thresh", sim))
+            g1marg= float(gdb.get("g1_margin", marg))
+            return sim, marg, g1sim, g1marg
         except Exception:
-            return 0.88, 0.03
+            return 0.88, 0.03, 0.88, 0.03
 
     def _ensure_model(self) -> bool:
         if self._det_model_path and Path(self._det_model_path).exists():
@@ -635,25 +639,51 @@ class MainWindow(QMainWindow):
 
         tb.addWidget(QLabel("  Sim ≥ "))
         self._sim_spin = QDoubleSpinBox()
-        self._sim_spin.setRange(0.50, 0.99)
-        self._sim_spin.setSingleStep(0.01)
-        self._sim_spin.setDecimals(2)
-        self._sim_spin.setValue(self._sim_thresh)
-        self._sim_spin.setFixedWidth(68)
+        self._sim_spin.setRange(50.0, 99.9)
+        self._sim_spin.setSingleStep(0.1)
+        self._sim_spin.setDecimals(1)
+        self._sim_spin.setSuffix("%")
+        self._sim_spin.setValue(self._sim_thresh * 100)
+        self._sim_spin.setFixedWidth(80)
         self._sim_spin.setToolTip("Minimum cosine similarity for a gate to count as MATCH")
-        self._sim_spin.valueChanged.connect(lambda v: setattr(self, "_sim_thresh", v))
+        self._sim_spin.valueChanged.connect(lambda v: setattr(self, "_sim_thresh", v / 100.0))
         tb.addWidget(self._sim_spin)
 
         tb.addWidget(QLabel("  Margin ≥ "))
         self._margin_spin = QDoubleSpinBox()
-        self._margin_spin.setRange(0.00, 0.20)
-        self._margin_spin.setSingleStep(0.01)
-        self._margin_spin.setDecimals(2)
-        self._margin_spin.setValue(self._min_match_margin)
-        self._margin_spin.setFixedWidth(68)
+        self._margin_spin.setRange(0.0, 20.0)
+        self._margin_spin.setSingleStep(0.1)
+        self._margin_spin.setDecimals(1)
+        self._margin_spin.setSuffix("%")
+        self._margin_spin.setValue(self._min_match_margin * 100)
+        self._margin_spin.setFixedWidth(80)
         self._margin_spin.setToolTip("Minimum gap between best and second-best gate similarity")
-        self._margin_spin.valueChanged.connect(lambda v: setattr(self, "_min_match_margin", v))
+        self._margin_spin.valueChanged.connect(lambda v: setattr(self, "_min_match_margin", v / 100.0))
         tb.addWidget(self._margin_spin)
+
+        tb.addWidget(QLabel("  G1 Sim ≥ "))
+        self._g1_sim_spin = QDoubleSpinBox()
+        self._g1_sim_spin.setRange(50.0, 99.9)
+        self._g1_sim_spin.setSingleStep(0.1)
+        self._g1_sim_spin.setDecimals(1)
+        self._g1_sim_spin.setSuffix("%")
+        self._g1_sim_spin.setValue(self._g1_sim_thresh * 100)
+        self._g1_sim_spin.setFixedWidth(80)
+        self._g1_sim_spin.setToolTip("Minimum cosine similarity for G1 (start/finish gate) to count as MATCH")
+        self._g1_sim_spin.valueChanged.connect(lambda v: setattr(self, "_g1_sim_thresh", v / 100.0))
+        tb.addWidget(self._g1_sim_spin)
+
+        tb.addWidget(QLabel("  G1 Margin ≥ "))
+        self._g1_margin_spin = QDoubleSpinBox()
+        self._g1_margin_spin.setRange(0.0, 20.0)
+        self._g1_margin_spin.setSingleStep(0.1)
+        self._g1_margin_spin.setDecimals(1)
+        self._g1_margin_spin.setSuffix("%")
+        self._g1_margin_spin.setValue(self._g1_margin * 100)
+        self._g1_margin_spin.setFixedWidth(80)
+        self._g1_margin_spin.setToolTip("Minimum margin for G1 (start/finish gate) — raise to prevent false lap resets")
+        self._g1_margin_spin.valueChanged.connect(lambda v: setattr(self, "_g1_margin", v / 100.0))
+        tb.addWidget(self._g1_margin_spin)
 
         tb.addSeparator()
 
@@ -963,8 +993,10 @@ class MainWindow(QMainWindow):
             "--gate-memory",        self._gate_memory_path,
             "--output",             out_json,
             "--clip-device",        self._clip_device,
-            "--sim-thresh",         str(round(self._sim_thresh, 2)),
-            "--min-match-margin",   str(round(self._min_match_margin, 2)),
+            "--sim-thresh",         str(round(self._sim_thresh, 3)),
+            "--min-match-margin",   str(round(self._min_match_margin, 3)),
+            "--g1-sim-thresh",      str(round(self._g1_sim_thresh, 3)),
+            "--g1-margin",          str(round(self._g1_margin, 3)),
         ]
         self._proc.start(sys.executable, args)
 
