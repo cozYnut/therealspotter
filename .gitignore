@@ -1,7 +1,9 @@
 datastuff/
 fpv_dataset/
 fpv_dataset_tolabel/
-fpv_videos/
+gate_annotations/
+gate_models/
+videos/
 runs/
 venv/
 .DS_Store
