@@ -635,6 +635,11 @@ class MainWindow(QMainWindow):
         set_model.triggered.connect(self._on_set_model)
         tb.addAction(set_model)
 
+        self._model_label = QLabel()
+        self._model_label.setStyleSheet("color:#ffa028; font-size:11px; padding: 0 4px;")
+        self._update_model_label()
+        tb.addWidget(self._model_label)
+
         tb.addSeparator()
 
         tb.addWidget(QLabel("  Sim ≥ "))
@@ -949,10 +954,15 @@ class MainWindow(QMainWindow):
             self._sb.showMessage(f"Gate memory: {Path(path).name}  ({len(self._gate_mem)} gates)")
             self._check_ready()
 
+    def _update_model_label(self):
+        name = Path(self._det_model_path).name if self._det_model_path else "no model"
+        self._model_label.setText(name)
+
     def _on_set_model(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select YOLO model", "", "PyTorch Models (*.pt)")
         if path:
             self._det_model_path = path
+            self._update_model_label()
             self._sb.showMessage(f"Model set: {Path(path).name}")
 
     def _check_ready(self):
