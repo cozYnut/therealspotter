@@ -792,12 +792,15 @@ class GateDB:
         if not candidates:
             return -1, 0.0, "NOMATCH", 0.0, 0.0, exp_before, window_size
 
+        # Score all candidates; track best overall and best non-G1 separately.
         best_sim = -1.0
         second_sim = -1.0
         best_m: Optional[MemoryGate] = None
+        best_non_g1_sim = -1.0
+        best_non_g1_second_sim = -1.0
+        best_non_g1_m: Optional[MemoryGate] = None
 
         for m in candidates:
-
             if not m.embeds:
                 continue
             smax = self._max_sim_to_bank(embn, m.embeds)
@@ -808,6 +811,13 @@ class GateDB:
             elif smax > second_sim:
                 second_sim = smax
 
+            if int(m.gate_id) != int(self.start_gate_id):
+                if smax > best_non_g1_sim:
+                    best_non_g1_second_sim = best_non_g1_sim
+                    best_non_g1_sim = smax
+                    best_non_g1_m = m
+                elif smax > best_non_g1_second_sim:
+                    best_non_g1_second_sim = smax
 
         if best_m is None:
             return -1, 0.0, "NOMATCH", 0.0, 0.0, exp_before, window_size
@@ -816,6 +826,16 @@ class GateDB:
         gid = int(best_m.gate_id)
         if gid == int(self.start_gate_id):
             ok = (best_sim >= self.g1_sim_thresh) and (margin >= self.g1_margin)
+            # G1 failed its threshold — fall back to best non-G1 candidate if it passes
+            if not ok and best_non_g1_m is not None:
+                non_g1_margin = (best_non_g1_sim - best_non_g1_second_sim) if best_non_g1_second_sim > -0.5 else 1e9
+                if (best_non_g1_sim >= self.sim_thresh) and (non_g1_margin >= self.min_match_margin):
+                    best_m = best_non_g1_m
+                    best_sim = best_non_g1_sim
+                    second_sim = best_non_g1_second_sim
+                    margin = non_g1_margin
+                    gid = int(best_m.gate_id)
+                    ok = True
         else:
             ok = (best_sim >= self.sim_thresh) and (margin >= self.min_match_margin)
 
