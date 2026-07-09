@@ -408,14 +408,17 @@ class MatchCandidatesWindow(QWidget):
                 return None
             return float(np.dot(q_vec, e / n))
 
-        if exp_before >= 0:
-            lo     = exp_before
-            hi     = min(len(self._gate_mem), exp_before + self._race_lookahead + 1)
-            window = self._gate_mem[lo:hi]
+        n = len(self._gate_mem)
+        if n > 0:
+            if exp_before >= 0:
+                exp = exp_before % n
+            else:
+                gid_to_pos  = {int(g["gate_id"]): i for i, g in enumerate(self._gate_mem)}
+                exp = gid_to_pos.get(matched_gid, 0)
+            idxs   = list(dict.fromkeys([exp, (exp + 1) % n, 0]))
+            window = [self._gate_mem[i] for i in idxs]
         else:
-            gid_to_pos  = {int(g["gate_id"]): i for i, g in enumerate(self._gate_mem)}
-            matched_pos = gid_to_pos.get(matched_gid, 0)
-            window      = self._gate_mem[max(0, matched_pos - 1): matched_pos + self._race_lookahead]
+            window = []
 
         if not window:
             self._canvas.setPixmap(QPixmap())
@@ -1203,14 +1206,17 @@ class MainWindow(QMainWindow):
         exp_before   = int(ps.get("exp_before", -1))
         query_img    = str(ps.get("query_img", ""))
 
-        if exp_before >= 0:
-            lo = exp_before
-            hi = min(len(self._gate_mem), exp_before + self._race_lookahead + 1)
-            window = self._gate_mem[lo:hi]
+        n = len(self._gate_mem)
+        if n > 0:
+            if exp_before >= 0:
+                exp = exp_before % n
+            else:
+                gid_to_pos = {int(g["gate_id"]): i for i, g in enumerate(self._gate_mem)}
+                exp = gid_to_pos.get(matched_gid, 0)
+            idxs = list(dict.fromkeys([exp, (exp + 1) % n, 0]))
+            window = [self._gate_mem[i] for i in idxs]
         else:
-            gid_to_pos  = {int(g["gate_id"]): i for i, g in enumerate(self._gate_mem)}
-            matched_pos = gid_to_pos.get(matched_gid, 0)
-            window      = self._gate_mem[max(0, matched_pos - 1): matched_pos + self._race_lookahead]
+            window = []
 
         if not window:
             self._match_strip.setPixmap(QPixmap())

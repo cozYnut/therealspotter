@@ -270,21 +270,20 @@ class GateDB:
 
     def _expected_window_indices(self) -> List[int]:
         """
-        RACE candidate indices:
-          expected_idx, expected_idx+1, ... expected_idx+lookahead  (wrap-around)
-        If memory empty -> [].
+        RACE candidate indices: [expected, expected+1, G1(index 0)].
+        G1 is always included as the start/finish anchor.
+        Deduplicates so G1 is not counted twice when expected is already at 0 or 1.
         """
         n = self._track_len()
         if n <= 0:
             return []
 
         exp = int(self._expected_idx) % n
-        look = int(max(0, self.race_lookahead))
-
-        idxs: List[int] = []
-        for k in range(look + 1):
-            idxs.append((exp + k) % n)
-        return idxs
+        seen: List[int] = []
+        for idx in [exp, (exp + 1) % n, 0]:
+            if idx not in seen:
+                seen.append(idx)
+        return seen
 
     def memory_window_preview(self, max_items: int = 3) -> str:
         """
