@@ -59,6 +59,7 @@ def run_race_extraction(
     min_match_margin: float = 0.03,
     g1_sim_thresh: Optional[float] = None,
     g1_margin: Optional[float] = None,
+    require_same_type: bool = False,
 ):
     print(f"Loading detector: {det_model_path}")
     det = YOLO(det_model_path)
@@ -70,7 +71,7 @@ def run_race_extraction(
     clip = ClipEmbedder(device=clip_device)
 
     gatedb = GateDB(
-        sim_thresh=sim_thresh, require_same_type=False,
+        sim_thresh=sim_thresh, require_same_type=require_same_type,
         min_lap_gap_sec=6.0, min_gates_between_laps=2,
         min_match_margin=min_match_margin, race_lookahead=3, max_embeds_per_gate=6,
         g1_sim_thresh=g1_sim_thresh, g1_margin=g1_margin,
@@ -105,12 +106,11 @@ def run_race_extraction(
     Path(query_frames_dir).mkdir(parents=True, exist_ok=True)
 
     while True:
+        t = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
         ok, frame = cap.read()
         if not ok:
             break
         frame_idx += 1
-
-        t = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
         H, W = frame.shape[:2]
         frame_area = float(W * H)
 
@@ -280,6 +280,8 @@ def main():
                         help="Minimum cosine similarity for G1 (start gate); defaults to --sim-thresh")
     parser.add_argument("--g1-margin",         type=float, default=None,
                         help="Minimum margin for G1 (start gate); defaults to --min-match-margin")
+    parser.add_argument("--require-same-type", action="store_true", default=False,
+                        help="Only match a detected gate against memory slots of the same type")
     args = parser.parse_args()
 
     run_race_extraction(
@@ -294,6 +296,7 @@ def main():
         min_match_margin=args.min_match_margin,
         g1_sim_thresh=args.g1_sim_thresh,
         g1_margin=args.g1_margin,
+        require_same_type=args.require_same_type,
     )
 
 

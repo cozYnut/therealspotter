@@ -38,7 +38,7 @@ try:
         QPushButton, QLabel, QListWidget, QListWidgetItem, QFileDialog,
         QSizePolicy, QMessageBox, QToolBar, QStatusBar, QFrame,
         QProgressBar, QTableWidget, QTableWidgetItem, QHeaderView,
-        QScrollArea, QSplitter, QDoubleSpinBox,
+        QScrollArea, QSplitter, QDoubleSpinBox, QCheckBox,
     )
     from PyQt6.QtCore import Qt, QTimer, QRect, QPoint, pyqtSignal, QProcess
     from PyQt6.QtGui import (
@@ -298,8 +298,8 @@ class VideoPlayer(QWidget):
     def _tick(self):
         if not self._cap:
             return
-        self._render_next()
         self._current_t = self._cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+        self._render_next()
         self.position_changed.emit(self._current_t)
         if self._current_t >= self._duration - 0.05:
             self.pause()
@@ -569,6 +569,7 @@ class MainWindow(QMainWindow):
         self._det_model_path: Optional[str] = self._find_model_auto()
         self._clip_device: str = _auto_clip_device()
         self._sim_thresh, self._min_match_margin, self._g1_sim_thresh, self._g1_margin = self._load_gatedb_defaults()
+        self._require_same_type: bool = False
 
         # Race data
         self._race_data: Optional[dict] = None
@@ -689,6 +690,17 @@ class MainWindow(QMainWindow):
         self._g1_margin_spin.setToolTip("Minimum margin for G1 (start/finish gate) — raise to prevent false lap resets")
         self._g1_margin_spin.valueChanged.connect(lambda v: setattr(self, "_g1_margin", v / 100.0))
         tb.addWidget(self._g1_margin_spin)
+
+        self._same_type_chk = QCheckBox("Match type")
+        self._same_type_chk.setChecked(self._require_same_type)
+        self._same_type_chk.setToolTip(
+            "Only match a detected gate against memory slots of the same type.\n"
+            "Enable if you have mixed gate types (squares, flagpoles, etc.) in the same course."
+        )
+        self._same_type_chk.stateChanged.connect(
+            lambda s: setattr(self, "_require_same_type", bool(s))
+        )
+        tb.addWidget(self._same_type_chk)
 
         tb.addSeparator()
 
@@ -1008,6 +1020,8 @@ class MainWindow(QMainWindow):
             "--g1-sim-thresh",      str(round(self._g1_sim_thresh, 3)),
             "--g1-margin",          str(round(self._g1_margin, 3)),
         ]
+        if self._require_same_type:
+            args.append("--require-same-type")
         self._proc.start(sys.executable, args)
 
         self._progress_bar.setValue(0)

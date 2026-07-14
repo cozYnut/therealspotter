@@ -1087,7 +1087,7 @@ class MainWindow(QMainWindow):
 
     def _on_mark_gate(self, gate_type: Optional[str] = None):
         t = self._video.current_t
-        matched = self._find_candidates(t)
+        matched = self._find_candidates(t, gate_type=gate_type)
 
         if self._mode == "define" and not self._define_second_lap:
             # First lap: every G creates a new gate slot
@@ -1406,11 +1406,13 @@ class MainWindow(QMainWindow):
 
     # ── Candidate matching ────────────────────────────────────
 
-    def _find_candidates(self, t: float) -> List[Candidate]:
+    def _find_candidates(self, t: float, gate_type: Optional[str] = None) -> List[Candidate]:
         fps = self._video.fps
         nearby = [
             c for c in self._candidates
-            if round(abs(c.t - t) * fps) <= self._match_window and c.idx not in self._used_idxs
+            if round(abs(c.t - t) * fps) <= self._match_window
+            and c.idx not in self._used_idxs
+            and (gate_type is None or c.gate_type == gate_type)
         ]
         nearby.sort(key=lambda c: round(abs(c.t - t) * fps))
         return nearby[:1]
