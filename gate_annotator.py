@@ -3041,6 +3041,10 @@ class MainWindow(QMainWindow):
             kpt_paths = {cls: self._trainer.active_kpt_weights(cls)
                          for cls in KPT_NAMES if self._trainer.active_kpt_weights(cls)}
             self._trainer._active_detect = path
+        else:
+            self._trainer = Trainer(path, self._dm, self.MODELS_ROOT)
+            kpt_paths = {cls: self._trainer.active_kpt_weights(cls)
+                         for cls in KPT_NAMES if self._trainer.active_kpt_weights(cls)}
         self._engine = InferenceEngine(path, kpt_paths)
         name = self._model_display_name(path)
         self.statusBar().showMessage(f"Model set: {name}")
