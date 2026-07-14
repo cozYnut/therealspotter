@@ -47,6 +47,7 @@ from ultralytics import YOLO
 
 from pass_detector import PassDetector, detect_camera_edges
 from collections import deque
+import pipeline_cfg
 from lazy_spotter import (
     TimeTracker,
     ClipEmbedder,
@@ -83,8 +84,9 @@ def run_extraction(
     names = _get_yolo_names(det)
     print(f"Classes: {list(names.values())}")
 
-    tracker = TimeTracker()
-    passdet = PassDetector()
+    _cfg = pipeline_cfg.load()
+    tracker = TimeTracker(**pipeline_cfg.tracker_kwargs(_cfg))
+    passdet = PassDetector(**pipeline_cfg.gates_passdet_kwargs(_cfg))
     clip = ClipEmbedder(device=clip_device)
 
     cap = cv2.VideoCapture(video_path)

@@ -22,6 +22,7 @@ from pass_detector import PassDetector, detect_camera_edges
 
 # GateDB (NEW learn=append-to-index, race=match-only)
 from gate_db import GateDB, build_gate_db_panel, compute_track_gate_hints, build_race_stats_panel
+import pipeline_cfg
 
 
 # ============================================================
@@ -780,6 +781,8 @@ def _cls_to_name(cls_id: int, names: Dict[int, str]) -> str:
 # ============================================================
 
 def main():
+    _pipe_cfg = pipeline_cfg.load()
+
     parser = argparse.ArgumentParser(
         description="FPV gate spotter: multiclass YOLO detector + type-lock tracking + pass detector + GateDB (learned order memory)"
     )
@@ -795,19 +798,19 @@ def main():
     parser.add_argument("--det-conf", type=float, default=0.25, help="YOLO confidence threshold")
     parser.add_argument("--det-maxdet", type=int, default=50, help="YOLO max detections per frame")
 
-    parser.add_argument("--iou-match", type=float, default=0.3, help="IOU association threshold")
-    parser.add_argument("--ttl-seconds", type=float, default=0.3, help="Track TTL in seconds")
+    parser.add_argument("--iou-match", type=float, default=_pipe_cfg["tracker"]["iou_match_thresh"], help="IOU association threshold")
+    parser.add_argument("--ttl-seconds", type=float, default=_pipe_cfg["tracker"]["ttl_seconds"], help="Track TTL in seconds")
     parser.add_argument("--hide-after", type=float, default=0.1, help="Hide tracks if not seen for this many seconds (0 disables)")
-    parser.add_argument("--lock-min-score", type=float, default=0.20)
-    parser.add_argument("--lock-hysteresis", type=float, default=0.10)
-    parser.add_argument("--lock-streak", type=int, default=3)
+    parser.add_argument("--lock-min-score", type=float, default=_pipe_cfg["tracker"]["lock_min_score"])
+    parser.add_argument("--lock-hysteresis", type=float, default=_pipe_cfg["tracker"]["lock_hysteresis"])
+    parser.add_argument("--lock-streak", type=int, default=_pipe_cfg["tracker"]["lock_streak"])
 
     # Pass detector
     parser.add_argument("--pass-enable", action="store_true", help="Enable gate pass detection")
-    parser.add_argument("--pass-min-score", type=float, default=0.4, help="Min track score_ema for pass logic")
-    parser.add_argument("--pass-min-area", type=float, default=0.20, help="Min bbox area ratio (gate close enough)")
-    parser.add_argument("--pass-center-tol", type=float, default=0.18, help="Center tolerance for alignment (0..1)")
-    parser.add_argument("--pass-disappear", type=float, default=0.25, help="Seconds after alignment where disappearance counts as pass")
+    parser.add_argument("--pass-min-score", type=float, default=_pipe_cfg["gates"]["min_track_score"], help="Min track score_ema for pass logic")
+    parser.add_argument("--pass-min-area", type=float, default=_pipe_cfg["gates"]["min_area_ratio"], help="Min bbox area ratio (gate close enough)")
+    parser.add_argument("--pass-center-tol", type=float, default=_pipe_cfg["gates"]["center_tol"], help="Center tolerance for alignment (0..1)")
+    parser.add_argument("--pass-disappear", type=float, default=_pipe_cfg["gates"]["disappear_timeout"], help="Seconds after alignment where disappearance counts as pass")
     parser.add_argument("--pass-hud-seconds", type=float, default=3.0, help="How long to keep PASSED lines on screen")
     parser.add_argument("--pass-hud-max", type=int, default=8, help="Max PASSED lines shown")
 
@@ -923,13 +926,13 @@ def main():
 
     while True:
         if not paused or step_once:
+            pos_msec = cap.get(cv2.CAP_PROP_POS_MSEC)
             ok, frame = cap.read()
             step_once = False
             if not ok:
                 break
             frame_idx += 1
 
-        pos_msec = cap.get(cv2.CAP_PROP_POS_MSEC)
         now = pos_msec / 1000.0
 
         dt = now - last_t

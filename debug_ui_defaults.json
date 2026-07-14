@@ -21,7 +21,7 @@
     "min_area_vel_ema": 0.015,
     "aligned_shrink_reset_frac": 0.35,
     "aligned_max_age_sec": 2,
-    "min_aligned_frames": 2,
+    "min_aligned_frames": 3,
     "aligned_shrink_disappear_frac": 0.35,
     "pass_area_ratio": 0.34,
     "aligned_area_jump_frac": 5.0
