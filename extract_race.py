@@ -108,10 +108,10 @@ def run_race_extraction(
     Path(query_frames_dir).mkdir(parents=True, exist_ok=True)
 
     while True:
-        t = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
         ok, frame = cap.read()
         if not ok:
             break
+        t = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
         frame_idx += 1
         H, W = frame.shape[:2]
         frame_area = float(W * H)

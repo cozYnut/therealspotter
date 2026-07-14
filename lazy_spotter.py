@@ -926,11 +926,11 @@ def main():
 
     while True:
         if not paused or step_once:
-            pos_msec = cap.get(cv2.CAP_PROP_POS_MSEC)
             ok, frame = cap.read()
             step_once = False
             if not ok:
                 break
+            pos_msec = cap.get(cv2.CAP_PROP_POS_MSEC)
             frame_idx += 1
 
         now = pos_msec / 1000.0

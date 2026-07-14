@@ -286,7 +286,6 @@ class VideoPlayer(QWidget):
             return
         t = max(0.0, min(self._duration, t))
         self._cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
-        self._current_t = t
         self._render_next()
         self.position_changed.emit(self._current_t)
 
@@ -298,7 +297,6 @@ class VideoPlayer(QWidget):
     def _tick(self):
         if not self._cap:
             return
-        self._current_t = self._cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
         self._render_next()
         self.position_changed.emit(self._current_t)
         if self._current_t >= self._duration - 0.05:
@@ -310,6 +308,7 @@ class VideoPlayer(QWidget):
         ok, frame = self._cap.read()
         if not ok:
             return
+        self._current_t = self._cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
         self._last_frame = frame.copy()
         display = frame.copy()
         if self._frame_processor:
