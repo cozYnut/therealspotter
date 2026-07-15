@@ -3036,6 +3036,9 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        if not Path(path).exists():
+            QMessageBox.warning(self, "No models found", f"Detect model not found:\n{path}")
+            return
         kpt_paths = {}
         if self._trainer:
             kpt_paths = {cls: self._trainer.active_kpt_weights(cls)
@@ -3045,6 +3048,7 @@ class MainWindow(QMainWindow):
             self._trainer = Trainer(path, self._dm, self.MODELS_ROOT)
             kpt_paths = {cls: self._trainer.active_kpt_weights(cls)
                          for cls in KPT_NAMES if self._trainer.active_kpt_weights(cls)}
+        kpt_paths = {cls: p for cls, p in kpt_paths.items() if Path(p).exists()}
         self._engine = InferenceEngine(path, kpt_paths)
         name = self._model_display_name(path)
         self.statusBar().showMessage(f"Model set: {name}")
