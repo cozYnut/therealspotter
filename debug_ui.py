@@ -1108,6 +1108,7 @@ class MainWindow(QMainWindow):
             "  font-family: monospace;}"
             "QListWidget::item:selected{background:#2a4a8a;}"
         )
+        self._tracks_list.currentRowChanged.connect(self._on_track_selected)
         bottom_tabs.addTab(self._tracks_list, "Tracks")
 
         # ── Events tab ───────────────────────────────────────────────────────
@@ -1575,6 +1576,7 @@ class MainWindow(QMainWindow):
                 except ValueError:
                     pass
         self._tracks_list.clear()
+        self._video.clear_overlay()
         if not entry:
             return
         raw_tracks = entry.get("raw_tracks", [])
@@ -1600,6 +1602,7 @@ class MainWindow(QMainWindow):
                     f"  ar={area_ratio:.3f}"
                     f"  PD:{pd_str}")
             item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, {"tid": tid, "bbox": [x1, y1, x2, y2]})
             if not in_pd:
                 item.setForeground(QColor(120, 120, 120))
             elif stage == "aligned":
@@ -1609,6 +1612,19 @@ class MainWindow(QMainWindow):
             else:
                 item.setForeground(QColor(220, 220, 220))
             self._tracks_list.addItem(item)
+
+    def _on_track_selected(self, row: int):
+        item = self._tracks_list.item(row)
+        if item is None:
+            self._video.clear_overlay()
+            return
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not data:
+            self._video.clear_overlay()
+            return
+        bbox = data["bbox"]
+        tid  = data["tid"]
+        self._video.set_overlay(bbox, label=f"#{tid}", color=(255, 165, 0))
 
     def _on_event_selected(self, row: int):
         if 0 <= row < len(self._detected_events):

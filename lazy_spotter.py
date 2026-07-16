@@ -446,8 +446,11 @@ class TimeTracker:
             bb = d["bbox"]
             best_iou = 0.0
             best_ti = None
+            det_type = d.get("type", "NONE")
             for ti, tr in enumerate(self._tracks):
                 if ti in used:
+                    continue
+                if det_type != "NONE" and tr.locked_type != "NONE" and det_type != tr.locked_type:
                     continue
                 s = iou(bb, tr.bbox)
                 if s > best_iou:
