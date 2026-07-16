@@ -21,6 +21,7 @@ DEFAULTS: Dict[str, Any] = {
         "lock_hysteresis":  0.1,
         "lock_streak":      3,
         "ema_alpha":        0.4,
+        "min_det_conf":     0.0,
     },
     "gates": {
         "min_track_score":               0.2,
@@ -94,6 +95,7 @@ def tracker_kwargs(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "lock_hysteresis":  float(t.get("lock_hysteresis",  DEFAULTS["tracker"]["lock_hysteresis"])),
         "lock_streak":      int(t.get("lock_streak",        DEFAULTS["tracker"]["lock_streak"])),
         "ema_alpha":        float(t.get("ema_alpha",         DEFAULTS["tracker"]["ema_alpha"])),
+        "min_det_conf":     float(t.get("min_det_conf",     DEFAULTS["tracker"]["min_det_conf"])),
     }
 
 

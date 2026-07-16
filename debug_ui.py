@@ -38,7 +38,7 @@ try:
         QPushButton, QLabel, QListWidget, QListWidgetItem, QFileDialog,
         QSizePolicy, QMessageBox, QToolBar, QStatusBar, QFrame,
         QSpinBox, QDoubleSpinBox, QCheckBox, QScrollArea, QFormLayout,
-        QSplitter, QProgressBar, QToolButton,
+        QSplitter, QProgressBar, QToolButton, QTabWidget,
     )
     from PyQt6.QtCore import Qt, QTimer, QRect, QPoint, pyqtSignal, QThread
     from PyQt6.QtGui import (
@@ -85,6 +85,7 @@ _PARAM_META: Dict[str, Dict] = {
     "lock_hysteresis":           {"min": 0.0,  "max": 1.0,  "step": 0.01,  "dec": 2},
     "lock_streak":               {"min": 1,    "max": 20,   "step": 1},
     "ema_alpha":                 {"min": 0.0,  "max": 1.0,  "step": 0.01,  "dec": 2},
+    "min_det_conf":              {"min": 0.0,  "max": 1.0,  "step": 0.01,  "dec": 2},
     # PassDetector
     "min_track_score":           {"min": 0.0,  "max": 1.0,  "step": 0.01,  "dec": 2},
     "min_area_ratio":            {"min": 0.0,  "max": 1.0,  "step": 0.005, "dec": 3},
@@ -141,6 +142,13 @@ _PARAM_DOCS: Dict[str, str] = {
         "Higher = reacts faster to new detections. Lower = smoother, slower to update.\n\n"
         "Example: 0.5 weights the current and historical score equally. "
         "0.1 is very smooth; 0.9 is almost raw."
+    ),
+    "min_det_conf": (
+        "Minimum YOLO detection confidence for a bbox to be visible to the tracker at all.\n\n"
+        "Detections below this threshold are filtered out before IoU matching — they will "
+        "never create a new track ID or update an existing one.\n\n"
+        "0.0 (default) = disabled, all detections pass through.\n\n"
+        "Example: 0.25 → only detections with ≥ 25 % YOLO confidence are tracked."
     ),
     # ── PassDetector ─────────────────────────────────────────────────────────
     "min_track_score": (
@@ -874,7 +882,26 @@ class RunnerThread(QThread):
                         "flag_centered": st.flag_was_centered,
                         "nx":            round(st.last_nx, 3),
                     })
-            self.frame_data_found.emit({"t": t, "tracks": snapshot})
+
+            # raw tracker snapshot — ALL tids visible this frame (before passdet filter)
+            pd_tids = {int(s["track_id"]) for s in snapshot}
+            raw_snapshot = []
+            for tr in tracks:
+                raw_snapshot.append({
+                    "track_id": int(tr.track_id),
+                    "type":     str(tr.locked_type),
+                    "score":    round(float(tr.score_ema), 3),
+                    "bbox":     list(tr.bbox),
+                    "in_pd":    int(tr.track_id) in pd_tids,
+                    "stage":    next(
+                        (s["stage"] for s in snapshot if s["track_id"] == int(tr.track_id)),
+                        "",
+                    ),
+                })
+
+            self.frame_data_found.emit({"t": t, "tracks": snapshot,
+                                        "raw_tracks": raw_snapshot,
+                                        "frame_w": W, "frame_h": H})
 
             if frame_idx % 15 == 0:
                 self.progress.emit(frame_idx, total, n_events)
@@ -906,7 +933,8 @@ class MainWindow(QMainWindow):
 
         self._user_marks:      List[UserMark]      = []
         self._detected_events: List[DetectedEvent] = []
-        self._frame_annotations: Dict[str, List[dict]] = {}  # "%.3f" → [ann, ...]
+        self._frame_annotations: Dict[str, List[dict]] = {}      # "%.3f" → [ann, ...]
+        self._raw_frame_annotations: Dict[str, dict] = {}         # "%.3f" → {raw_tracks, frame_w, frame_h}
 
         self._runner: Optional[RunnerThread] = None
         self._tracker_widgets: Dict[str, Any] = {}
@@ -1060,16 +1088,29 @@ class MainWindow(QMainWindow):
 
         right_splitter.addWidget(param_outer)
 
-        # ── Events panel ─────────────────────────────────────────────────────
-        evt_outer = QWidget()
-        ev = QVBoxLayout(evt_outer)
-        ev.setContentsMargins(4, 4, 4, 4)
-        ev.setSpacing(2)
+        # ── Bottom panel: Tracks tab + Events tab ────────────────────────────
+        bottom_outer = QWidget()
+        bv = QVBoxLayout(bottom_outer)
+        bv.setContentsMargins(4, 4, 4, 4)
+        bv.setSpacing(2)
 
         self._events_header = QLabel("Events: —")
         self._events_header.setStyleSheet("font-size:11px; color:#aaa; font-weight:bold;")
-        ev.addWidget(self._events_header)
+        bv.addWidget(self._events_header)
 
+        bottom_tabs = QTabWidget()
+        bottom_tabs.setStyleSheet("QTabBar::tab{font-size:11px; padding:3px 8px;}")
+
+        # ── Tracks tab ───────────────────────────────────────────────────────
+        self._tracks_list = QListWidget()
+        self._tracks_list.setStyleSheet(
+            "QListWidget{background:#1e1e1e; border:1px solid #444; font-size:11px;"
+            "  font-family: monospace;}"
+            "QListWidget::item:selected{background:#2a4a8a;}"
+        )
+        bottom_tabs.addTab(self._tracks_list, "Tracks")
+
+        # ── Events tab ───────────────────────────────────────────────────────
         self._event_list = QListWidget()
         self._event_list.setStyleSheet(
             "QListWidget{background:#1e1e1e; border:1px solid #444; font-size:11px;"
@@ -1077,9 +1118,11 @@ class MainWindow(QMainWindow):
             "QListWidget::item:selected{background:#2a4a8a;}"
         )
         self._event_list.currentRowChanged.connect(self._on_event_selected)
-        ev.addWidget(self._event_list, stretch=1)
+        bottom_tabs.addTab(self._event_list, "Events")
 
-        right_splitter.addWidget(evt_outer)
+        bv.addWidget(bottom_tabs, stretch=1)
+
+        right_splitter.addWidget(bottom_outer)
         right_splitter.setSizes([520, 280])
 
         root.addWidget(right_splitter)
@@ -1305,6 +1348,7 @@ class MainWindow(QMainWindow):
     def _on_position(self, t: float):
         self._timeline.set_current_t(t)
         self._time_label.setText(f"{t:.2f} s  /  {self._video.duration:.2f} s")
+        self._update_tracks_tab(t)
 
     # ── User marks ──────────────────────────────────────────────────────────
 
@@ -1327,8 +1371,10 @@ class MainWindow(QMainWindow):
     def _on_clear_results(self):
         self._detected_events.clear()
         self._frame_annotations.clear()
+        self._raw_frame_annotations.clear()
         self._video.clear_annotations()
         self._event_list.clear()
+        self._tracks_list.clear()
         self._timeline.set_detected_events([])
         self._events_header.setText("Events: —")
 
@@ -1495,6 +1541,11 @@ class MainWindow(QMainWindow):
     def _on_frame_data(self, data: dict):
         key = f"{data['t']:.3f}"
         self._frame_annotations[key] = data.get("tracks", [])
+        self._raw_frame_annotations[key] = {
+            "raw_tracks": data.get("raw_tracks", []),
+            "frame_w":    data.get("frame_w", 1),
+            "frame_h":    data.get("frame_h", 1),
+        }
 
     def _get_annotations_at(self, t: float) -> List[dict]:
         key = f"{t:.3f}"
@@ -1509,6 +1560,55 @@ class MainWindow(QMainWindow):
             except ValueError:
                 pass
         return []
+
+    def _update_tracks_tab(self, t: float):
+        key = f"{t:.3f}"
+        entry = self._raw_frame_annotations.get(key)
+        if entry is None:
+            # ±40 ms tolerance search
+            t_ms = round(t * 1000)
+            for k, v in self._raw_frame_annotations.items():
+                try:
+                    if abs(round(float(k) * 1000) - t_ms) <= 40:
+                        entry = v
+                        break
+                except ValueError:
+                    pass
+        self._tracks_list.clear()
+        if not entry:
+            return
+        raw_tracks = entry.get("raw_tracks", [])
+        W = max(entry.get("frame_w", 1), 1)
+        H = max(entry.get("frame_h", 1), 1)
+        for tr in sorted(raw_tracks, key=lambda x: x["track_id"]):
+            tid   = int(tr["track_id"])
+            ttype = str(tr["type"]).ljust(9)[:9]
+            score = float(tr["score"])
+            x1, y1, x2, y2 = (int(v) for v in tr["bbox"])
+            w_pct      = (x2 - x1) / W * 100
+            h_pct      = (y2 - y1) / H * 100
+            cx_pct     = ((x1 + x2) / 2) / W * 100
+            cy_pct     = ((y1 + y2) / 2) / H * 100
+            area_ratio = (x2 - x1) * (y2 - y1) / (W * H)
+            in_pd  = bool(tr.get("in_pd", False))
+            stage  = str(tr.get("stage", ""))
+            pd_str = stage if stage else "—"
+            text = (f"#{tid:<3d}  {ttype}  {score:.2f}"
+                    f"  [{x1},{y1},{x2},{y2}]"
+                    f"  w={w_pct:.0f}% h={h_pct:.0f}%"
+                    f"  cx={cx_pct:.0f}% cy={cy_pct:.0f}%"
+                    f"  ar={area_ratio:.3f}"
+                    f"  PD:{pd_str}")
+            item = QListWidgetItem(text)
+            if not in_pd:
+                item.setForeground(QColor(120, 120, 120))
+            elif stage == "aligned":
+                item.setForeground(_ALIGNED_COLOR)
+            elif stage == "passed":
+                item.setForeground(QColor(0, 220, 255))
+            else:
+                item.setForeground(QColor(220, 220, 220))
+            self._tracks_list.addItem(item)
 
     def _on_event_selected(self, row: int):
         if 0 <= row < len(self._detected_events):

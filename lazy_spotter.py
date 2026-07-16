@@ -423,6 +423,7 @@ class TimeTracker:
         lock_hysteresis: float = 0.1,
         lock_streak: int = 3,
         ema_alpha: float = 0.4,
+        min_det_conf: float = 0.0,
     ):
         self.iou_match_thresh = iou_match_thresh
         self.ttl_seconds = ttl_seconds
@@ -430,12 +431,16 @@ class TimeTracker:
         self.lock_hysteresis = lock_hysteresis
         self.lock_streak = lock_streak
         self.ema_alpha = ema_alpha
+        self.min_det_conf = min_det_conf
 
         self._tracks: List[Track] = []
         self._next_id = 1
 
     def update(self, dets: List[dict], now: float) -> List[Track]:
         used = set()
+
+        if self.min_det_conf > 0.0:
+            dets = [d for d in dets if float(d.get("det_conf", 0.0)) >= self.min_det_conf]
 
         for d in dets:
             bb = d["bbox"]
@@ -800,6 +805,7 @@ def main():
 
     parser.add_argument("--iou-match", type=float, default=_pipe_cfg["tracker"]["iou_match_thresh"], help="IOU association threshold")
     parser.add_argument("--ttl-seconds", type=float, default=_pipe_cfg["tracker"]["ttl_seconds"], help="Track TTL in seconds")
+    parser.add_argument("--min-det-conf", type=float, default=_pipe_cfg["tracker"]["min_det_conf"], help="Min detection confidence for tracker (0 disables)")
     parser.add_argument("--hide-after", type=float, default=0.1, help="Hide tracks if not seen for this many seconds (0 disables)")
     parser.add_argument("--lock-min-score", type=float, default=_pipe_cfg["tracker"]["lock_min_score"])
     parser.add_argument("--lock-hysteresis", type=float, default=_pipe_cfg["tracker"]["lock_hysteresis"])
@@ -834,6 +840,7 @@ def main():
         lock_min_score=args.lock_min_score,
         lock_hysteresis=args.lock_hysteresis,
         lock_streak=args.lock_streak,
+        min_det_conf=args.min_det_conf,
     )
 
     passdet: Optional[PassDetector] = None
