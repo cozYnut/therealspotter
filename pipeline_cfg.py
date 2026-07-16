@@ -41,6 +41,8 @@ DEFAULTS: Dict[str, Any] = {
         "aligned_shrink_disappear_frac": 0.35,
         "pass_area_ratio":               0.34,
         "aligned_area_jump_frac":        5.0,
+        "high_conf_score":               0.0,
+        "high_conf_top_tol":             0.35,
     },
     "flags": {
         "min_track_score":             0.14,
@@ -119,6 +121,8 @@ def gates_passdet_kwargs(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "aligned_shrink_disappear_frac": float(g.get("aligned_shrink_disappear_frac", DEFAULTS["gates"]["aligned_shrink_disappear_frac"])),
         "pass_area_ratio":               float(g.get("pass_area_ratio",               DEFAULTS["gates"]["pass_area_ratio"])),
         "aligned_area_jump_frac":        float(g.get("aligned_area_jump_frac",        DEFAULTS["gates"]["aligned_area_jump_frac"])),
+        "high_conf_score":               float(g.get("high_conf_score",               DEFAULTS["gates"]["high_conf_score"])),
+        "high_conf_top_tol":             float(g.get("high_conf_top_tol",             DEFAULTS["gates"]["high_conf_top_tol"])),
         "ignore_flagpoles":              True,
     }
 

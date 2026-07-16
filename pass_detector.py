@@ -164,6 +164,8 @@ class PassDetector:
         pass_area_ratio: float = 0.0,
         aligned_area_jump_frac: float = 0.0,
         flag_aligned_area_jump_frac: float = 0.0,
+        high_conf_score: float = 0.0,
+        high_conf_top_tol: float = 0.35,
     ):
         self.min_track_score = float(min_track_score)
         self.min_area_ratio = float(min_area_ratio)
@@ -196,6 +198,8 @@ class PassDetector:
         self.pass_area_ratio = float(pass_area_ratio)
         self.aligned_area_jump_frac = float(aligned_area_jump_frac)
         self.flag_aligned_area_jump_frac = float(flag_aligned_area_jump_frac)
+        self.high_conf_score = float(high_conf_score)
+        self.high_conf_top_tol = float(high_conf_top_tol)
 
         self.states: Dict[int, TrackPassState] = {}
         self._just_passed: Dict[int, dict] = {}
@@ -385,7 +389,21 @@ class PassDetector:
                             self.cam_left_norm, self.cam_right_norm,
                             self.flag_edge_tol,
                         )
-                        if edges_near >= self.flag_min_edges:
+                        x1c, y1c, x2c, y2c = bbox
+                        edges_cur = _count_edges_near_real_frame(
+                            x1c, y1c, x2c, y2c,
+                            frame_w, frame_h,
+                            self.cam_left_norm, self.cam_right_norm,
+                            self.flag_edge_tol,
+                        )
+                        high_conf_gate = (
+                            not _is_flag(ttype)
+                            and self.high_conf_score > 0
+                            and score_ema >= self.high_conf_score
+                            and py1 <= self.high_conf_top_tol * frame_h
+                        )
+                        normal_edges_ok = edges_near >= self.flag_min_edges and edges_cur < edges_near
+                        if normal_edges_ok or high_conf_gate:
                             if self.pass_area_ratio > 0 and prev < self.pass_area_ratio:
                                 pass  # bbox area too small at fire time
                             else:
@@ -486,7 +504,13 @@ class PassDetector:
                             self.cam_left_norm, self.cam_right_norm,
                             self.flag_edge_tol,
                         )
-                        if edges_near >= self.flag_min_edges:
+                        high_conf_gate = (
+                            not _is_flag(st.ttype)
+                            and self.high_conf_score > 0
+                            and st.last_score_ema >= self.high_conf_score
+                            and st.last_bbox[1] <= self.high_conf_top_tol * self._frame_h
+                        )
+                        if edges_near >= self.flag_min_edges or high_conf_gate:
                             if self.pass_area_ratio > 0 and st.last_area_ratio < self.pass_area_ratio:
                                 pass  # bbox area too small at fire time
                             else:

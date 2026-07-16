@@ -106,6 +106,8 @@ _PARAM_META: Dict[str, Dict] = {
     "pass_area_ratio":               {"min": 0.0, "max": 1.0,  "step": 0.005, "dec": 3},
     "aligned_area_jump_frac":        {"min": 0.0, "max": 10.0, "step": 0.1,   "dec": 1},
     "flag_aligned_area_jump_frac":   {"min": 0.0, "max": 10.0, "step": 0.1,   "dec": 1},
+    "high_conf_score":               {"min": 0.0, "max": 1.0,  "step": 0.01,  "dec": 2},
+    "high_conf_top_tol":             {"min": 0.0, "max": 1.0,  "step": 0.01,  "dec": 2},
 }
 
 
@@ -269,6 +271,21 @@ _PARAM_DOCS: Dict[str, str] = {
         "0.0 (default) = disabled.\n\n"
         "Example: 2.5 → if the flag bbox becomes 2.5× larger than the previous frame while "
         "aligned, reset to idle."
+    ),
+    "high_conf_score": (
+        "High-confidence gate pass score threshold (gates only).\n\n"
+        "0.0 (default) = disabled.\n\n"
+        "When > 0: if a gate track is aligned and its score_ema >= this value AND the bbox "
+        "center is in the top N% of the frame (see High Conf Top Tol), the normal 2-edge "
+        "requirement is waived for disappear_after_align and gate_frame_shrink passes."
+    ),
+    "high_conf_top_tol": (
+        "Top-edge proximity tolerance for the high-confidence gate pass rule.\n\n"
+        "Fraction of frame height: the bbox top edge (y1) must be within this distance "
+        "of the top of the frame. E.g. 0.20 means y1 <= 20% of frame height.\n\n"
+        "Independent from Flag Edge Tol (which controls the normal 2-edge check). "
+        "Can be set looser since the high score requirement compensates.\n\n"
+        "Only used when High Conf Score > 0."
     ),
 }
 
