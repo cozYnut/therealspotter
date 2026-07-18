@@ -1,7 +1,7 @@
 {
   "tracker": {
     "iou_match_thresh": 0.3,
-    "ttl_seconds": 0.03,
+    "ttl_seconds": 0.06,
     "lock_min_score": 0.2,
     "lock_hysteresis": 0.1,
     "lock_streak": 1,
@@ -15,19 +15,23 @@
     "disappear_timeout": 0.04,
     "flag_edge_tol": 0.08,
     "flag_min_edges": 2,
-    "pass_cooldown_sec": 0.09,
+    "pass_cooldown_sec": 0.24,
     "type_cooldown_sec": 0.09,
     "track_cooldown_sec": 0.2,
     "area_vel_ema_alpha": 0.34,
     "min_area_vel_ema": 0.015,
     "aligned_shrink_reset_frac": 0.5,
     "aligned_max_age_sec": 2,
-    "min_aligned_frames": 2,
-    "aligned_shrink_disappear_frac": 0.43,
-    "pass_area_ratio": 0.243,
+    "min_aligned_frames": 3,
+    "aligned_shrink_disappear_frac": 0.35,
+    "pass_area_ratio": 0.22,
     "aligned_area_jump_frac": 5.0,
     "high_conf_score": 0.87,
-    "high_conf_top_tol": 0.1
+    "high_conf_top_tol": 0.1,
+    "high_conf_cx_tol": 0.2,
+    "bottom_edge_max_cy": 0.69,
+    "bottom_edge_min_w": 0.52,
+    "side_edge_min_w": 0.45
   },
   "flags": {
     "min_track_score": 0.14,
@@ -35,7 +39,7 @@
     "disappear_timeout": 0.09,
     "flag_center_tol": 0.2,
     "flag_edge_tol": 0.07,
-    "flag_min_edges": 2,
+    "flag_min_edges": 4,
     "pass_cooldown_sec": 0.09,
     "type_cooldown_sec": 0.09,
     "track_cooldown_sec": 0.2,
@@ -45,6 +49,9 @@
     "pass_area_ratio": 0.15,
     "flag_aligned_area_jump_frac": 5.0,
     "high_conf_score": 0.0,
-    "high_conf_top_tol": 0.35
+    "high_conf_top_tol": 0.35,
+    "bottom_edge_max_cy": 0.69,
+    "bottom_edge_min_w": 0.52,
+    "side_edge_min_w": 0.45
   }
 }

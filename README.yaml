@@ -319,6 +319,147 @@ At startup, `detect_camera_edges()` scans the first frame to find where real con
 
 ---
 
+## 🚪 Gate Pass Detection
+
+Implemented in `pass_detector.py`. Each tracked gate runs an independent state machine: **idle → aligned → passed**.
+
+---
+
+### Alignment — idle → aligned
+
+A gate enters `aligned` when all three conditions hold in the same frame:
+
+| Condition | Parameter | Meaning |
+|---|---|---|
+| `area_ratio ≥ min_area_ratio` | `0.03` | Gate occupies enough of the frame |
+| `center_dist ≤ center_tol` | `0.4` | Gate center is near frame center |
+| `area_vel_ema ≥ min_area_vel_ema` | `0.015` | Gate is growing (drone approaching) |
+
+`area_vel_ema` is an exponential moving average of frame-to-frame area growth (alpha `area_vel_ema_alpha = 0.34`). This prevents transient detections from triggering alignment.
+
+Once aligned, `aligned_frames` increments every frame. The gate must reach `min_aligned_frames` (3) before any pass can fire.
+
+---
+
+### Pass Paths — aligned → passed
+
+There are two ways a pass fires:
+
+#### PATH 1 — `gate_frame_shrink`
+
+Triggered when the tracker still holds the gate but its bounding-box area drops by ≥ `aligned_shrink_disappear_frac` (35%) in a single frame. This catches the moment the drone flies through and the gate snaps to a smaller remnant — even though IoU keeps the track alive.
+
+Uses `prev_bbox` (the bbox from the frame **before** the shrink) for all edge and geometry checks.
+
+#### PATH 2 �� `disappear_after_align`
+
+Triggered when the track disappears from the detector's output entirely while in `aligned` state, within `disappear_timeout` (0.04 s) of last being seen. The most common path for clean flythroughs.
+
+Uses `last_bbox` (the last known bbox before disappearance) for all checks.
+
+---
+
+### Pass Conditions (shared by both paths)
+
+Both paths require **at least one** of three OR-conditions to be true, **plus** the area guard:
+
+#### OR-1 — Normal edges (`normal_edges_ok`)
+
+```
+edges_near ≥ flag_min_edges (2)
+AND edges_cur < edges_near         ← gate_frame_shrink only (edge count must decrease)
+```
+
+`edges_near` counts how many of the 4 bbox sides are within `flag_edge_tol` (8%) of the real camera boundary (left, right, top, bottom). For `disappear_after_align` only `edges_near ≥ 2` is required — no decrease check, since the track is gone.
+
+**Bottom edge filter:** the bottom edge only contributes to the count if:
+- `cy% < bottom_edge_max_cy` (69%) — gate center is not too low in frame
+- `w% > bottom_edge_min_w` (52%) — gate is wide enough
+
+Both conditions must hold, otherwise bottom is excluded from the count. Left, right, and top edges are always counted as-is.
+
+#### OR-2 — High confidence gate (`high_conf_gate`)
+
+```
+score_ema ≥ high_conf_score (0.87)
+AND prev_bbox.y1 ≤ high_conf_top_tol × frame_h (10%)
+AND |cx − 0.5| ≤ high_conf_cx_tol (0.20)
+```
+
+For gates with very high YOLO confidence whose top edge is near the top of the frame AND whose center-x is within 20% of horizontal center (between 30%–70% of frame width). Bypasses the edge-count requirement. Not available for flagpoles.
+
+#### OR-3 — Wide side gate (`wide_side_gate`)
+
+```
+edges_near == 1
+AND (x2 − x1) / frame_w ≥ side_edge_min_w (0.45)
+AND (has_left_edge OR has_right_edge)
+```
+
+For gates that have **exactly one** filtered edge and it is a side (left or right) edge, and the gate is wide enough. Catches large gates exiting through a frame corner where the edge count can't decrease or reach 2 after the bottom-edge filter strips a borderline bottom edge. Not available for flagpoles.
+
+#### Area guard (applies to all three)
+
+```
+pass_area_ratio = 0 OR prev_area_ratio ≥ pass_area_ratio (0.22)
+```
+
+The gate must have occupied at least 22% of the real camera area at the moment of the shrink/disappear. Prevents small distant gates from firing.
+
+---
+
+### Reset to Idle — aligned → idle (no pass)
+
+| Cause | Description |
+|---|---|
+| `gate_frame_shrink` conditions not met | Shrink detected but all three OR-conditions fail → idle same frame |
+| Area jump | `area_ratio / prev ≥ aligned_area_jump_frac (5.0)` — sudden bbox expansion, likely tracker merge error |
+| Entry-area drop | Drop from aligned-entry area ≥ `aligned_shrink_reset_frac (0.5)` → state removed entirely |
+| Max age | Gate in aligned state longer than `aligned_max_age_sec (2 s)` |
+| Disappear timeout expired | Track gone longer than `disappear_timeout` without firing → idle |
+| Another pass fired | `_mark_passed` resets **all** currently aligned tracks to idle |
+
+---
+
+### Cooldowns
+
+All three must be clear for a pass to fire. All three clocks reset on every fired pass.
+
+| Level | Parameter | Default |
+|---|---|---|
+| Global | `pass_cooldown_sec` | 0.24 s |
+| Per gate type | `type_cooldown_sec` | 0.09 s |
+| Per track ID | `track_cooldown_sec` | 0.20 s |
+
+---
+
+### Key Parameters Reference
+
+```
+min_area_ratio                 0.03   Gate area / real-camera-area threshold for alignment
+center_tol                     0.40   Max center-distance (normalized) for alignment
+min_area_vel_ema               0.015  Min growth rate (area/s EMA) for alignment
+min_aligned_frames             3      Frames in aligned state before any pass can fire
+aligned_shrink_disappear_frac  0.35   Single-frame area-drop fraction to trigger shrink path
+disappear_timeout              0.04   Seconds after disappearance that disappear path checks
+pass_area_ratio                0.22   Min gate area at fire time (fraction of camera area)
+flag_min_edges                 2      Min edges near frame boundary for normal_edges_ok
+flag_edge_tol                  0.08   Boundary tolerance as fraction of frame dimension
+bottom_edge_max_cy             0.69   Bottom edge only counts if gate cy% is below this
+bottom_edge_min_w              0.52   Bottom edge only counts if gate w% is above this
+high_conf_score                0.87   Score EMA threshold for high_conf_gate OR-condition
+high_conf_top_tol              0.10   Top edge must be within this fraction of frame top
+high_conf_cx_tol               0.20   cx must be within this of 0.5 (i.e. 30%–70%)
+side_edge_min_w                0.45   Min gate width for wide_side_gate OR-condition
+aligned_shrink_reset_frac      0.50   Drop from entry-area that removes aligned state
+aligned_max_age_sec            2.0    Max time a gate stays aligned before forced idle
+pass_cooldown_sec              0.24   Global minimum time between any two passes
+type_cooldown_sec              0.09   Min time between passes of the same gate type
+track_cooldown_sec             0.20   Min time before the same track ID can fire again
+```
+
+---
+
 ## 🗃️ Training a YOLO Detector
 
 ```bash
