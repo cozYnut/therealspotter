@@ -43,6 +43,11 @@ DEFAULTS: Dict[str, Any] = {
         "aligned_area_jump_frac":        5.0,
         "high_conf_score":               0.0,
         "high_conf_top_tol":             0.35,
+        "high_conf_cx_tol":              0.20,
+        "bottom_edge_max_cy":            0.69,
+        "bottom_edge_min_w":             0.52,
+        "side_edge_min_w":               0.45,
+        "approach_score_alpha":          0.2,
     },
     "flags": {
         "min_track_score":             0.14,
@@ -123,6 +128,11 @@ def gates_passdet_kwargs(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "aligned_area_jump_frac":        float(g.get("aligned_area_jump_frac",        DEFAULTS["gates"]["aligned_area_jump_frac"])),
         "high_conf_score":               float(g.get("high_conf_score",               DEFAULTS["gates"]["high_conf_score"])),
         "high_conf_top_tol":             float(g.get("high_conf_top_tol",             DEFAULTS["gates"]["high_conf_top_tol"])),
+        "high_conf_cx_tol":              float(g.get("high_conf_cx_tol",              DEFAULTS["gates"]["high_conf_cx_tol"])),
+        "bottom_edge_max_cy":            float(g.get("bottom_edge_max_cy",            DEFAULTS["gates"]["bottom_edge_max_cy"])),
+        "bottom_edge_min_w":             float(g.get("bottom_edge_min_w",             DEFAULTS["gates"]["bottom_edge_min_w"])),
+        "side_edge_min_w":               float(g.get("side_edge_min_w",               DEFAULTS["gates"]["side_edge_min_w"])),
+        "approach_score_alpha":          float(g.get("approach_score_alpha",          DEFAULTS["gates"]["approach_score_alpha"])),
         "ignore_flagpoles":              True,
     }
 

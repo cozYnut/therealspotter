@@ -437,40 +437,55 @@ class TimeTracker:
         self._next_id = 1
 
     def update(self, dets: List[dict], now: float) -> List[Track]:
-        used = set()
-
         if self.min_det_conf > 0.0:
             dets = [d for d in dets if float(d.get("det_conf", 0.0)) >= self.min_det_conf]
 
-        for d in dets:
+        # Build all valid (score, di, ti) pairs above IoU threshold
+        pairs: List[Tuple[float, int, int]] = []
+        for di, d in enumerate(dets):
             bb = d["bbox"]
-            best_iou = 0.0
-            best_ti = None
             det_type = d.get("type", "NONE")
+            dx1, dy1, dx2, dy2 = bb
+            d_area = max(1, (dx2 - dx1) * (dy2 - dy1))
+            d_diag = ((dx2 - dx1) ** 2 + (dy2 - dy1) ** 2) ** 0.5 or 1.0
+            dcx = (dx1 + dx2) / 2
+            dcy = (dy1 + dy2) / 2
             for ti, tr in enumerate(self._tracks):
-                if ti in used:
-                    continue
                 if det_type != "NONE" and tr.locked_type != "NONE" and det_type != tr.locked_type:
                     continue
-                s = iou(bb, tr.bbox)
-                if s > best_iou:
-                    best_iou = s
-                    best_ti = ti
+                if iou(bb, tr.bbox) < self.iou_match_thresh:
+                    continue
+                tx1, ty1, tx2, ty2 = tr.bbox
+                t_area = max(1, (tx2 - tx1) * (ty2 - ty1))
+                center_dist = ((dcx - (tx1 + tx2) / 2) ** 2 + (dcy - (ty1 + ty2) / 2) ** 2) ** 0.5
+                size_ratio = min(d_area, t_area) / max(d_area, t_area)
+                pairs.append((center_dist / d_diag + (1.0 - size_ratio), di, ti))
 
-            if best_ti is not None and best_iou >= self.iou_match_thresh:
-                tr = self._tracks[best_ti]
-                used.add(best_ti)
+        # Greedy assign best-scoring pairs first
+        pairs.sort()
+        used_dets: set = set()
+        used_tracks: set = set()
+        assignments: dict = {}
+        for _, di, ti in pairs:
+            if di in used_dets or ti in used_tracks:
+                continue
+            assignments[di] = ti
+            used_dets.add(di)
+            used_tracks.add(ti)
 
+        # Apply assignments; create new tracks for unmatched detections
+        for di, d in enumerate(dets):
+            bb = d["bbox"]
+            s = float(d.get("type_score", -1.0))
+            if di in assignments:
+                tr = self._tracks[assignments[di]]
                 tr.bbox = bb
                 tr.last_seen = now
-
-                s = float(d.get("type_score", -1.0))
                 tr.score_ema = (1 - self.ema_alpha) * tr.score_ema + self.ema_alpha * max(0.0, s)
                 self._update_lock(tr, d.get("type", "NONE"), s)
             else:
                 tr = Track(track_id=self._next_id, bbox=bb, last_seen=now)
                 self._next_id += 1
-                s = float(d.get("type_score", -1.0))
                 tr.score_ema = max(0.0, s)
                 self._update_lock(tr, d.get("type", "NONE"), s, is_new=True)
                 self._tracks.append(tr)

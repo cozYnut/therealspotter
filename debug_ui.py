@@ -39,6 +39,7 @@ try:
         QSizePolicy, QMessageBox, QToolBar, QStatusBar, QFrame,
         QSpinBox, QDoubleSpinBox, QCheckBox, QScrollArea, QFormLayout,
         QSplitter, QProgressBar, QToolButton, QTabWidget,
+        QTreeWidget, QTreeWidgetItem, QHeaderView,
     )
     from PyQt6.QtCore import Qt, QTimer, QRect, QPoint, pyqtSignal, QThread
     from PyQt6.QtGui import (
@@ -108,6 +109,12 @@ _PARAM_META: Dict[str, Dict] = {
     "flag_aligned_area_jump_frac":   {"min": 0.0, "max": 10.0, "step": 0.1,   "dec": 1},
     "high_conf_score":               {"min": 0.0, "max": 1.0,  "step": 0.01,  "dec": 2},
     "high_conf_top_tol":             {"min": 0.0, "max": 1.0,  "step": 0.01,  "dec": 2},
+    "high_conf_cx_tol":              {"min": 0.0, "max": 0.5,  "step": 0.01,  "dec": 2},
+    "bottom_edge_max_cy":            {"min": 0.0, "max": 1.0,  "step": 0.01,  "dec": 2},
+    "bottom_edge_min_w":             {"min": 0.0, "max": 1.0,  "step": 0.01,  "dec": 2},
+    "side_edge_min_w":               {"min": 0.0, "max": 1.0,  "step": 0.01,  "dec": 2},
+    "approach_score_alpha":          {"min": 0.0, "max": 1.0,  "step": 0.01,  "dec": 2},
+    "min_aligned_frames":            {"min": 1,   "max": 20,   "step": 1},
 }
 
 
@@ -194,8 +201,11 @@ _PARAM_DOCS: Dict[str, str] = {
         "Example: 0.05 → within 5 % of the frame width/height counts as 'near the edge'."
     ),
     "flag_min_edges": (
-        "Minimum number of bbox edges that must be near the real camera edge "
-        "for a disappearance to count as a pass (applies to both flags and gates).\n\n"
+        "Minimum number of bbox edges near the real camera boundary required for a pass "
+        "(applies to both gates and flags).\n\n"
+        "For disappear_after_align: edges at last seen bbox must meet this count.\n"
+        "For gate_frame_shrink: edges before the shrink must meet this count AND must "
+        "decrease after the shrink (the gate must be exiting the frame).\n\n"
         "Example: 2 → at least 2 of the 4 bbox sides must be close to the camera boundary. "
         "Set to 1 to be very permissive; 4 requires the bbox to fill the whole frame."
     ),
@@ -218,14 +228,18 @@ _PARAM_DOCS: Dict[str, str] = {
         "Example: 0.35 is a moderate response."
     ),
     "min_area_vel_ema": (
-        "Minimum smoothed growth rate (area fraction per second) required to arm alignment. "
+        "Minimum smoothed growth rate (area fraction per second) required to arm alignment "
+        "(gates only — flags use flag_center_tol instead). "
         "Filters out static or receding gates.\n\n"
-        "Example: 0.015 → gate must be growing by at least 1.5 % of frame area per second."
+        "Example: 0.015 → gate must be growing by at least 1.5 % of frame area per second "
+        "before it can enter aligned state."
     ),
     "aligned_shrink_reset_frac": (
-        "If the gate shrinks by this fraction relative to its area when alignment fired, "
-        "reset to idle. Prevents a gate behind you from firing.\n\n"
-        "Example: 0.14 → if area drops 14 % from the moment of alignment, disarm."
+        "If the gate's current area drops by this fraction relative to its area at the "
+        "moment alignment fired, the track state is removed entirely. "
+        "Prevents a receding gate from firing a pass.\n\n"
+        "Example: 0.14 → if area drops 14 % from the alignment entry size, the track "
+        "is discarded (not just reset to idle — it must be re-detected fresh)."
     ),
     "aligned_max_age_sec": (
         "If a track stays in aligned stage longer than this without passing, reset to idle. "
@@ -233,10 +247,11 @@ _PARAM_DOCS: Dict[str, str] = {
         "Example: 10 s → alignment expires after 10 seconds if no pass occurs."
     ),
     "min_aligned_frames": (
-        "Gate must remain in aligned stage for at least this many consecutive frames "
-        "before a disappearance can count as a pass. "
+        "Minimum consecutive aligned frames required before any pass can fire — "
+        "applies to both gate_frame_shrink and disappear_after_align paths. "
         "Filters out single-frame glitch alignments.\n\n"
-        "Example: 3 → gate must be aligned across 3 frames (~100 ms at 30 fps)."
+        "Example: 3 → gate must be aligned across 3 frames (~100 ms at 30 fps) "
+        "before either a shrink or a disappearance can trigger a pass."
     ),
     "flag_aligned_shrink_reset_frac": (
         "Flag-specific shrink reset threshold. If the flag's bbox area drops by this "
@@ -273,11 +288,16 @@ _PARAM_DOCS: Dict[str, str] = {
         "aligned, reset to idle."
     ),
     "high_conf_score": (
-        "High-confidence gate pass score threshold (gates only).\n\n"
+        "High-confidence gate pass threshold for the approach score (gates only).\n\n"
         "0.0 (default) = disabled.\n\n"
-        "When > 0: if a gate track is aligned and its score_ema >= this value AND the bbox "
-        "center is in the top N% of the frame (see High Conf Top Tol), the normal 2-edge "
-        "requirement is waived for disappear_after_align and gate_frame_shrink passes."
+        "When > 0: if a gate is aligned and its approach_score >= this value, the normal "
+        "2-edge requirement is waived for gate_frame_shrink and disappear_after_align passes — "
+        "provided the bbox top is in the top N% of the frame (High Conf Top Tol) and the "
+        "centre is within the horizontal window (High Conf Cx Tol).\n\n"
+        "The approach score starts at 0.1 for every new track and rises toward 1.0 only "
+        "while the gate is observed growing frame-over-frame. A gate that appears suddenly "
+        "large will not reach this threshold until it has been tracked approaching for "
+        "several frames."
     ),
     "high_conf_top_tol": (
         "Top-edge proximity tolerance for the high-confidence gate pass rule.\n\n"
@@ -286,6 +306,48 @@ _PARAM_DOCS: Dict[str, str] = {
         "Independent from Flag Edge Tol (which controls the normal 2-edge check). "
         "Can be set looser since the high score requirement compensates.\n\n"
         "Only used when High Conf Score > 0."
+    ),
+    "high_conf_cx_tol": (
+        "Horizontal centering tolerance for the high-confidence gate pass rule.\n\n"
+        "The gate's bbox centre (cx) must be within this fraction of frame width "
+        "from the frame centre (0.5). E.g. 0.20 means cx must be between 30%–70% "
+        "of frame width.\n\n"
+        "Prevents high-conf passes from firing on gates that are far to one side "
+        "(e.g. a gate the drone is not actually heading through).\n\n"
+        "Only used when High Conf Score > 0."
+    ),
+    "bottom_edge_max_cy": (
+        "Maximum centre-y (cy%) for the bottom edge to count as a real frame edge.\n\n"
+        "If the gate's vertical centre is at or below this fraction of frame height, "
+        "the bottom edge is stripped from the edge count before pass evaluation.\n\n"
+        "Example: 0.69 → if cy% ≥ 69% the gate is sitting too low in the frame and "
+        "its bottom edge is ignored. This prevents bottom-heavy gates that are "
+        "sliding off-screen from qualifying via a bottom-edge match."
+    ),
+    "bottom_edge_min_w": (
+        "Minimum width (w%) for the bottom edge to count as a real frame edge.\n\n"
+        "If the gate's bbox width is at or below this fraction of frame width, "
+        "the bottom edge is stripped from the edge count.\n\n"
+        "Example: 0.52 → a narrow gate touching the bottom of the frame doesn't "
+        "count its bottom edge — only wide gates (likely filling the view) do."
+    ),
+    "side_edge_min_w": (
+        "Minimum gate width (w%) required for the wide_side_gate rule to fire.\n\n"
+        "wide_side_gate fires when a gate has exactly 1 raw edge (left OR right) "
+        "and its bbox is at least this wide. It bypasses the normal 2-edge requirement "
+        "for gates that exit to the side while filling most of the frame width.\n\n"
+        "Example: 0.45 → gate must span at least 45% of frame width to qualify.\n\n"
+        "0.0 = disabled."
+    ),
+    "approach_score_alpha": (
+        "Smoothing factor for the approach score EMA.\n\n"
+        "The approach score starts at 0.1 for every new track and rises toward 1.0 "
+        "while the gate is growing (approaching) and falls toward 0.0 while it is "
+        "shrinking. Each frame the score is EMA'd with this alpha.\n\n"
+        "Lower = slower to react, more stable — one bad frame barely moves it.\n\n"
+        "The approach score is used by high_conf_gate instead of the YOLO score_ema, "
+        "so a gate must have been observed genuinely growing for several frames before "
+        "it can qualify for a high-confidence pass."
     ),
 }
 
@@ -325,6 +387,104 @@ _FLAG_SKIP: set = {
     "aligned_shrink_disappear_frac",
     "aligned_area_jump_frac",
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GATES parameter groups — (label, group_doc, [param_names])
+# ─────────────────────────────────────────────────────────────────────────────
+
+_GATE_PARAM_GROUPS: List[tuple] = [
+    (
+        "Alignment",
+        "Controls when a gate enters the aligned state (idle → aligned).\n\n"
+        "A gate aligns when it is:\n"
+        "  • Big enough in the frame (min_area_ratio)\n"
+        "  • Scored high enough by the tracker (min_track_score)\n"
+        "  • Centered within the frame (center_tol)\n"
+        "  • Growing toward the camera fast enough (min_area_vel_ema)\n\n"
+        "Once aligned it must stay aligned for at least min_aligned_frames before "
+        "any pass can fire. aligned_max_age_sec is a safety cap — if the gate "
+        "stays aligned too long without a pass it resets.",
+        ["min_track_score", "min_area_ratio", "center_tol",
+         "min_area_vel_ema", "area_vel_ema_alpha",
+         "min_aligned_frames", "aligned_max_age_sec"],
+    ),
+    (
+        "Aligned resets",
+        "Conditions that send an aligned gate back to idle without firing a pass.\n\n"
+        "  • Shrink reset: if the gate's area drops by aligned_shrink_reset_frac "
+        "relative to its size when it first aligned, the track state is discarded entirely.\n\n"
+        "  • Area jump: if the bbox suddenly grows by aligned_area_jump_frac× in one frame "
+        "while aligned (likely a detection glitch), reset to idle.",
+        ["aligned_shrink_reset_frac", "aligned_area_jump_frac"],
+    ),
+    (
+        "Pass paths",
+        "Controls what triggers a pass attempt for an aligned gate.\n\n"
+        "There are two paths:\n"
+        "  • gate_frame_shrink: the gate's bbox area drops by aligned_shrink_disappear_frac "
+        "in a single frame while aligned — treated as an instant exit. "
+        "The pass is evaluated on the pre-shrink bbox.\n\n"
+        "  • disappear_after_align: the gate's track disappears from the detector. "
+        "If it vanishes within disappear_timeout seconds of being aligned, a pass is evaluated "
+        "on the last known bbox.\n\n"
+        "pass_area_ratio is a shared guard: the gate's bbox must cover at least this "
+        "fraction of the frame at fire time for either path to succeed.",
+        ["aligned_shrink_disappear_frac", "disappear_timeout", "pass_area_ratio"],
+    ),
+    (
+        "Edge rule  (normal_edges_ok)",
+        "The primary pass condition — requires the gate to be exiting through a real frame edge.\n\n"
+        "normal_edges_ok fires when:\n"
+        "  • The pre-fire bbox has ≥ flag_min_edges edges near the camera boundary\n"
+        "  • AND the edge count decreases after the shrink (gate_frame_shrink path only)\n\n"
+        "flag_edge_tol sets the proximity window — how close a bbox edge must be to the "
+        "frame boundary to count.\n\n"
+        "The bottom edge filter (bottom_edge_max_cy / bottom_edge_min_w) strips the bottom "
+        "edge from the count if the gate is sitting too low or is too narrow — preventing "
+        "bottom-heavy off-screen gates from qualifying.\n\n"
+        "Note: flag_edge_tol is also used by wide_side_gate to detect the side edge.",
+        ["flag_edge_tol", "flag_min_edges", "bottom_edge_max_cy", "bottom_edge_min_w"],
+    ),
+    (
+        "High conf gate",
+        "A bypass condition that waives the normal edge requirement for gates that "
+        "have been clearly approaching for several frames.\n\n"
+        "Fires when ALL of:\n"
+        "  • approach_score ≥ high_conf_score  (gate has been growing consistently)\n"
+        "  • bbox top is within high_conf_top_tol of the top of the frame\n"
+        "  • bbox centre cx is within ±high_conf_cx_tol of frame centre (30–70% by default)\n\n"
+        "The approach score starts at 0.1 for every new track and rises toward 1.0 "
+        "only while the gate is observed growing frame-over-frame. approach_score_alpha "
+        "controls how fast it reacts — lower = more stable, harder to reach the threshold "
+        "from noise.\n\n"
+        "0.0 = disabled (default).",
+        ["high_conf_score", "high_conf_top_tol", "high_conf_cx_tol", "approach_score_alpha"],
+    ),
+    (
+        "Wide side gate",
+        "A bypass condition for gates that exit to one side while filling most of the frame.\n\n"
+        "Fires when ALL of:\n"
+        "  • The gate has exactly 1 raw edge (left OR right — not top/bottom)\n"
+        "  • The gate's bbox width ≥ side_edge_min_w fraction of frame width\n\n"
+        "This catches fast wide exits that only clip one side of the frame. "
+        "The edge count used here is the raw count before the bottom-edge filter, "
+        "so filtering a bottom edge cannot accidentally qualify a gate for this rule.\n\n"
+        "0.0 = disabled.",
+        ["side_edge_min_w"],
+    ),
+    (
+        "Cooldowns",
+        "Rate-limiting guards applied after a pass fires — prevent the same event "
+        "from being counted multiple times.\n\n"
+        "  • pass_cooldown_sec: global — no pass of any kind within this window\n"
+        "  • type_cooldown_sec: per gate type — e.g. two 'square' passes can't fire "
+        "within this interval\n"
+        "  • track_cooldown_sec: per track ID — a single track can't fire more than "
+        "once within this window",
+        ["pass_cooldown_sec", "type_cooldown_sec", "track_cooldown_sec"],
+    ),
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -890,14 +1050,15 @@ class RunnerThread(QThread):
                     if tid not in visible_tids:
                         continue
                     snapshot.append({
-                        "bbox":          list(st.last_bbox),
-                        "track_id":      tid,
-                        "type":          st.ttype,
-                        "stage":         st.stage,
-                        "score":         round(st.last_score_ema, 3),
-                        "area_ratio":    round(st.last_area_ratio, 3),
-                        "flag_centered": st.flag_was_centered,
-                        "nx":            round(st.last_nx, 3),
+                        "bbox":           list(st.last_bbox),
+                        "track_id":       tid,
+                        "type":           st.ttype,
+                        "stage":          st.stage,
+                        "score":          round(st.last_score_ema, 3),
+                        "area_ratio":     round(st.last_area_ratio, 3),
+                        "flag_centered":  st.flag_was_centered,
+                        "nx":             round(st.last_nx, 3),
+                        "approach_score": round(st.approach_score, 3),
                     })
 
             # raw tracker snapshot — ALL tids visible this frame (before passdet filter)
@@ -909,10 +1070,14 @@ class RunnerThread(QThread):
                     "type":     str(tr.locked_type),
                     "score":    round(float(tr.score_ema), 3),
                     "bbox":     list(tr.bbox),
-                    "in_pd":    int(tr.track_id) in pd_tids,
-                    "stage":    next(
+                    "in_pd":          int(tr.track_id) in pd_tids,
+                    "stage":          next(
                         (s["stage"] for s in snapshot if s["track_id"] == int(tr.track_id)),
                         "",
+                    ),
+                    "approach_score": next(
+                        (s["approach_score"] for s in snapshot if s["track_id"] == int(tr.track_id)),
+                        None,
                     ),
                 })
 
@@ -1082,10 +1247,10 @@ class MainWindow(QMainWindow):
         pv2.setContentsMargins(2, 2, 2, 4)
         pv2.setSpacing(2)
 
-        for title, params_fn, store, skip in [
-            ("TRACKER",       _get_tracker_params,  self._tracker_widgets, set()),
-            ("GATES  (square / arch / circle)", _get_passdet_params, self._gate_widgets, _GATE_SKIP),
-            ("FLAGS  (flagpole)",               _get_passdet_params, self._flag_widgets, _FLAG_SKIP),
+        for title, params_fn, store, skip, groups in [
+            ("TRACKER",       _get_tracker_params,  self._tracker_widgets, set(),       None),
+            ("GATES  (square / arch / circle)", _get_passdet_params, self._gate_widgets, _GATE_SKIP, _GATE_PARAM_GROUPS),
+            ("FLAGS  (flagpole)",               _get_passdet_params, self._flag_widgets, _FLAG_SKIP, None),
         ]:
             hdr = QLabel(f"  {title}")
             hdr.setStyleSheet(
@@ -1096,7 +1261,7 @@ class MainWindow(QMainWindow):
             form = QFormLayout()
             form.setSpacing(3)
             form.setContentsMargins(4, 2, 4, 6)
-            self._build_param_section(form, params_fn(), store, skip)
+            self._build_param_section(form, params_fn(), store, skip, groups)
             pv2.addLayout(form)
 
         pv2.addStretch()
@@ -1119,13 +1284,22 @@ class MainWindow(QMainWindow):
         bottom_tabs.setStyleSheet("QTabBar::tab{font-size:11px; padding:3px 8px;}")
 
         # ── Tracks tab ───────────────────────────────────────────────────────
-        self._tracks_list = QListWidget()
+        _TRACK_COLS = ["tid", "type", "stage", "score", "ap", "ar",
+                       "cx%", "cy%", "w%", "h%", "bbox"]
+        self._tracks_list = QTreeWidget()
+        self._tracks_list.setColumnCount(len(_TRACK_COLS))
+        self._tracks_list.setHeaderLabels(_TRACK_COLS)
+        self._tracks_list.setRootIsDecorated(False)
+        self._tracks_list.setSortingEnabled(True)
+        hdr = self._tracks_list.header()
+        hdr.setSectionsMovable(True)
+        hdr.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self._tracks_list.setStyleSheet(
-            "QListWidget{background:#1e1e1e; border:1px solid #444; font-size:11px;"
+            "QTreeWidget{background:#1e1e1e; border:1px solid #444; font-size:11px;"
             "  font-family: monospace;}"
-            "QListWidget::item:selected{background:#2a4a8a;}"
+            "QTreeWidget::item:selected{background:#2a4a8a;}"
         )
-        self._tracks_list.currentRowChanged.connect(self._on_track_selected)
+        self._tracks_list.currentItemChanged.connect(self._on_track_selected)
         bottom_tabs.addTab(self._tracks_list, "Tracks")
 
         # ── Events tab ───────────────────────────────────────────────────────
@@ -1154,12 +1328,20 @@ class MainWindow(QMainWindow):
 
     def _build_param_section(self, form: QFormLayout,
                               params: List[tuple], store: Dict[str, Any],
-                              skip: set = None):
-        """Add one spinbox/checkbox row per param into form; save widgets into store."""
+                              skip: set = None,
+                              groups: List[tuple] = None):
+        """Add one spinbox/checkbox row per param into form; save widgets into store.
+
+        If groups is provided (list of (label, doc, [param_names])), params are
+        rendered under sub-group headers in that order. Any param not listed in any
+        group is appended at the end ungrouped.
+        """
         skip = skip or set()
-        for name, default in params:
-            if name in skip:
-                continue
+        param_map = {name: default for name, default in params if name not in skip}
+
+        def _add_param(name, default):
+            if name not in param_map:
+                return
             label = name.replace("_", " ")
             if isinstance(default, bool):
                 w = QCheckBox()
@@ -1178,7 +1360,7 @@ class MainWindow(QMainWindow):
                 w.setDecimals(int(meta.get("dec", 3)))
                 w.setValue(float(default))
             else:
-                continue
+                return
             w.setFixedHeight(24)
             store[name] = w
 
@@ -1204,6 +1386,59 @@ class MainWindow(QMainWindow):
                 form.addRow(label + ":", row_w)
             else:
                 form.addRow(label + ":", w)
+
+        def _add_group_header(label, doc):
+            hdr_w = QWidget()
+            hdr_h = QHBoxLayout(hdr_w)
+            hdr_h.setContentsMargins(2, 4, 2, 1)
+            hdr_h.setSpacing(3)
+            lbl = QLabel(label)
+            lbl.setStyleSheet(
+                "font-size:10px; font-weight:bold; color:#aac; "
+                "background:transparent; padding:0px;"
+            )
+            hdr_h.addWidget(lbl)
+            if doc:
+                gbtn = QToolButton()
+                gbtn.setText("ⓘ")
+                gbtn.setFixedSize(18, 18)
+                gbtn.setStyleSheet(
+                    "QToolButton{font-size:11px; color:#5af; border:none;"
+                    " background:transparent;}"
+                    "QToolButton:hover{color:#9df;}"
+                )
+                gbtn.clicked.connect(
+                    lambda _, t=label, d=doc: QMessageBox.information(self, t, d)
+                )
+                hdr_h.addWidget(gbtn)
+            hdr_h.addStretch()
+            sep = QFrame()
+            sep.setFrameShape(QFrame.Shape.HLine)
+            sep.setStyleSheet("color:#3a3a50;")
+            form.addRow(sep)
+            form.addRow(hdr_w)
+
+        if groups:
+            grouped = set()
+            for g_label, g_doc, g_params in groups:
+                visible = [n for n in g_params if n in param_map]
+                if not visible:
+                    continue
+                _add_group_header(g_label, g_doc)
+                for name in g_params:
+                    if name in param_map:
+                        _add_param(name, param_map[name])
+                        grouped.add(name)
+            # remaining params not in any group
+            remaining = [n for n, _ in params if n not in skip and n not in grouped]
+            if remaining:
+                _add_group_header("Other", "")
+                for name in remaining:
+                    _add_param(name, param_map[name])
+        else:
+            for name, default in params:
+                if name not in skip:
+                    _add_param(name, default)
 
     def _build_legend(self) -> QWidget:
         w = QWidget()
@@ -1599,43 +1834,59 @@ class MainWindow(QMainWindow):
         raw_tracks = entry.get("raw_tracks", [])
         W = max(entry.get("frame_w", 1), 1)
         H = max(entry.get("frame_h", 1), 1)
-        for tr in sorted(raw_tracks, key=lambda x: x["track_id"]):
-            tid   = int(tr["track_id"])
-            ttype = str(tr["type"]).ljust(9)[:9]
-            score = float(tr["score"])
+        # col indices: tid=0 type=1 stage=2 score=3 ap=4 ar=5 cx%=6 cy%=7 w%=8 h%=9 bbox=10
+        _NUM = Qt.ItemDataRole.UserRole  # store numeric value for correct sorting
+        for tr in raw_tracks:
+            tid    = int(tr["track_id"])
+            ttype  = str(tr["type"])
+            score  = float(tr["score"])
             x1, y1, x2, y2 = (int(v) for v in tr["bbox"])
             w_pct      = (x2 - x1) / W * 100
             h_pct      = (y2 - y1) / H * 100
             cx_pct     = ((x1 + x2) / 2) / W * 100
             cy_pct     = ((y1 + y2) / 2) / H * 100
             area_ratio = (x2 - x1) * (y2 - y1) / (W * H)
-            in_pd  = bool(tr.get("in_pd", False))
-            stage  = str(tr.get("stage", ""))
-            pd_str = stage if stage else "—"
-            text = (f"#{tid:<3d}  {ttype}  {score:.2f}"
-                    f"  [{x1},{y1},{x2},{y2}]"
-                    f"  w={w_pct:.0f}% h={h_pct:.0f}%"
-                    f"  cx={cx_pct:.0f}% cy={cy_pct:.0f}%"
-                    f"  ar={area_ratio:.3f}"
-                    f"  PD:{pd_str}")
-            item = QListWidgetItem(text)
-            item.setData(Qt.ItemDataRole.UserRole, {"tid": tid, "bbox": [x1, y1, x2, y2]})
-            if not in_pd:
-                item.setForeground(QColor(120, 120, 120))
-            elif stage == "aligned":
-                item.setForeground(_ALIGNED_COLOR)
-            elif stage == "passed":
-                item.setForeground(QColor(0, 220, 255))
-            else:
-                item.setForeground(QColor(220, 220, 220))
-            self._tracks_list.addItem(item)
+            in_pd          = bool(tr.get("in_pd", False))
+            stage          = str(tr.get("stage", ""))
+            approach_score = tr.get("approach_score", None)
 
-    def _on_track_selected(self, row: int):
-        item = self._tracks_list.item(row)
-        if item is None:
+            ap_text  = f"{approach_score:.2f}" if approach_score is not None else "—"
+            pd_text  = stage if stage else "—"
+            bbox_text = f"{x1},{y1},{x2},{y2}"
+
+            item = QTreeWidgetItem([
+                str(tid),            # 0 tid
+                ttype,               # 1 type
+                pd_text,             # 2 stage
+                f"{score:.2f}",      # 3 score
+                ap_text,             # 4 ap
+                f"{area_ratio:.3f}", # 5 ar
+                f"{cx_pct:.0f}",     # 6 cx%
+                f"{cy_pct:.0f}",     # 7 cy%
+                f"{w_pct:.0f}",      # 8 w%
+                f"{h_pct:.0f}",      # 9 h%
+                bbox_text,           # 10 bbox
+            ])
+            # store numeric values for sorting
+            for col, val in [(0, tid), (3, score), (4, approach_score or -1),
+                             (5, area_ratio), (6, cx_pct), (7, cy_pct),
+                             (8, w_pct), (9, h_pct)]:
+                item.setData(col, _NUM, val)
+            item.setData(0, Qt.ItemDataRole.UserRole + 1, {"tid": tid, "bbox": [x1, y1, x2, y2]})
+
+            color = (QColor(120, 120, 120) if not in_pd else
+                     _ALIGNED_COLOR       if stage == "aligned" else
+                     QColor(0, 220, 255)  if stage == "passed"  else
+                     QColor(220, 220, 220))
+            for col in range(11):
+                item.setForeground(col, color)
+            self._tracks_list.addTopLevelItem(item)
+
+    def _on_track_selected(self, current, previous):
+        if current is None:
             self._video.clear_overlay()
             return
-        data = item.data(Qt.ItemDataRole.UserRole)
+        data = current.data(0, Qt.ItemDataRole.UserRole + 1)
         if not data:
             self._video.clear_overlay()
             return

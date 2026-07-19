@@ -119,6 +119,10 @@ class TrackPassState:
     aligned_time: float = 0.0
     aligned_frames: int = 0
 
+    # approach score: starts low, rises while gate grows, falls while it shrinks
+    approach_score: float = 0.1
+    approach_prev_area_ratio: float = 0.0
+
 
 class PassDetector:
     """
@@ -170,6 +174,7 @@ class PassDetector:
         bottom_edge_max_cy: float = 0.69,
         bottom_edge_min_w: float = 0.52,
         side_edge_min_w: float = 0.45,
+        approach_score_alpha: float = 0.2,
     ):
         self.min_track_score = float(min_track_score)
         self.min_area_ratio = float(min_area_ratio)
@@ -208,6 +213,7 @@ class PassDetector:
         self.bottom_edge_max_cy = float(bottom_edge_max_cy)
         self.bottom_edge_min_w = float(bottom_edge_min_w)
         self.side_edge_min_w = float(side_edge_min_w)
+        self.approach_score_alpha = float(approach_score_alpha)
 
         self.states: Dict[int, TrackPassState] = {}
         self._just_passed: Dict[int, dict] = {}
@@ -236,6 +242,7 @@ class PassDetector:
                 "last_seen_age": float(now - st.last_seen_time),
 
                 "score_ema": float(st.last_score_ema),
+                "approach_score": float(st.approach_score),
 
                 "area_ratio": float(st.last_area_ratio),
                 "center_dist": float(st.last_center_dist),
@@ -383,6 +390,13 @@ class PassDetector:
             st.area_vel_ema = (1.0 - self.area_vel_ema_alpha) * st.area_vel_ema + self.area_vel_ema_alpha * vel
             st.prev_area_ratio = area_ratio
 
+            approach_vel = (area_ratio - st.approach_prev_area_ratio) / dt
+            st.approach_prev_area_ratio = area_ratio
+            if approach_vel > 0:
+                st.approach_score = (1.0 - self.approach_score_alpha) * st.approach_score + self.approach_score_alpha * 1.0
+            elif approach_vel < 0:
+                st.approach_score = (1.0 - self.approach_score_alpha) * st.approach_score + self.approach_score_alpha * 0.0
+
             # --------------------------------
             # Sudden single-frame shrink while aligned => treat as disappeared.
             # A real flythrough exit (or occlusion) often shows up as one huge
@@ -403,13 +417,13 @@ class PassDetector:
                     fired = False
                     if st.aligned_frames >= self.min_aligned_frames:
                         px1, py1, px2, py2 = prev_bbox
-                        edges_near = _count_edges_near_real_frame(
+                        edges_near_raw = _count_edges_near_real_frame(
                             px1, py1, px2, py2,
                             frame_w, frame_h,
                             self.cam_left_norm, self.cam_right_norm,
                             self.flag_edge_tol,
                         )
-                        edges_near = self._filter_bottom_edge(edges_near, px1, py1, px2, py2, frame_w, frame_h)
+                        edges_near = self._filter_bottom_edge(edges_near_raw, px1, py1, px2, py2, frame_w, frame_h)
                         x1c, y1c, x2c, y2c = bbox
                         edges_cur = _count_edges_near_real_frame(
                             x1c, y1c, x2c, y2c,
@@ -424,7 +438,7 @@ class PassDetector:
                         high_conf_gate = (
                             not _is_flag(ttype)
                             and self.high_conf_score > 0
-                            and score_ema >= self.high_conf_score
+                            and st.approach_score >= self.high_conf_score
                             and py1 <= self.high_conf_top_tol * frame_h
                             and abs((px1 + px2) / 2 / frame_w - 0.5) <= self.high_conf_cx_tol
                         )
@@ -432,7 +446,7 @@ class PassDetector:
                         wide_side_gate = (
                             not _is_flag(ttype)
                             and self.side_edge_min_w > 0
-                            and edges_near == 1
+                            and edges_near_raw == 1
                             and (px2 - px1) / frame_w >= self.side_edge_min_w
                             and (px1 <= cam_l + tol_x or px2 >= cam_r - tol_x)
                         )
@@ -531,27 +545,27 @@ class PassDetector:
                 if elapsed <= self.disappear_timeout:
                     if st.aligned_frames >= self.min_aligned_frames:
                         x1, y1, x2, y2 = st.last_bbox
-                        edges_near = _count_edges_near_real_frame(
+                        edges_near_raw = _count_edges_near_real_frame(
                             x1, y1, x2, y2,
                             self._frame_w, self._frame_h,
                             self.cam_left_norm, self.cam_right_norm,
                             self.flag_edge_tol,
                         )
-                        edges_near = self._filter_bottom_edge(edges_near, x1, y1, x2, y2, self._frame_w, self._frame_h)
+                        edges_near = self._filter_bottom_edge(edges_near_raw, x1, y1, x2, y2, self._frame_w, self._frame_h)
                         cam_l = self.cam_left_norm * self._frame_w
                         cam_r = self.cam_right_norm * self._frame_w
                         tol_x = self.flag_edge_tol * self._frame_w
                         high_conf_gate = (
                             not _is_flag(st.ttype)
                             and self.high_conf_score > 0
-                            and st.last_score_ema >= self.high_conf_score
+                            and st.approach_score >= self.high_conf_score
                             and st.last_bbox[1] <= self.high_conf_top_tol * self._frame_h
                             and abs((x1 + x2) / 2 / self._frame_w - 0.5) <= self.high_conf_cx_tol
                         )
                         wide_side_gate = (
                             not _is_flag(st.ttype)
                             and self.side_edge_min_w > 0
-                            and edges_near == 1
+                            and edges_near_raw == 1
                             and (x2 - x1) / self._frame_w >= self.side_edge_min_w
                             and (x1 <= cam_l + tol_x or x2 >= cam_r - tol_x)
                         )
