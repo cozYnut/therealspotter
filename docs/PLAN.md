@@ -143,4 +143,4 @@ Pass-detection errors (missed or extra passes) are reported separately, so they 
 - **Fisheye distortion** bends bearings near the frame edge. Use normalised positions near the centre, or a rough per-lens undistortion.
 - **Analog breakup** can split one pass into two or hide a gate. The false-pass state absorbs extras.
 - **Decided: one memory per track.** Gates don't move within a track; a changed layout means a new memory.
-- **FPVTrackside comes last.** Integration starts only once the pass detection system works (Milestone 5).
+- **FPVTrackside comes last.** Integration starts only once the pass detection system works (Milestone 5); until then results show in `race_ui`.
