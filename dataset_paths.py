@@ -1,0 +1,160 @@
+"""
+Where dataset files live — shared by every UI and script.
+
+Nothing generated from videos is written inside the code repo.  Everything
+lives under one data root, one folder per track.  Every file or folder made
+from a video starts with the video's name (<video>.<what>), so one video's
+data sorts together:
+
+    <data_root>/
+      <track>/                       e.g. track1
+        gate_memory.json             the track's learned gates
+        memory_videos/               videos used to learn the gates
+        test_videos/                 videos used only for scoring
+        candidates/<video>.candidates.json   learn_ui candidate extraction
+        candidates/<video>.crops/            candidate / Force Clip crops (memory images)
+        runs/<video>.race_data.json          extract_race.py output
+        runs/<video>.race_query/             its query crops
+        gt/<video>.gt.json                   reviewed marks (learn_ui REVIEW mode)
+        velocidrone/                 same layout, for the sim version of the track
+      training/                      shared YOLO data (gate_annotator)
+        gate_annotations/  gate_models/  runs/
+
+Data root: $FPV_DATA_ROOT, else "data_root" in local_config.json next to this
+file, else /Users/eyalcozac/Codes and apps/FPVdatasets.
+"""
+
+import json
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional
+
+DEFAULT_DATA_ROOT = "/Users/eyalcozac/Codes and apps/FPVdatasets"
+VIDEO_FILTER = "Video Files (*.mp4 *.avi *.mov *.mkv *.MP4 *.MOV)"
+SIM_DIR = "velocidrone"
+TRAINING_DIR = "training"
+
+
+def data_root() -> Path:
+    env = os.environ.get("FPV_DATA_ROOT")
+    if env:
+        return Path(env)
+    cfg = Path(__file__).parent / "local_config.json"
+    if cfg.exists():
+        try:
+            val = json.loads(cfg.read_text(encoding="utf-8")).get("data_root")
+            if val:
+                return Path(val)
+        except Exception:
+            pass
+    return Path(DEFAULT_DATA_ROOT)
+
+
+def training_dir() -> Path:
+    return data_root() / TRAINING_DIR
+
+
+def under_root(path) -> Optional[Path]:
+    """Path relative to the data root, or None if it lies outside.
+    Tries the path as given first, so symlinked videos inside the dataset count."""
+    root = data_root()
+    for p, r in ((Path(os.path.abspath(path)), Path(os.path.abspath(root))),
+                 (Path(path).resolve(), root.resolve())):
+        try:
+            return p.relative_to(r)
+        except ValueError:
+            pass
+    return None
+
+
+def rel(path) -> str:
+    """Path relative to the data root (unchanged if it lies outside)."""
+    if not path:
+        return ""
+    r = under_root(path)
+    return str(r) if r is not None else str(path)
+
+
+def abs_path(path) -> str:
+    """Inverse of rel(): resolve a data-root-relative path."""
+    if not path:
+        return ""
+    p = Path(path)
+    return str(p if p.is_absolute() else data_root() / p)
+
+
+@dataclass(frozen=True)
+class TrackPaths:
+    """All file locations for one track folder (or its velocidrone/ subfolder)."""
+    dir: Path
+
+    @property
+    def name(self) -> str:
+        return f"{self.dir.parent.name} (sim)" if self.dir.name == SIM_DIR else self.dir.name
+
+    @property
+    def gate_memory(self) -> Path:
+        return self.dir / "gate_memory.json"
+
+    @property
+    def memory_videos(self) -> Path:
+        return self.dir / "memory_videos"
+
+    @property
+    def test_videos(self) -> Path:
+        return self.dir / "test_videos"
+
+    @property
+    def gt_dir(self) -> Path:
+        return self.dir / "gt"
+
+    @property
+    def runs_dir(self) -> Path:
+        return self.dir / "runs"
+
+    @property
+    def candidates_dir(self) -> Path:
+        return self.dir / "candidates"
+
+    def gt(self, stem: str) -> Path:
+        return self.gt_dir / f"{stem}.gt.json"
+
+    def race_data(self, stem: str) -> Path:
+        return self.runs_dir / f"{stem}.race_data.json"
+
+    def race_query_dir(self, stem: str) -> Path:
+        # extract_race.py writes this next to its --output
+        return self.runs_dir / f"{stem}.race_query"
+
+    def candidates_json(self, stem: str) -> Path:
+        return self.candidates_dir / f"{stem}.candidates.json"
+
+    def candidate_crops(self, stem: str) -> Path:
+        return self.candidates_dir / f"{stem}.crops"
+
+    def ensure(self) -> "TrackPaths":
+        for d in (self.memory_videos, self.test_videos, self.gt_dir, self.runs_dir, self.candidates_dir):
+            d.mkdir(parents=True, exist_ok=True)
+        return self
+
+
+def track_of(path) -> Optional[TrackPaths]:
+    """The track a file or folder inside the data root belongs to, else None."""
+    r = under_root(path)
+    root = data_root()
+    if r is None or not r.parts or r.parts[0] == TRAINING_DIR:
+        return None
+    if len(r.parts) == 1 and not (root / r.parts[0]).is_dir():
+        return None                     # a loose file in the root, not a track
+    if len(r.parts) >= 2 and r.parts[1] == SIM_DIR:
+        return TrackPaths(root / r.parts[0] / SIM_DIR)
+    return TrackPaths(root / r.parts[0])
+
+
+def list_tracks() -> List[TrackPaths]:
+    root = data_root()
+    if not root.exists():
+        return []
+    return [TrackPaths(d) for d in sorted(root.iterdir())
+            if d.is_dir() and d.name != TRAINING_DIR and not d.name.startswith(".")]

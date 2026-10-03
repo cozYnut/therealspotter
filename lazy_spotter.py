@@ -390,10 +390,10 @@ class ClipEmbedder:
         return feat.squeeze(0).detach().cpu().numpy().astype(np.float32)
 
 
-def save_pass_crop(out_dir: str, pass_idx: int, gate_type: str, track_id: int, now: float, item: dict):
+def save_pass_crop(out_dir: str, pass_idx: int, gate_type: str, track_id: int, now: float, item: dict,
+                   prefix: str = ""):
     Path(out_dir).mkdir(parents=True, exist_ok=True)
-    ts_ms = int(now * 1000.0)
-    fname = f"pass_{pass_idx:04d}_tid{track_id}_{gate_type}_{ts_ms}.jpg"
+    fname = f"{prefix}pass{pass_idx:04d}_tid{track_id}_{gate_type}_{now:.3f}s.jpg"
     path = os.path.join(out_dir, fname)
     cv2.imwrite(path, item["crop"])
     return path
@@ -840,14 +840,23 @@ def main():
 
     # embeddings
     parser.add_argument("--save-pass-crops", action="store_true", help="Enable CLIP embeddings (and optionally save crops)")
-    parser.add_argument("--pass-crops-dir", type=str, default="pass_crops", help="Folder to save pass crops into")
+    parser.add_argument("--pass-crops-dir", type=str, default=None, help="Folder to save pass crops into (default: <track>/pass_crops)")
     parser.add_argument("--clip-device", type=str, default="cpu", help="cpu / mps / cuda for CLIP embedding")
 
     # memory persistence
-    parser.add_argument("--gate-memory", type=str, default=GATE_MEMORY_PATH, help="Path to gate memory json file")
+    parser.add_argument("--gate-memory", type=str, default=None, help="Path to gate memory json file (default: the video's track)")
     parser.add_argument("--race-lookahead", type=int, default=RACE_LOOKAHEAD, help="How many gates ahead to consider in race mode")
 
     args = parser.parse_args()
+
+    # Default file locations come from the video's track folder (dataset_paths.py)
+    from dataset_paths import data_root, track_of
+    _tp = track_of(args.video) if args.video else None
+    if args.gate_memory is None:
+        args.gate_memory = str(_tp.gate_memory) if _tp else str(data_root() / GATE_MEMORY_PATH)
+    if args.pass_crops_dir is None:
+        stem = Path(args.video).stem if args.video else "camera"
+        args.pass_crops_dir = str((_tp.runs_dir if _tp else data_root()) / f"{stem}.pass_crops")
 
     det = YOLO(args.det_model)
     names = _get_yolo_names(det)
@@ -1072,6 +1081,7 @@ def main():
                     if SAVE_PASS_CROPS_TODISK:
                         saved_path = save_pass_crop(
                             out_dir=args.pass_crops_dir,
+                            prefix=f"{Path(args.video).stem}_" if args.video else "",
                             pass_idx=passhud._next_idx,
                             gate_type=evt_type,
                             track_id=tid,

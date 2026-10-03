@@ -34,6 +34,8 @@ import numpy as np
 import yaml
 from ultralytics import YOLO
 
+from dataset_paths import training_dir
+
 from PySide6.QtCore import Qt, QPointF, QRectF, QRect, QSize, Signal, QObject, QThread
 from PySide6.QtGui import (
     QPen, QBrush, QColor, QPixmap, QImage, QPainter, QCursor, QFont,
@@ -985,7 +987,7 @@ class Trainer:
             return {"error": f"No '{class_name}' keypoint annotations to export"}
 
         current = self._active_kpts.get(class_name)
-        start   = "yolo11n-pose.pt" if (retrain_from_base or not current) else current
+        start   = str(training_dir() / "yolo11n-pose.pt") if (retrain_from_base or not current) else current
         ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
         run     = self.output_root / "keypoints" / class_name / ts
         n       = len(KPT_NAMES[class_name])
@@ -1042,7 +1044,8 @@ class Trainer:
 
     def eval_on_val(self, weights_path: str, data_yaml: str) -> float:
         try:
-            res = YOLO(weights_path).val(data=data_yaml, device=self.device, verbose=False)
+            res = YOLO(weights_path).val(data=data_yaml, device=self.device, verbose=False,
+                                         project=str(training_dir() / "runs" / "detect"), name="val")
             return float(res.results_dict.get("metrics/mAP50-95(B)", 0.0))
         except Exception as e:
             print(f"[Trainer] eval failed: {e}")
@@ -1895,8 +1898,9 @@ _HERE = Path(__file__).parent
 
 class MainWindow(QMainWindow):
     DET_MODEL_PATH   = str(_HERE / "current_best_non_vocab.pt")
-    ANNOTATIONS_ROOT = str(_HERE / "gate_annotations")
-    MODELS_ROOT      = str(_HERE / "gate_models")
+    # Shared YOLO training data lives in the dataset, not the repo (dataset_paths.py)
+    ANNOTATIONS_ROOT = str(training_dir() / "gate_annotations")
+    MODELS_ROOT      = str(training_dir() / "gate_models")
 
     def __init__(self) -> None:
         super().__init__()
