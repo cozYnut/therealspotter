@@ -883,15 +883,14 @@ class DatasetManager:
 # ═════════════════════════════════════════════════════════════════════════════
 
 class Trainer:
-    def __init__(self, det_model_path: str, dataset_manager: DatasetManager,
+    def __init__(self, dataset_manager: DatasetManager,
                  output_root: str = "gate_models", device: str = "mps") -> None:
-        self.det_model_path = str(det_model_path)
         self.dm             = dataset_manager
         self.output_root    = Path(output_root)
         self.device         = device
         self.output_root.mkdir(parents=True, exist_ok=True)
         self._manifest_path = self.output_root / "manifest.json"
-        self._active_detect = self.det_model_path
+        self._active_detect: Optional[str] = None
         self._active_kpts: dict[str, Optional[str]] = {k: None for k in KPT_NAMES}
         self._best_det_map: float = 0.0
         self._best_kpt_maps: dict[str, float] = {k: 0.0 for k in KPT_NAMES}
@@ -900,7 +899,7 @@ class Trainer:
     def _load_manifest(self) -> None:
         if self._manifest_path.exists():
             d = json.loads(self._manifest_path.read_text())
-            self._active_detect  = d.get("detect",          self.det_model_path)
+            self._active_detect  = d.get("detect",          None)
             self._active_kpts    = d.get("keypoints",       self._active_kpts)
             self._best_det_map   = d.get("best_detect_map", 0.0)
             self._best_kpt_maps  = d.get("best_kpt_maps",   self._best_kpt_maps)
@@ -941,12 +940,18 @@ class Trainer:
         if not (dataset / "data.yaml").exists():
             return {"error": "No annotated frames to export"}
 
-        start = self.det_model_path if retrain_from_base else self._active_detect
+        base  = str(training_dir() / "yolo11n.pt")   # downloaded there on first use
+        start = base if (retrain_from_base or not self._active_detect) else self._active_detect
         ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
         run   = self.output_root / "detect" / ts
 
         print(f"[Trainer] detect  epochs={epochs}  lr0={lr0}  batch={batch}  start={start}")
-        res = YOLO(start).train(
+        model = YOLO(start)
+        if self.device == "mps":
+            import torch
+            model.add_callback("on_train_epoch_end",
+                               lambda _: torch.mps.empty_cache())
+        res = model.train(
             data=str(dataset / "data.yaml"),
             epochs=epochs, imgsz=imgsz, device=self.device,
             project=str(run), name="train", exist_ok=True,
@@ -993,7 +998,12 @@ class Trainer:
         n       = len(KPT_NAMES[class_name])
 
         print(f"[Trainer] {class_name}  kpt_shape=[{n},3]  epochs={epochs}  lr0={lr0}")
-        res = YOLO(start).train(
+        model = YOLO(start)
+        if self.device == "mps":
+            import torch
+            model.add_callback("on_train_epoch_end",
+                               lambda _: torch.mps.empty_cache())
+        res = model.train(
             data=str(dataset / "data.yaml"),
             epochs=epochs, imgsz=imgsz, device=self.device,
             project=str(run), name="train", exist_ok=True,
@@ -1897,7 +1907,6 @@ _HERE = Path(__file__).parent
 
 
 class MainWindow(QMainWindow):
-    DET_MODEL_PATH   = str(_HERE / "current_best_non_vocab.pt")
     # Shared YOLO training data lives in the dataset, not the repo (dataset_paths.py)
     ANNOTATIONS_ROOT = str(training_dir() / "gate_annotations")
     MODELS_ROOT      = str(training_dir() / "gate_models")
@@ -1916,7 +1925,7 @@ class MainWindow(QMainWindow):
         self._worker:    Optional[_AllFramesWorker] = None
         self._bg_thread: Optional[QThread]          = None
         self._dm       = DatasetManager(self.ANNOTATIONS_ROOT)
-        self._trainer:   Optional[Trainer]          = None
+        self._trainer  = Trainer(self._dm, self.MODELS_ROOT)
         self._inference_results: dict[int, list]   = {}
 
         # dataset-tab state
@@ -1998,10 +2007,21 @@ class MainWindow(QMainWindow):
         self._btn_validate.clicked.connect(self._run_validation)
         tb.addWidget(self._btn_validate)
 
-        act_set_model = QAction("🔧 Set Model", self)
-        act_set_model.setToolTip("Override the active detection model for this session")
-        act_set_model.triggered.connect(self._on_set_model)
-        tb.addAction(act_set_model)
+        btn_set_model = QPushButton("🔧 Set Model")
+        btn_set_model.setToolTip("Set the active detection model")
+        btn_set_model.clicked.connect(self._on_set_model)
+        tb.addWidget(btn_set_model)
+        self._det_model_lbl = QLabel("No model")
+        self._det_model_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        tb.addWidget(self._det_model_lbl)
+
+        btn_set_kp_model = QPushButton("🔧 Set KP Model")
+        btn_set_kp_model.setToolTip("Set the active keypoint model for a gate class")
+        btn_set_kp_model.clicked.connect(self._on_set_kp_model)
+        tb.addWidget(btn_set_kp_model)
+        self._kpt_model_lbl = QLabel("No KP model")
+        self._kpt_model_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        tb.addWidget(self._kpt_model_lbl)
         tb.addSeparator()
 
         self._btn_show_bbox = QPushButton("BBox")
@@ -2350,11 +2370,6 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Opened: {Path(path).name}  ({n} frames  {self._video.fps:.1f} fps)"
         )
-        if self._engine is None:
-            self._trainer = Trainer(self.DET_MODEL_PATH, self._dm, self.MODELS_ROOT)
-            kpt_paths = {cls: self._trainer.active_kpt_weights(cls)
-                         for cls in KPT_NAMES if self._trainer.active_kpt_weights(cls)}
-            self._engine = InferenceEngine(self._trainer.active_detect_weights, kpt_paths)
         # Switch to video tab
         self._bottom_tabs.setCurrentIndex(0)
         self._mode = "video"
@@ -2441,7 +2456,11 @@ class MainWindow(QMainWindow):
             self._start_inference()
 
     def _start_inference(self) -> None:
-        if self._engine is None or self._video is None:
+        if self._video is None:
+            return
+        if self._engine is None:
+            QMessageBox.warning(self, "No model loaded",
+                                "Please set a detection model first using the Set Model button.")
             return
         self._inference_results.clear()
         self._timeline.clear_marks()
@@ -3043,19 +3062,53 @@ class MainWindow(QMainWindow):
         if not Path(path).exists():
             QMessageBox.warning(self, "No models found", f"Detect model not found:\n{path}")
             return
-        kpt_paths = {}
-        if self._trainer:
-            kpt_paths = {cls: self._trainer.active_kpt_weights(cls)
-                         for cls in KPT_NAMES if self._trainer.active_kpt_weights(cls)}
-            self._trainer._active_detect = path
-        else:
-            self._trainer = Trainer(path, self._dm, self.MODELS_ROOT)
-            kpt_paths = {cls: self._trainer.active_kpt_weights(cls)
-                         for cls in KPT_NAMES if self._trainer.active_kpt_weights(cls)}
+        self._trainer._active_detect = path
+        kpt_paths = {cls: self._trainer.active_kpt_weights(cls)
+                     for cls in KPT_NAMES if self._trainer.active_kpt_weights(cls)}
         kpt_paths = {cls: p for cls, p in kpt_paths.items() if Path(p).exists()}
         self._engine = InferenceEngine(path, kpt_paths)
         name = self._model_display_name(path)
-        self.statusBar().showMessage(f"Model set: {name}")
+        self._det_model_lbl.setText(name)
+        self.statusBar().showMessage(f"Detect model set: {name}")
+
+    def _on_set_kp_model(self) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Set Keypoint Model")
+        vlay = QVBoxLayout(dlg)
+        vlay.addWidget(QLabel("Select gate class:"))
+        combo = QComboBox()
+        for cls in KPT_NAMES:
+            combo.addItem(cls)
+        vlay.addWidget(combo)
+        bbox = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        bbox.accepted.connect(dlg.accept)
+        bbox.rejected.connect(dlg.reject)
+        vlay.addWidget(bbox)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        cls_name = combo.currentText()
+        path, _ = QFileDialog.getOpenFileName(
+            self, f"Select keypoint model for '{cls_name}'", "", "PyTorch Models (*.pt)"
+        )
+        if not path or not Path(path).exists():
+            return
+        self._trainer._active_kpts[cls_name] = path
+        self._trainer._save_manifest()
+        # reload engine with updated kpt paths
+        det_path = self._trainer.active_detect_weights
+        if det_path and Path(det_path).exists():
+            kpt_paths = {cls: self._trainer.active_kpt_weights(cls)
+                         for cls in KPT_NAMES if self._trainer.active_kpt_weights(cls)}
+            kpt_paths = {cls: p for cls, p in kpt_paths.items() if Path(p).exists()}
+            self._engine = InferenceEngine(det_path, kpt_paths)
+        self._update_kpt_label()
+        self.statusBar().showMessage(f"KP model set for '{cls_name}': {Path(path).name}")
+
+    def _update_kpt_label(self) -> None:
+        loaded = [cls for cls in KPT_NAMES if self._trainer.active_kpt_weights(cls)]
+        self._kpt_model_lbl.setText(", ".join(loaded) if loaded else "No KP model")
 
     @staticmethod
     def _model_display_name(path: str) -> str:
@@ -3068,10 +3121,6 @@ class MainWindow(QMainWindow):
             return p.name
 
     def _show_finetune_dialog(self) -> None:
-        if not self._trainer:
-            QMessageBox.information(self, "Fine-tune",
-                                    "Open a video first to initialise the trainer.")
-            return
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Fine-tune")
@@ -3195,9 +3244,13 @@ class MainWindow(QMainWindow):
         self._show_promotion_dialog(finetune_results)
 
         # Reload inference engine with whatever is now active
-        kpt_paths = {cls: self._trainer.active_kpt_weights(cls)
-                     for cls in KPT_NAMES if self._trainer.active_kpt_weights(cls)}
-        self._engine = InferenceEngine(self._trainer.active_detect_weights, kpt_paths)
+        det_path = self._trainer.active_detect_weights
+        if det_path and Path(det_path).exists():
+            kpt_paths = {cls: self._trainer.active_kpt_weights(cls)
+                         for cls in KPT_NAMES if self._trainer.active_kpt_weights(cls)}
+            self._engine = InferenceEngine(det_path, kpt_paths)
+            self._det_model_lbl.setText(self._model_display_name(det_path))
+        self._update_kpt_label()
         self.statusBar().showMessage("Fine-tune complete — engine updated.")
 
     def _show_promotion_dialog(self, results: dict) -> None:
