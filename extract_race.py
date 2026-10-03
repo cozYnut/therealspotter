@@ -5,13 +5,14 @@ Headless race extraction for race_ui.py.
 Runs the full pipeline (YOLO + tracker + PassDetector + CLIP + GateDB race matching)
 on a video and saves per-frame data + race results to JSON.
 
-Usage:
+Usage (video inside a track folder — memory and output come from the track):
     python extract_race.py \
-        --video  venv/videos/myvideo.mp4 \
+        --video  "<data_root>/track1/test_videos/myvideo.mp4" \
         --det-model  current_best_non_vocab.pt \
-        --gate-memory  gate_memory.json \
-        --output  race_data.json \
         --clip-device  mps
+    → <data_root>/track1/runs/myvideo.race_data.json  (see dataset_paths.py)
+
+--gate-memory / --output override the track defaults.
 """
 
 import argparse
@@ -24,6 +25,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+from dataset_paths import track_of
 from pass_detector import PassDetector, detect_camera_edges
 from gate_db import GateDB
 from collections import deque
@@ -104,7 +106,8 @@ def run_race_extraction(
     all_passes = []
     frame_idx = 0
 
-    query_frames_dir = str(Path(output_json).parent / f"race_query_{Path(video_path).stem}")
+    stem = Path(video_path).stem
+    query_frames_dir = str(Path(output_json).parent / f"{stem}.race_query")
     Path(query_frames_dir).mkdir(parents=True, exist_ok=True)
 
     while True:
@@ -183,7 +186,7 @@ def run_race_extraction(
 
             emb = clip.embed_bgr(embed_crop)
 
-            q_fname = f"q_{frame_idx:06d}_{int(t * 1000)}.jpg"
+            q_fname = f"{stem}_q{frame_idx:06d}_{t:.3f}s.jpg"
             query_img_path = str(Path(query_frames_dir) / q_fname)
             cv2.imwrite(query_img_path, embed_crop)
 
@@ -267,8 +270,8 @@ def main():
     parser = argparse.ArgumentParser(description="Headless race extraction for race_ui.py")
     parser.add_argument("--video",             required=True,              help="Path to video file")
     parser.add_argument("--det-model",         required=True,              help="Path to YOLO .pt model")
-    parser.add_argument("--gate-memory",       required=True,              help="Path to gate_memory.json")
-    parser.add_argument("--output",            default="race_data.json",   help="Output JSON path")
+    parser.add_argument("--gate-memory",       default=None,  help="gate_memory.json (default: the video's track)")
+    parser.add_argument("--output",            default=None,  help="Output JSON (default: <track>/runs/<video>.race_data.json)")
     parser.add_argument("--det-conf",        type=float, default=0.25)
     parser.add_argument("--clip-device",     default="cpu",            help="cpu / mps / cuda")
     parser.add_argument("--pass-offset-sec", type=float, default=0.0,
@@ -285,6 +288,15 @@ def main():
     parser.add_argument("--require-same-type", action="store_true", default=False,
                         help="Only match a detected gate against memory slots of the same type")
     args = parser.parse_args()
+
+    tp = track_of(args.video)
+    if tp is None and (args.gate_memory is None or args.output is None):
+        parser.error("video is not inside a track folder — pass --gate-memory and --output")
+    if args.gate_memory is None:
+        args.gate_memory = str(tp.gate_memory)
+    if args.output is None:
+        tp.runs_dir.mkdir(parents=True, exist_ok=True)
+        args.output = str(tp.race_data(Path(args.video).stem))
 
     run_race_extraction(
         video_path=args.video,

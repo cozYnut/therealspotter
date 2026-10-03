@@ -6,10 +6,13 @@ No command-line arguments needed.  Open everything from inside the UI.
 
 Workflow:
   1. python race_ui.py
-  2. 📂 Open Video   → select your race video
-  3. 🧠 Open Gate Memory → select gate_memory.json
-  4. ▶ Run Race Analysis → extraction runs in background
+  2. 📁 Open Track   → pick <data_root>/<track>; its gate_memory.json loads
+  3. 📂 Open Video   → a video from the track (saved results load if present)
+  4. ▶ Run Race Analysis → extraction runs in background and saves to
+     <track>/runs/<video>.race_data.json (see dataset_paths.py)
   5. Scrub through the video to review detections, matches, and lap splits
+
+🧠 Open Gate Memory can still load a different memory for experiments.
 
 Timeline legend:
   Green tick  = gate pass matched (RACE)
@@ -25,9 +28,12 @@ Keyboard shortcuts:
 """
 
 import json
+import shutil
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+from dataset_paths import VIDEO_FILTER, TrackPaths, data_root, track_of
 
 import cv2
 import numpy as np
@@ -564,6 +570,7 @@ class MainWindow(QMainWindow):
         self.resize(1540, 900)
 
         self._video_path: Optional[str] = None
+        self._track: Optional[TrackPaths] = None
         self._gate_memory_path: Optional[str] = None
         self._det_model_path: Optional[str] = self._find_model_auto()
         self._clip_device: str = _auto_clip_device()
@@ -622,6 +629,14 @@ class MainWindow(QMainWindow):
         tb = QToolBar("Main")
         tb.setMovable(False)
         self.addToolBar(tb)
+
+        open_track = QAction("📁 Open Track", self)
+        open_track.setToolTip("Pick a track folder — its gate memory loads and results are saved there")
+        open_track.triggered.connect(self._on_open_track)
+        tb.addAction(open_track)
+        self._track_label = QLabel("  no track  ")
+        self._track_label.setStyleSheet("color:#ffa028; font-weight:bold; font-size:12px;")
+        tb.addWidget(self._track_label)
 
         open_vid = QAction("📂 Open Video", self)
         open_vid.triggered.connect(self._on_open_video)
@@ -931,10 +946,62 @@ class MainWindow(QMainWindow):
 
     # ── File loading ──────────────────────────────────────────
 
-    def _on_open_video(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open Video", "", "Video Files (*.mp4 *.avi *.mov *.mkv *.MP4 *.MOV)"
+    def _on_open_track(self):
+        root = data_root()
+        root.mkdir(parents=True, exist_ok=True)
+        d = QFileDialog.getExistingDirectory(
+            self, "Open a track folder", str(self._track.dir if self._track else root)
         )
+        if not d:
+            return
+        tp = track_of(d)
+        if tp is None:
+            QMessageBox.warning(self, "Not a track folder", f"Pick a track folder inside:\n{root}")
+            return
+        self._set_track(tp)
+
+    def _set_track(self, tp: TrackPaths):
+        self._track = tp.ensure()
+        self._track_label.setText(f"  track: {tp.name}  ")
+        self._track_label.setStyleSheet("color:#60dc78; font-weight:bold; font-size:12px;")
+        if tp.gate_memory.exists():
+            self._load_memory(str(tp.gate_memory))
+        else:
+            self._sb.showMessage(f"Track '{tp.name}' has no gate_memory.json yet — learn it in learn_ui first.")
+
+    def _place_video(self, path: str) -> Optional[str]:
+        """The video must be in a track folder; one from outside is copied into
+        <track>/test_videos/ of the open track."""
+        tp = track_of(path)
+        if tp is not None:
+            if not self._track or tp.dir != self._track.dir:
+                self._set_track(tp)
+            return path
+        if self._track is None:
+            QMessageBox.information(self, "Pick a track", "This video is not in the dataset yet — pick its track folder.")
+            self._on_open_track()
+            if self._track is None:
+                return None
+        dest = self._track.test_videos / Path(path).name
+        if not dest.exists():
+            ans = QMessageBox.question(
+                self, "Copy video into the track?",
+                f"Copy\n{Path(path).name}\ninto\n{dest.parent}?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if ans == QMessageBox.StandardButton.No:
+                return None
+            self._sb.showMessage(f"Copying {Path(path).name}…")
+            QApplication.processEvents()
+            shutil.copy2(path, dest)
+        return str(dest)
+
+    def _on_open_video(self):
+        start = self._track.test_videos if self._track else data_root()
+        path, _ = QFileDialog.getOpenFileName(self, "Open Video", str(start), VIDEO_FILTER)
+        if not path:
+            return
+        path = self._place_video(path)
         if not path:
             return
         if not self._video.load(path):
@@ -945,11 +1012,20 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"FPV Race Review — {Path(path).name}")
         self._sb.showMessage(f"Video loaded: {Path(path).name}  ({self._video.duration:.1f}s)")
         self._check_ready()
+        saved = track_of(path).race_data(Path(path).stem)
+        if saved.exists():
+            self._load_race_data(str(saved))
+            self._sb.showMessage(f"Loaded saved results {saved.name} — ▶ Run Race Analysis to redo them")
 
     def _on_open_memory(self):
+        start = self._track.dir if self._track else data_root()
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open Gate Memory", "", "JSON Files (*.json)"
+            self, "Open Gate Memory", str(start), "JSON Files (*.json)"
         )
+        if path:
+            self._load_memory(path)
+
+    def _load_memory(self, path: str):
         if path:
             self._gate_memory_path = path
             try:
@@ -998,7 +1074,9 @@ class MainWindow(QMainWindow):
 
         stem = Path(self._video_path).stem
         here = Path(__file__).parent
-        out_json = str(here / f"race_data_{stem}.json")
+        tp = track_of(self._video_path)
+        tp.runs_dir.mkdir(parents=True, exist_ok=True)
+        out_json = str(tp.race_data(stem))
         self._proc_json_path = out_json
         script = str(here / "extract_race.py")
 

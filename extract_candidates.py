@@ -6,13 +6,14 @@ Runs a video through YOLO + tracker + PassDetector + CLIP with no display,
 and saves every detected gate-pass candidate to a JSON file for use in
 learn_ui.py (Phase 2).
 
-Usage:
+Usage (video inside a track folder — outputs go to the track, see dataset_paths.py):
     python extract_candidates.py \
-        --video ~/races/video1.mp4 \
+        --video "<data_root>/track1/memory_videos/video1.mp4" \
         --det-model current_best_non_vocab.pt \
-        --output candidates.json \
-        --crops-dir candidate_crops \
         --clip-device mps
+    → <track>/candidates/video1.candidates.json  +  <track>/candidates/video1.crops/
+
+--output / --crops-dir override the track defaults.
 
 Output JSON schema:
     {
@@ -26,7 +27,7 @@ Output JSON schema:
                 "t": 12.4,
                 "gate_type": "square",
                 "embedding": [<512 floats>],
-                "crop_path": "candidate_crops/candidate_0001_square_12400.jpg",
+                "crop_path": "<track>/candidates/video1.crops/video1_cand0001_square_12.400s.jpg",
                 "bbox": [x1, y1, x2, y2],
                 "reason": "aligned->disappear"
             },
@@ -45,6 +46,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+from dataset_paths import track_of
 from pass_detector import PassDetector, detect_camera_edges
 from collections import deque
 import pipeline_cfg
@@ -164,7 +166,7 @@ def run_extraction(
             emb = clip.embed_bgr(crop)
 
             pass_idx += 1
-            crop_filename = f"candidate_{pass_idx:04d}_{evt_type}_{int(now * 1000)}.jpg"
+            crop_filename = f"{Path(video_path).stem}_cand{pass_idx:04d}_{evt_type}_{now:.3f}s.jpg"
             crop_path = os.path.join(crops_dir, crop_filename)
             cv2.imwrite(crop_path, crop)
 
@@ -209,11 +211,21 @@ def main():
     )
     parser.add_argument("--video",      required=True,              help="Path to input video file")
     parser.add_argument("--det-model",  required=True,              help="Path to YOLO .pt detector")
-    parser.add_argument("--output",      default="candidates.json", help="Output JSON path")
-    parser.add_argument("--crops-dir",   default="candidate_crops", help="Directory to save gate crop images")
+    parser.add_argument("--output",      default=None, help="Output JSON (default: <track>/candidates/<video>.candidates.json)")
+    parser.add_argument("--crops-dir",   default=None, help="Crop folder (default: <track>/candidates/<video>.crops)")
     parser.add_argument("--det-conf",    type=float, default=0.25,  help="YOLO confidence threshold")
     parser.add_argument("--clip-device", default="cpu",             help="Device for CLIP: cpu / mps / cuda")
     args = parser.parse_args()
+
+    tp = track_of(args.video)
+    if tp is None and (args.output is None or args.crops_dir is None):
+        parser.error("video is not inside a track folder — pass --output and --crops-dir")
+    stem = Path(args.video).stem
+    if args.output is None:
+        tp.candidates_dir.mkdir(parents=True, exist_ok=True)
+        args.output = str(tp.candidates_json(stem))
+    if args.crops_dir is None:
+        args.crops_dir = str(tp.candidate_crops(stem))
 
     run_extraction(
         video_path=args.video,

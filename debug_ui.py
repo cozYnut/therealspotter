@@ -1563,9 +1563,8 @@ class MainWindow(QMainWindow):
     # ── Video loading ───────────────────────────────────────────────────────
 
     def _on_open_video(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open Video", "", "Video Files (*.mp4 *.avi *.mov *.mkv *.MP4 *.MOV)"
-        )
+        from dataset_paths import VIDEO_FILTER, data_root
+        path, _ = QFileDialog.getOpenFileName(self, "Open Video", str(data_root()), VIDEO_FILTER)
         if not path:
             return
         self._stop_runner()

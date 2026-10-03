@@ -15,6 +15,90 @@ YT video demonstration: https://www.youtube.com/watch?v=6A2gmpzc6iU
 
 ---
 
+## 🧪 Test dataset collection
+
+**Collecting a scored test dataset comes before changing detection** (built on branch `dataset/real-video-marking`).
+Before we change the pass detector or the gate matching, we need ground truth to measure them against: for real race videos, every real gate pass with its exact time and gate ID. These tools collect and store that data and score the current system against it. They don't change how passes are detected or matched.
+
+What it adds:
+- **One dataset folder outside the repo, one folder per track** (`dataset_paths.py`). Every UI and script reads from and saves to it, so no data files are written into the repo.
+- **REVIEW mode in `learn_ui.py`.** The current system pre-fills every pass on a test video. You confirm or fix each one with the keyboard and add what it missed. The result is saved as `<video>.gt.json`. Review never changes the gate memory.
+- **Every file made from a video starts with the video's name**, so one video's data sorts together.
+
+### Dataset layout
+
+```
+FPVdatasets/                         default: /Users/eyalcozac/Codes and apps/FPVdatasets
+  <track>/                           one folder per track, e.g. track1
+    gate_memory.json                 the track's learned gates (learn_ui, DEFINE/ADD)
+    memory_videos/                   videos the gates are learned from
+    test_videos/                     videos used only for scoring
+    candidates/<video>.candidates.json   + <video>.crops/          (learn_ui extraction)
+    runs/<video>.race_data.json          + <video>.race_query/     (extract_race.py)
+    gt/<video>.gt.json               reviewed ground truth (learn_ui REVIEW)
+    velocidrone/                     the sim version of the same track, same layout
+  training/                          shared YOLO data: gate_annotations/, gate_models/, runs/
+```
+
+The data root is taken from `$FPV_DATA_ROOT`, then `data_root` in a local `local_config.json` next to the code, then the default above. Paths inside the dataset are stored relative to the root, so the folder can be moved. Keep the videos used for learning a track out of `test_videos/`, so the gate-ID scores aren't inflated by videos the memory has already seen.
+
+### How to collect data for a track
+
+1. `python learn_ui.py` → **📁 Open Track** → pick or create `FPVdatasets/<track>`.
+2. **Learn the gates** (if the track has no `gate_memory.json` yet): Open Video → a video from `memory_videos/` → mark gates (L / G, see below) → more memory videos in ADD mode → **S** saves `<track>/gate_memory.json`.
+3. **Review test videos**: **🔍 Review Video** → a video from `test_videos/`. If `runs/<video>.race_data.json` is missing, the current system runs on the video first (progress bar). Then go through every pass:
+
+| Key | Action |
+|---|---|
+| `N` / `Shift+N` | next / previous pass still to review |
+| `0`–`9` | gate ID for the selected pass (`1` `2` quickly → G12); clicking a gate in Gate Order does the same |
+| `Enter` | accept at the playhead and go to the next pass |
+| `↑` / `↓` | move one frame first, to fix the exact pass frame |
+| `X` | not a real pass (false pass) |
+| `A` | add a pass the detector missed, at the playhead |
+| `M` | mark a gate the pilot skipped, at the playhead |
+| `T` | tag: crash/clipped → bad video → unsure → none |
+| `Backspace` | undo the review of the selected pass (deletes added ones) |
+| `S` / `Cmd+S` | save now (also saved after every change) |
+
+A video picked from outside the dataset is copied into the open track first. Reopening a reviewed video continues from its `gt.json`.
+
+**Pass rule:** a clipped gate counts as a pass if the drone went through it. A crash in the gate counts only if the drone flies on.
+
+### What a `<video>.gt.json` holds
+
+For every real pass: time and frame, gate ID and type, lap, tag, and the verdict (`accepted`, `fixed_id`, `added` = detector missed it, `skipped` = pilot missed the gate). It also records whether the time was adjusted, the detector's original prediction (time, gate, CLIP similarity, pass reason, track ID), and the tracker box at the pass frame (`track_at_pass`). Detector passes that weren't real are listed in `false_passes`. Together these give pass-detection recall and precision, timing error and gate-ID accuracy, without rerunning YOLO.
+
+### Scoring — `score.py`
+
+Compares `runs/<video>.race_data.json` with `gt/<video>.gt.json` for every track and prints, per video and per track, with real and Velocidrone tracks totalled separately:
+
+- **Pass detection:** a detector pass within ±0.15 s of a real pass is *on time*. Within ±0.5 s it's *off-time*: it fired for that gate, but at the wrong moment, so it isn't counted as a miss plus a false pass. Also reports recall, precision and timing error.
+- **Gate ID** on every real pass the detector fired for. Videos in `memory_videos/` are left out.
+- **Laps**, **skipped gates** marked, and results **per tag**. Marks tagged *unsure* are left out of all scores.
+
+```bash
+python score.py                       # all tracks, gate IDs as saved in runs/
+python score.py track1 --rematch      # redo gate matching with the current gate_memory.json (no YOLO, seconds)
+python score.py --list                # also list every missed / off-time / false pass and wrong gate, with times
+python score.py --rematch --save baseline   # write <FPVdatasets>/scores/<date>_baseline.json
+```
+
+### Baseline (track1, `score.py --rematch`, 4 test videos + 1 memory video)
+
+| | Current system |
+|---|---|
+| Pass recall | 186 / 213 on time (87%), 196 / 213 including 10 off-time (92%), 17 missed |
+| Pass precision | 196 / 205 detector passes were real (96%) |
+| Pass timing | median 0 ms, 90% within 67 ms |
+| Gate ID | 8 / 173 correct (5%); a gate was given on 17%, and was right on 27% of those |
+| CLIP most-similar gate | right on 64 / 173 (37%), with no gate order and no threshold |
+| Laps | 4 found / 15 marked |
+
+Pass detection is already usable. Telling gates apart by appearance alone is the weak point, so the next steps are the pass detector's misses and off-time passes, and using gate order (`docs/PLAN.md`, Milestone 2).
+
+---
+
 ## Current Gaps
 - Circle gate class not supported (insufficient training data)
 - Model trained on a limited dataset with some auto-annotation errors
@@ -26,11 +110,14 @@ YT video demonstration: https://www.youtube.com/watch?v=6A2gmpzc6iU
 
 ```
 therealspotter/
-├── learn_ui.py              # Phase 2: interactive gate learning UI
+├── dataset_paths.py         # Where every dataset file lives (one folder per track)
+├── score.py                 # Score the current system against reviewed ground truth
+├── learn_ui.py              # Gate learning UI + REVIEW mode (ground-truth marking)
 ├── extract_candidates.py    # Phase 1: headless candidate extraction (for learn_ui)
 ├── race_ui.py               # Race review UI (timeline, lap timing, match candidates)
 ├── extract_race.py          # Headless race analysis (runs inside race_ui)
 ├── debug_ui.py              # Pass detector tuning UI
+├── gate_annotator.py        # YOLO frame annotation + training (data in FPVdatasets/training)
 ├── debug_ui_defaults.json   # Default parameter values for debug_ui / race_ui
 ├── lazy_spotter.py          # Main FPV gate spotter (legacy real-time mode)
 ├── gate_db.py               # Gate memory, ordering, laps, race logic
@@ -68,18 +155,20 @@ Runs YOLO + TimeTracker + PassDetector + CLIP on the video without any display.
 Saves every detected gate-pass candidate (embedding + cropped image) to JSON.
 Run once per video; reuse the JSON as many times as needed in Phase 2.
 
+learn_ui runs this automatically when you open a video. To run it by hand:
+
 ```bash
 python extract_candidates.py \
-  --video ~/races/video1.mp4 \
+  --video "<FPVdatasets>/track1/memory_videos/video1.mp4" \
   --det-model current_best_non_vocab.pt \
-  --output candidates.json \
-  --crops-dir candidate_crops \
   --clip-device mps
 ```
 
-Output:
-- `candidates.json`   — detected pass events with CLIP embeddings + bbox
-- `candidate_crops/`  — gate crop image for each candidate
+Output (in the video's track folder):
+- `candidates/video1.candidates.json` — detected pass events with CLIP embeddings + bbox
+- `candidates/video1.crops/`          — gate crop image for each candidate
+
+`--output` / `--crops-dir` override these. They're required if the video isn't inside a track folder.
 
 **How the crop is taken:**
 The embedding and saved image use the frame **4 frames before the pass fires**, cropped to the gate's bounding box with 50% padding on each side. This captures the gate + surrounding environment at the moment of approach, which is what distinguishes one gate from another visually.
@@ -188,10 +277,12 @@ python race_ui.py
 No command-line arguments. Open everything from inside the UI.
 
 **Workflow:**
-1. `📂 Open Video`        — select race video
-2. `🧠 Open Gate Memory`  — select gate_memory.json
+1. `📁 Open Track`        — pick the track folder; its `gate_memory.json` loads automatically
+2. `📂 Open Video`        — a video from the track; saved results (`runs/<video>.race_data.json`) load if present
 3. Adjust **Sim ≥** and **Margin ≥** spinboxes if needed (see below)
-4. `▶ Run Race Analysis`  — extraction runs in background, results load automatically
+4. `▶ Run Race Analysis`  — extraction runs in background, saves to `runs/` and loads automatically
+
+`🧠 Open Gate Memory` can still load a different memory for experiments.
 5. Scrub the timeline to review gate passes, lap splits, and match candidates
 
 **Toolbar controls:**

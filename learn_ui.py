@@ -3,20 +3,22 @@
 Phase 2 — Interactive Gate Learning UI (multi-video, self-contained).
 
 No command-line arguments needed — open everything from inside the UI.
+All files are read from and written to one track folder in the dataset
+(see dataset_paths.py); nothing is written into the code repo.
 
 When you open a video, candidate extraction runs automatically in the
 background.  Candidates appear on the timeline when extraction finishes.
 
 Workflow:
   1. python learn_ui.py
-  2. Open Video → select video 1
+  2. 📁 Open Track → pick or create <data_root>/<track>
+     (an existing gate_memory.json can be loaded to keep adding to it)
+  3. Open Video → a video from <track>/memory_videos
      (extraction runs automatically, candidates appear on timeline)
-  3. Mark gate passes (G) and lap ends (L) → DEFINE mode
-  4. Open Video → select video 2 → confirm ADD mode
-     (extraction runs, more candidates appear)
-  5. Mark same gates in same order → embeddings added to existing slots
-  6. Repeat for more videos
-  7. S → Save gate_memory.json
+  4. Mark gate passes (G) and lap ends (L) → DEFINE mode
+  5. Open Video → next memory video → confirm ADD mode
+  6. Mark same gates in same order → embeddings added to existing slots
+  7. S → Save <track>/gate_memory.json
 
 Keyboard shortcuts:
   Space            Play / Pause
@@ -27,14 +29,40 @@ Keyboard shortcuts:
   L                Mark lap end  (DEFINE mode only)
   D                Delete last   (DEFINE mode only)
   S                Save gate_memory.json
+
+REVIEW mode (🔍 Review Video) — build a scored test dataset, never touches
+the gate memory.  Pre-fills passes from the current system (race_data.json,
+or runs extract_race.py), you confirm or fix each one, and the result is
+auto-saved as <track>/gt/<video>.gt.json.  Pick videos from
+<track>/test_videos.
+
+  N / Shift+N      Next / previous pending pass
+  0-9              Type gate ID for the selected pass (1 then 2 → G12)
+  Enter            Accept selected pass at the playhead, go to next
+  X                Reject: no real pass here (false pass)
+  A                Add a pass the detector missed, at the playhead
+  M                Mark a gate the pilot skipped, at the playhead
+  T                Cycle tag: crash/clipped → bad video → unsure → none
+  Backspace        Undo review of the selected pass (deletes added ones)
+  S / Ctrl+S       Save now (saves after every change anyway)
+
+A video picked from outside the dataset is copied into the open track first.
 """
 
+import bisect
 import json
 import os
+import shutil
 import sys
+import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
+
+from dataset_paths import (
+    VIDEO_FILTER, TrackPaths, data_root as _data_root, rel as _rel, abs_path as _abs, track_of,
+)
 
 import cv2
 import numpy as np
@@ -72,6 +100,18 @@ _BG_COLOR       = QColor( 24,  24,  24)
 _TRACK_COLOR    = QColor( 55,  55,  55)
 _FILL_COLOR     = QColor( 80,  80,  80)
 _POINTER_COLOR  = QColor( 60, 220, 120)
+
+
+_REVIEW_COLORS = {
+    "pending":  QColor(150, 150, 150),
+    "accepted": QColor( 60, 220, 120),
+    "fixed_id": QColor(255, 160,  40),
+    "added":    QColor( 80, 160, 255),
+    "skipped":  QColor(180, 100, 255),
+    "rejected": QColor(230,  60,  60),
+}
+_REVIEW_TAGS = [None, "crash_clipped", "bad_video", "unsure"]
+_TAG_LABELS = {None: "", "crash_clipped": "crash/clipped", "bad_video": "bad video", "unsure": "unsure"}
 
 
 def _gate_color(gate_type: str) -> QColor:
@@ -150,12 +190,28 @@ class SessionMarker:
     is_extra_lap: bool = False  # G marker added during lap 2+ (adds to existing slot)
 
 
+@dataclass
+class ReviewMark:
+    """One ground-truth mark in REVIEW mode (persisted to <video>.gt.json)."""
+    t: float
+    gate_id: int                      # -1 = not set yet
+    kind: str = "pass"                # "pass" | "skipped" (pilot missed this gate)
+    origin: str = "prefill"           # "prefill" (detector pass) | "added" (detector missed it)
+    state: str = "pending"            # pending | accepted | fixed_id | added | skipped | rejected
+    tag: Optional[str] = None
+    time_adjusted: bool = False
+    lap: int = 0
+    pred: Optional[dict] = None       # the detector's pass, for prefill marks
+    track_at_pass: Optional[dict] = None
+
+
 # ──────────────────────────────────────────────────────────────
 # Timeline widget
 # ──────────────────────────────────────────────────────────────
 
 class TimelineWidget(QWidget):
     seeked = pyqtSignal(float)
+    mark_clicked = pyqtSignal(object)   # ReviewMark
 
     _CAND_H = 12
     _GATE_H = 18
@@ -173,6 +229,13 @@ class TimelineWidget(QWidget):
         self._candidates: List[Candidate] = []
         self._session_markers: List[SessionMarker] = []
         self._hover_t: Optional[float] = None
+        self._review_marks: List[ReviewMark] = []
+        self._review_sel: Optional[ReviewMark] = None
+
+    def set_review_marks(self, marks: List[ReviewMark], sel: Optional[ReviewMark]):
+        self._review_marks = marks
+        self._review_sel = sel
+        self.update()
 
     def set_duration(self, d: float):
         self._duration = float(d)
@@ -258,6 +321,29 @@ class TimelineWidget(QWidget):
                     p.setPen(QColor(255, 255, 255))
                     p.drawText(mx - 8, mid + self._GATE_H + 13, f"G{m.slot_idx + 1}")
 
+        # Review marks (REVIEW mode)
+        for m in self._review_marks:
+            mx = self._t_to_x(m.t)
+            col = _REVIEW_COLORS.get(m.state, _REVIEW_COLORS["pending"])
+            if m.state != "rejected" and m.state != "pending" and m.gate_id == 1:
+                p.setPen(QPen(_LAP_COLOR, 2))
+                p.drawLine(mx, mid - self._LAP_H, mx, mid + self._LAP_H)
+                p.setFont(QFont("Arial", 7))
+                p.drawText(mx - 8, mid - self._LAP_H - 4, f"L{m.lap}")
+            p.setPen(QPen(col, 2))
+            if m.state == "rejected":
+                p.drawLine(mx - 4, mid - 4, mx + 4, mid + 4)
+                p.drawLine(mx - 4, mid + 4, mx + 4, mid - 4)
+            else:
+                p.drawLine(mx, mid - self._GATE_H, mx, mid + self._GATE_H)
+                p.setFont(QFont("Arial", 7))
+                label = f"G{m.gate_id}" if m.gate_id >= 1 else "G?"
+                p.drawText(mx - 8, mid + self._GATE_H + 13, label)
+            if m is self._review_sel:
+                p.setPen(QPen(QColor(255, 255, 255), 1))
+                p.setBrush(QBrush())
+                p.drawRect(mx - 6, mid - self._GATE_H - 4, 12, 2 * self._GATE_H + 8)
+
         # Playhead
         ph = self._t_to_x(self._current_t)
         p.setPen(QPen(_PLAYHEAD_COLOR, 2))
@@ -274,7 +360,12 @@ class TimelineWidget(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self.seeked.emit(self._x_to_t(event.pos().x()))
+            x = event.pos().x()
+            near = [m for m in self._review_marks if abs(self._t_to_x(m.t) - x) <= 5]
+            if near:
+                self.mark_clicked.emit(min(near, key=lambda m: abs(self._t_to_x(m.t) - x)))
+                return
+            self.seeked.emit(self._x_to_t(x))
 
     def mouseMoveEvent(self, event):
         self._hover_t = self._x_to_t(event.pos().x())
@@ -558,6 +649,9 @@ class MainWindow(QMainWindow):
         self._det_model_path: Optional[str] = self._find_model_auto()
         self._clip_device: str = _auto_clip_device()
 
+        # ── Track folder: every file is read from / written to it ─
+        self._track: Optional[TrackPaths] = None
+
         # ── Per-video session ─────────────────────────────────
         self._candidates: List[Candidate] = []
         self._used_idxs: set = set()
@@ -572,6 +666,22 @@ class MainWindow(QMainWindow):
         # ── Background extraction (QProcess) ─────────────────
         self._proc: Optional[QProcess] = None
         self._proc_json_path: str = ""
+        self._proc_kind: str = "candidates"     # "candidates" | "race"
+
+        # ── REVIEW mode (ground-truth marking; gate memory is read-only) ─
+        self._mode_before_review: str = "define"
+        self._review_marks: List[ReviewMark] = []
+        self._review_sel: Optional[ReviewMark] = None
+        self._digit_buf: str = ""
+        self._digit_t: float = 0.0
+        self._mem_gates: List[dict] = []
+        self._mem_path: str = ""
+        self._gt_path: str = ""
+        self._race_path: str = ""
+        self._race_data: Optional[dict] = None
+        self._race_ts: List[float] = []
+        self._review_fps: float = 30.0
+        self._review_det_model: Optional[str] = None
 
         # ── Force Clip CLIP embedder (lazy-loaded on first use) ─
         self._clip_embedder = None
@@ -605,9 +715,23 @@ class MainWindow(QMainWindow):
         tb.setMovable(False)
         self.addToolBar(tb)
 
+        track_act = QAction("📁 Open Track", self)
+        track_act.setToolTip("Pick or create a track folder — all files for this track are saved there")
+        track_act.triggered.connect(self._on_open_track)
+        tb.addAction(track_act)
+        self._track_label = QLabel("  no track  ")
+        self._track_label.setStyleSheet("color:#ffa028; font-weight:bold; font-size:12px;")
+        tb.addWidget(self._track_label)
+        tb.addSeparator()
+
         open_act = QAction("📂 Open Video", self)
         open_act.triggered.connect(self._on_open_video)
         tb.addAction(open_act)
+
+        review_act = QAction("🔍 Review Video", self)
+        review_act.setToolTip("Review the current system's passes on a test video and save <video>.gt.json")
+        review_act.triggered.connect(self._on_review_video)
+        tb.addAction(review_act)
 
         model_act = QAction("🔧 Set Model", self)
         model_act.triggered.connect(self._on_set_model)
@@ -615,9 +739,9 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
-        save_act = QAction("💾 Save Memory  [S]", self)
-        save_act.triggered.connect(self._on_save)
-        tb.addAction(save_act)
+        self._save_act = QAction("💾 Save Memory  [S]", self)
+        self._save_act.triggered.connect(self._on_save)
+        tb.addAction(self._save_act)
 
         tb.addSeparator()
         tb.addWidget(QLabel("  Match ±"))
@@ -659,6 +783,7 @@ class MainWindow(QMainWindow):
 
         self._timeline = TimelineWidget()
         self._timeline.seeked.connect(self._on_seek)
+        self._timeline.mark_clicked.connect(self._review_select)
         lv.addWidget(self._timeline)
 
         lv.addWidget(self._build_legend())
@@ -699,7 +824,21 @@ class MainWindow(QMainWindow):
             "QListWidget::item:selected{background:#2a5a8a;}"
         )
         self._gate_list.currentRowChanged.connect(self._on_slot_selected)
+        self._gate_list.itemClicked.connect(self._on_gate_item_clicked)
         rv.addWidget(self._gate_list, stretch=1)
+
+        # REVIEW mode: list of all marks (hidden otherwise)
+        self._marks_header = self._lbl("Marks", bold=True, size=13)
+        rv.addWidget(self._marks_header)
+        self._marks_list = QListWidget()
+        self._marks_list.setStyleSheet(
+            "QListWidget{background:#222;border:1px solid #444;font-family:Menlo,monospace;font-size:10px;}"
+            "QListWidget::item:selected{background:#2a5a8a;}"
+        )
+        self._marks_list.itemClicked.connect(self._on_mark_item_clicked)
+        rv.addWidget(self._marks_list, stretch=2)
+        self._marks_header.setVisible(False)
+        self._marks_list.setVisible(False)
 
         self._stats_label = QLabel("Gates: 0   Videos: 0")
         self._stats_label.setStyleSheet("color:#777; font-size:10px;")
@@ -718,12 +857,43 @@ class MainWindow(QMainWindow):
         sep.setStyleSheet("color:#444;")
         rv.addWidget(sep)
 
-        rv.addWidget(self._lbl("Matched crop:"))
+        self._crop_title = self._lbl("Matched crop:")
+        rv.addWidget(self._crop_title)
         self._crop_label = QLabel()
         self._crop_label.setFixedSize(270, 185)
         self._crop_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._crop_label.setStyleSheet("background:#111; border:1px solid #333;")
         rv.addWidget(self._crop_label)
+
+        # REVIEW mode: detector crop vs memory crop of the chosen gate
+        self._review_crops = QWidget()
+        rc = QHBoxLayout(self._review_crops)
+        rc.setContentsMargins(0, 0, 0, 0)
+        rc.setSpacing(4)
+        self._query_crop = QLabel()
+        self._mem_crop = QLabel()
+        self._query_caption = self._lbl("Detector")
+        self._mem_caption = self._lbl("Memory")
+        for img, cap in ((self._query_crop, self._query_caption), (self._mem_crop, self._mem_caption)):
+            col = QVBoxLayout()
+            col.setSpacing(1)
+            img.setFixedSize(136, 100)
+            img.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            img.setStyleSheet("background:#111; border:1px solid #333; color:#555;")
+            col.addWidget(img)
+            col.addWidget(cap)
+            rc.addLayout(col)
+        rv.addWidget(self._review_crops)
+        self._review_crops.setVisible(False)
+
+        self._review_help = QLabel(
+            "N/⇧N next/prev pending   0-9 gate ID   Enter accept\n"
+            "X false pass   A add missed pass   M pilot skipped gate\n"
+            "T tag   ⌫ undo   ↑/↓ nudge 1 frame before Enter"
+        )
+        self._review_help.setStyleSheet("color:#888; font-size:9px;")
+        rv.addWidget(self._review_help)
+        self._review_help.setVisible(False)
 
         self._match_info = QLabel("")
         self._match_info.setStyleSheet("color:#777; font-size:9px;")
@@ -825,6 +995,12 @@ class MainWindow(QMainWindow):
         self._cancel_btn.setVisible(False)
         row.addWidget(self._cancel_btn)
 
+        # Buttons that change the gate memory — disabled in REVIEW mode
+        self._learn_btns = list(self._gate_type_btns.values()) + [
+            self._mark_lap_btn, self._delete_btn, self._skip_btn, self._force_btn,
+        ]
+        self._learn_btn_styles = {id(b): b.styleSheet() for b in self._learn_btns}
+
         return row
 
     def _build_seek_row(self) -> QHBoxLayout:
@@ -849,10 +1025,17 @@ class MainWindow(QMainWindow):
         pairs = [
             ("Space",        self._on_play_pause),
             ("G",            self._on_mark_gate),           # auto-detect type
-            ("1",            lambda: self._on_mark_gate(gate_type="square")),
-            ("2",            lambda: self._on_mark_gate(gate_type="arch")),
-            ("3",            lambda: self._on_mark_gate(gate_type="circle")),
-            ("4",            lambda: self._on_mark_gate(gate_type="flagpole")),
+            *[(str(d), lambda d=d: self._on_digit(d)) for d in range(10)],  # gate type / gate ID
+            ("Return",       self._review_accept),
+            ("Enter",        self._review_accept),
+            ("N",            lambda: self._review_step(+1)),
+            ("Shift+N",      lambda: self._review_step(-1)),
+            ("X",            self._review_reject),
+            ("A",            lambda: self._review_add("pass")),
+            ("M",            lambda: self._review_add("skipped")),
+            ("T",            self._review_cycle_tag),
+            ("Backspace",    self._review_undo),
+            ("Ctrl+S",       self._on_save),
             ("L",            self._on_mark_start_finish),
             ("D",            self._on_delete_last),
             ("K",            self._on_skip),
@@ -868,6 +1051,12 @@ class MainWindow(QMainWindow):
         for key, fn in pairs:
             QShortcut(QKeySequence(key), self).activated.connect(fn)
 
+    def _on_digit(self, d: int):
+        if self._mode == "review":
+            self._review_digit(d)
+        elif 1 <= d <= 4:
+            self._on_mark_gate(gate_type=("square", "arch", "circle", "flagpole")[d - 1])
+
     # ── Model management ──────────────────────────────────────
 
     def _on_set_model(self):
@@ -881,11 +1070,130 @@ class MainWindow(QMainWindow):
     # ── File loading + auto extraction ────────────────────────
 
     def _on_open_video(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open Video", "", "Video Files (*.mp4 *.avi *.mov *.mkv *.MP4 *.MOV)"
-        )
+        start = self._track.memory_videos if self._track else _data_root()
+        path, _ = QFileDialog.getOpenFileName(self, "Open Video (memory video)", str(start), VIDEO_FILTER)
+        if not path:
+            return
+        path = self._place_video(path, "memory_videos")
         if path:
             self._load_video(path)
+
+    # ── Track folder ──────────────────────────────────────────
+
+    def _on_open_track(self):
+        root = _data_root()
+        root.mkdir(parents=True, exist_ok=True)
+        start = self._track.dir if self._track else root
+        d = QFileDialog.getExistingDirectory(
+            self, "Open or create a track folder (inside the dataset folder)", str(start)
+        )
+        if not d:
+            return
+        tp = track_of(d)
+        if tp is None:
+            QMessageBox.warning(
+                self, "Not a track folder",
+                f"Pick (or create) a folder for the track inside:\n{root}\n\n"
+                "e.g. " + str(root / "track1"),
+            )
+            return
+        self._set_track(tp, offer_load=self._mode != "review")
+
+    def _set_track(self, tp: TrackPaths, offer_load: bool = True) -> bool:
+        """Make tp the open track. Returns False if the user cancelled."""
+        if self._track and tp.dir == self._track.dir:
+            return True
+        if self._gate_slots:
+            ans = QMessageBox.question(
+                self, "Switch track?",
+                f"{len(self._gate_slots)} gate(s) are learned for track "
+                f"'{self._track.name if self._track else '?'}' and not tied to '{tp.name}'.\n\n"
+                "Switching clears them (save first with S if needed). Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if ans == QMessageBox.StandardButton.No:
+                return False
+            self._reset_learning()
+        self._track = tp.ensure()
+        self._track_label.setText(f"  track: {tp.name}  ")
+        self._track_label.setStyleSheet("color:#60dc78; font-weight:bold; font-size:12px;")
+        self._status.showMessage(f"Track: {tp.dir}")
+        if offer_load and not self._gate_slots and tp.gate_memory.exists():
+            self._offer_load_memory(tp)
+        self._update_mode_ui()
+        return True
+
+    def _reset_learning(self):
+        self._gate_slots.clear()
+        self._session_markers.clear()
+        self._used_idxs.clear()
+        self._slot_pointer = 0
+        self._define_second_lap = False
+        self._define_lap_num = 1
+        self._video_count = 0
+        if self._mode != "review":
+            self._mode = "define"
+        else:
+            self._mode_before_review = "define"
+        for b in (self._mark_lap_btn, self._delete_btn):
+            b.setEnabled(self._mode != "review")
+            b.setStyleSheet(self._learn_btn_styles[id(b)] if self._mode != "review" else "background:#333; color:#555;")
+        self._timeline.set_session_markers([])
+
+    def _offer_load_memory(self, tp: TrackPaths):
+        try:
+            with open(tp.gate_memory, encoding="utf-8") as f:
+                mem = json.load(f).get("memory", []) or []
+        except Exception as e:
+            self._status.showMessage(f"Could not read {tp.gate_memory}: {e}")
+            return
+        if not mem:
+            return
+        ans = QMessageBox.question(
+            self, "Load gate memory?",
+            f"Track '{tp.name}' already has a gate memory with {len(mem)} gates.\n\n"
+            "Load it to keep adding embeddings from more videos (ADD mode)?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if ans == QMessageBox.StandardButton.No:
+            return
+        for i, g in enumerate(sorted(mem, key=lambda g: int(g.get("order_idx", 0)))):
+            self._gate_slots.append(GateSlot(
+                slot_idx=i,
+                gate_type=str(g.get("gate_type", "unknown")),
+                embeddings=list(g.get("embeds", []) or []),
+                crop_paths=list(g.get("embed_imgs", []) or []),
+            ))
+        self._status.showMessage(f"Loaded {len(mem)} gates from {tp.gate_memory} — open a video to add to them")
+
+    def _place_video(self, path: str, sub: str) -> Optional[str]:
+        """Make sure the video lives in a track folder (and that track is open).
+        A video from outside the dataset is copied into <track>/<sub>/."""
+        tp = track_of(path)
+        if tp is not None:
+            return path if self._set_track(tp, offer_load=sub == "memory_videos") else None
+        if self._track is None:
+            QMessageBox.information(
+                self, "Pick a track",
+                "This video is not in the dataset yet.\nPick or create the track folder it belongs to.",
+            )
+            self._on_open_track()
+            if self._track is None:
+                return None
+        dest = self._track.dir / sub / Path(path).name
+        if not dest.exists():
+            ans = QMessageBox.question(
+                self, "Copy video into the track?",
+                f"Copy\n{Path(path).name}\ninto\n{dest.parent}\n\nso all of this track's data is in one place?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if ans == QMessageBox.StandardButton.No:
+                return None
+            self._status.showMessage(f"Copying {Path(path).name}…")
+            QApplication.processEvents()
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, dest)
+        return str(dest)
 
     def _load_video(self, path: str):
         # If slots already defined, confirm ADD mode
@@ -902,7 +1210,11 @@ class MainWindow(QMainWindow):
             )
             if ans == QMessageBox.StandardButton.No:
                 return
+            if self._mode == "review":
+                self._exit_review_mode()
             self._enter_add_mode()
+        elif self._mode == "review":
+            self._exit_review_mode()
 
         if not self._video.load(path):
             QMessageBox.critical(self, "Error", f"Cannot open video:\n{path}")
@@ -935,9 +1247,12 @@ class MainWindow(QMainWindow):
 
         stem = Path(video_path).stem
         here = Path(__file__).parent
-        out_json  = str(here / f"candidates_{stem}.json")
-        crops_dir = str(here / f"candidate_crops_{stem}")
+        tp = track_of(video_path) or self._track
+        tp.candidates_dir.mkdir(parents=True, exist_ok=True)
+        out_json  = str(tp.candidates_json(stem))
+        crops_dir = str(tp.candidate_crops(stem))
         self._proc_json_path = out_json
+        self._proc_kind = "candidates"
 
         script = str(here / "extract_candidates.py")
 
@@ -975,9 +1290,10 @@ class MainWindow(QMainWindow):
                     pct_str = line.split("%")[0].split()[-1]
                     pct = int(float(pct_str))
                     self._progress_bar.setValue(pct)
-                    cand_part = [p for p in line.split() if p.startswith("candidates=")]
+                    what = "passes" if self._proc_kind == "race" else "candidates"
+                    cand_part = [p for p in line.split() if p.startswith(f"{what}=")]
                     n = int(cand_part[0].split("=")[1]) if cand_part else 0
-                    self._status.showMessage(f"Extracting…  {pct}%   ({n} candidates so far)")
+                    self._status.showMessage(f"Extracting…  {pct}%   ({n} {what} so far)")
                 except Exception:
                     pass
             elif line.startswith("Done."):
@@ -993,6 +1309,13 @@ class MainWindow(QMainWindow):
 
         if not self._proc_json_path or not Path(self._proc_json_path).exists():
             self._status.showMessage("Extraction finished but no output JSON found.")
+            return
+
+        if self._proc_kind == "race":
+            # Ignore a run for a video we have since left
+            if self._mode == "review" and self._proc_json_path == self._race_path:
+                self._load_race_data(self._race_path)
+                self._prefill_from_race_data()
             return
 
         self._load_candidates_json(self._proc_json_path)
@@ -1041,6 +1364,22 @@ class MainWindow(QMainWindow):
         self._delete_btn.setStyleSheet("background:#333; color:#555;")
 
     def _update_mode_ui(self):
+        if self._mode == "review":
+            live = [m for m in self._review_marks if m.state != "rejected"]
+            done = sum(1 for m in self._review_marks if m.state != "pending")
+            laps = max((m.lap for m in live), default=0)
+            text = (
+                f"  MODE: REVIEW  {done}/{len(self._review_marks)} reviewed  "
+                f"Lap {laps}"
+            )
+            if self._digit_buf:
+                text += f"   → G{self._digit_buf}"
+            self._mode_badge.setText(text)
+            self._mode_badge.setStyleSheet("font-weight:bold; color:#ff80c8; font-size:12px;")
+            self._refresh_gate_list()
+            self._refresh_marks_list()
+            self._timeline.set_review_marks(self._review_marks, self._review_sel)
+            return
         if self._mode == "define":
             if not self._define_second_lap:
                 self._mode_badge.setText("  MODE: DEFINE")
@@ -1086,6 +1425,8 @@ class MainWindow(QMainWindow):
     # ── Marking ───────────────────────────────────────────────
 
     def _on_mark_gate(self, gate_type: Optional[str] = None):
+        if self._mode == "review":
+            return
         t = self._video.current_t
         matched = self._find_candidates(t, gate_type=gate_type)
 
@@ -1276,6 +1617,8 @@ class MainWindow(QMainWindow):
     def _on_skip(self):
         """Advance the slot pointer by one without assigning any clip.
         In first-lap DEFINE mode, creates an empty placeholder slot instead."""
+        if self._mode == "review":
+            return
         t = self._video.current_t
 
         if self._mode == "define" and not self._define_second_lap:
@@ -1305,6 +1648,8 @@ class MainWindow(QMainWindow):
     def _on_force_clip(self):
         """Embed the current displayed frame directly and assign it to the next slot.
         Uses gate bbox+padding from the nearest visible candidate; falls back to full frame."""
+        if self._mode == "review":
+            return
         frame = self._video._last_frame
         if frame is None:
             self._status.showMessage("No frame loaded.")
@@ -1330,9 +1675,13 @@ class MainWindow(QMainWindow):
 
         # Save crop image alongside other candidates
         stem = Path(self._current_video_path).stem if self._current_video_path else "force"
-        crops_dir = Path(__file__).parent / f"candidate_crops_{stem}"
+        tp = (track_of(self._current_video_path) if self._current_video_path else None) or self._track
+        if tp is None:
+            self._status.showMessage("Open a track first.")
+            return
+        crops_dir = tp.candidate_crops(stem)
         crops_dir.mkdir(parents=True, exist_ok=True)
-        crop_path = str(crops_dir / f"force_{int(t * 1000)}.jpg")
+        crop_path = str(crops_dir / f"{stem}_force_{t:.3f}s.jpg")
         cv2.imwrite(crop_path, crop)
 
         if self._mode == "define" and not self._define_second_lap:
@@ -1390,6 +1739,8 @@ class MainWindow(QMainWindow):
         return self._clip_embedder
 
     def _on_manage_clips(self):
+        if self._mode == "review":
+            return
         if not self._gate_slots:
             self._status.showMessage("No gates defined yet.")
             return
@@ -1421,6 +1772,20 @@ class MainWindow(QMainWindow):
 
     def _refresh_gate_list(self):
         self._gate_list.clear()
+        if self._mode == "review":
+            sel_gid = self._review_sel.gate_id if self._review_sel else None
+            for i, g in enumerate(self._mem_gates):
+                gid = i + 1
+                is_sel = gid == sel_gid
+                item = QListWidgetItem(f"{'▶ ' if is_sel else '   '}G{gid}  {g.get('gate_type', '?')}")
+                item.setForeground(_POINTER_COLOR if is_sel else _gate_color(g.get("gate_type", "")))
+                self._gate_list.addItem(item)
+            track = self._track.name if self._track else "?"
+            self._stats_label.setText(
+                f"Track: {track}   Gates: {len(self._mem_gates)}   "
+                f"False passes: {sum(1 for m in self._review_marks if m.state == 'rejected')}"
+            )
+            return
         show_ptr = self._mode == "add" or (self._mode == "define" and self._define_second_lap)
         for slot in self._gate_slots:
             is_next = (
@@ -1445,6 +1810,8 @@ class MainWindow(QMainWindow):
         )
 
     def _on_slot_selected(self, row: int):
+        if self._mode == "review":
+            return   # clicks are handled by _on_gate_item_clicked
         if row < 0 or row >= len(self._gate_slots):
             return
         slot = self._gate_slots[row]
@@ -1471,9 +1838,546 @@ class MainWindow(QMainWindow):
         else:
             self._crop_label.setText("Crop not found")
 
+    # ── REVIEW mode: open / leave ─────────────────────────────
+
+    def _on_review_video(self):
+        start = self._track.test_videos if self._track else _data_root()
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Review video — pick a test video", str(start), VIDEO_FILTER,
+        )
+        if not path:
+            return
+        path = self._place_video(path, "test_videos")
+        if not path:
+            return
+        tp = track_of(path)
+
+        mem_path = tp.gate_memory
+        if not mem_path.exists():
+            QMessageBox.warning(
+                self, "No gate memory",
+                f"Track '{tp.name}' has no gate_memory.json yet:\n{mem_path}\n\n"
+                "Learn the gates first (Open Video → mark gates → S saves it here).",
+            )
+            return
+        try:
+            with open(mem_path, encoding="utf-8") as f:
+                mem = json.load(f).get("memory", []) or []
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Cannot read gate memory:\n{mem_path}\n\n{e}")
+            return
+        if not mem:
+            QMessageBox.warning(self, "Empty gate memory", f"No gates in:\n{mem_path}")
+            return
+
+        if not self._video.load(path):
+            QMessageBox.critical(self, "Error", f"Cannot open video:\n{path}")
+            return
+
+        self._enter_review_mode()
+        self._current_video_path = path
+        self._mem_path = str(mem_path)
+        self._mem_gates = sorted(mem, key=lambda g: int(g.get("order_idx", 0)))
+        stem = Path(path).stem
+        self._gt_path = str(tp.gt(stem))
+        self._race_path = str(tp.race_data(stem))
+        self._race_data = None
+        self._race_ts = []
+        self._review_det_model = None
+        self._review_fps = self._video.fps
+        self._review_marks = []
+        self._review_sel = None
+        self._candidates = []
+        self._timeline.set_duration(self._video.duration)
+        self._timeline.set_candidates([])
+        self._timeline.set_session_markers([])
+        self.setWindowTitle(f"FPV Gate Learning UI  —  REVIEW  —  {tp.name} / {Path(path).name}")
+        self._video_status.setText(f"Review: {tp.name} / {Path(path).name}")
+
+        if Path(self._race_path).exists():
+            self._load_race_data(self._race_path)
+        if Path(self._gt_path).exists():
+            self._load_gt()
+            self._review_changed(save=False)
+            self._review_step(+1)
+        elif self._race_data is not None:
+            self._prefill_from_race_data()
+        else:
+            self._start_race_extraction()
+        self._update_mode_ui()
+
+    def _enter_review_mode(self):
+        if self._mode != "review":
+            self._mode_before_review = self._mode
+        self._mode = "review"
+        self._digit_buf = ""
+        for b in self._learn_btns:
+            b.setEnabled(False)
+            b.setStyleSheet("background:#333; color:#555;")
+        self._save_act.setEnabled(False)
+        self._manage_clips_btn.setEnabled(False)
+        for w in (self._marks_header, self._marks_list, self._review_crops, self._review_help):
+            w.setVisible(True)
+        for w in (self._crop_title, self._crop_label, self._match_info):
+            w.setVisible(False)
+
+    def _exit_review_mode(self):
+        self._mode = self._mode_before_review
+        for b in self._learn_btns:
+            b.setEnabled(True)
+            b.setStyleSheet(self._learn_btn_styles[id(b)])
+        self._save_act.setEnabled(True)
+        self._manage_clips_btn.setEnabled(True)
+        for w in (self._marks_header, self._marks_list, self._review_crops, self._review_help):
+            w.setVisible(False)
+        for w in (self._crop_title, self._crop_label, self._match_info):
+            w.setVisible(True)
+        self._review_marks = []
+        self._review_sel = None
+        self._digit_buf = ""
+        self._timeline.set_review_marks([], None)
+
+    # ── REVIEW mode: pre-fill from the current system ─────────
+
+    def _start_race_extraction(self):
+        if not self._ensure_model():
+            self._status.showMessage("No detector model — use A to add passes by hand, or Set Model and reopen.")
+            return
+        if self._proc and self._proc.state() != QProcess.ProcessState.NotRunning:
+            self._proc.kill()
+
+        Path(self._race_path).parent.mkdir(parents=True, exist_ok=True)
+        self._proc_json_path = self._race_path
+        self._proc_kind = "race"
+        self._review_det_model = Path(self._det_model_path).name
+
+        self._proc = QProcess(self)
+        self._proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self._proc.readyReadStandardOutput.connect(self._on_extract_output)
+        self._proc.finished.connect(self._on_extract_finished)
+        self._proc.start(sys.executable, [
+            str(Path(__file__).parent / "extract_race.py"),
+            "--video",       self._current_video_path,
+            "--det-model",   self._det_model_path,
+            "--gate-memory", self._mem_path,
+            "--output",      self._race_path,
+            "--clip-device", self._clip_device,
+        ])
+
+        self._progress_bar.setValue(0)
+        self._progress_bar.setVisible(True)
+        self._cancel_btn.setVisible(True)
+        self._status.showMessage("Running the current system on this video…  0%")
+
+    def _load_race_data(self, path: str):
+        try:
+            with open(path, encoding="utf-8") as f:
+                self._race_data = json.load(f)
+        except Exception as e:
+            self._race_data = None
+            self._status.showMessage(f"Could not load race data: {e}")
+            return
+        self._race_ts = [float(fr.get("t", 0.0)) for fr in self._race_data.get("frames", [])]
+        self._review_fps = float(self._race_data.get("fps") or self._video.fps)
+
+    def _prefill_from_race_data(self):
+        """Every detector pass becomes a pending mark (hand-added marks are kept)."""
+        if not self._race_data:
+            return
+        n = max(1, len(self._mem_gates))
+        marks = [m for m in self._review_marks if m.origin == "added"]
+        prev_gid = 0
+        for i, p in enumerate(self._race_data.get("passes", [])):
+            pred = {
+                "idx":       i,
+                "t":         round(float(p.get("t", 0.0)), 4),
+                "gate_id":   int(p.get("gate_id", -1)),
+                "gate_type": p.get("gate_type"),
+                "source":    p.get("source"),
+                "sim":       p.get("sim"),
+                "reason":    p.get("reason"),
+                "track_id":  p.get("track_id"),
+                "query_img": _rel(p.get("query_img", "")),
+            }
+            gid = pred["gate_id"] if pred["gate_id"] >= 1 else (prev_gid % n + 1 if prev_gid else 1)
+            if pred["source"] != "DUP":
+                prev_gid = gid
+            marks.append(ReviewMark(
+                t=pred["t"], gate_id=gid, pred=pred,
+                track_at_pass=self._track_at(pred["t"], pred["track_id"]),
+            ))
+        self._review_marks = marks
+        self._review_sel = None
+        self._review_changed()
+        self._status.showMessage(
+            f"Pre-filled {len(marks)} passes — N jumps to the first one, Enter accepts."
+        )
+        self._review_step(+1)
+
+    def _track_at(self, t: float, track_id: Optional[int]) -> Optional[dict]:
+        """Tracker state at the pass: the pass's track (or the biggest box) at the
+        nearest saved frame, looking up to 15 frames back if it already vanished."""
+        frames = (self._race_data or {}).get("frames", [])
+        if not frames:
+            return None
+        i = bisect.bisect_left(self._race_ts, t)
+        if i >= len(frames) or (i > 0 and abs(self._race_ts[i - 1] - t) <= abs(self._race_ts[i] - t)):
+            i -= 1
+        for off in range(16):
+            j = i - off
+            if j < 0:
+                break
+            tracks = frames[j].get("tracks", []) or []
+            if track_id is not None:
+                match = [tr for tr in tracks if tr.get("track_id") == track_id]
+            else:
+                def area(tr):
+                    x1, y1, x2, y2 = tr.get("bbox", [0, 0, 0, 0])
+                    return (x2 - x1) * (y2 - y1)
+                match = sorted(tracks, key=area, reverse=True)
+            if match:
+                return dict(match[0], frame_offset=-off)
+        return None
+
+    # ── REVIEW mode: actions ──────────────────────────────────
+
+    def _suggest_gate(self, t: float, exclude: Optional[ReviewMark] = None) -> int:
+        """Next gate in order after the last non-rejected mark before t."""
+        n = max(1, len(self._mem_gates))
+        prev = [m for m in self._review_marks
+                if m is not exclude and m.t < t and m.state != "rejected" and m.gate_id >= 1]
+        return prev[-1].gate_id % n + 1 if prev else 1
+
+    def _review_select(self, m: Optional[ReviewMark]):
+        if self._mode != "review" or m is None:
+            return
+        self._review_sel = m
+        self._digit_buf = ""
+        self._on_seek(m.t)
+        self._show_review_crops(m)
+        if m.pred:
+            p = m.pred
+            sim = f"{p['sim']:.2f}" if isinstance(p.get("sim"), (int, float)) else "-"
+            det = f"G{p['gate_id']}" if p.get("gate_id", -1) >= 1 else "no match"
+            self._status.showMessage(
+                f"{m.t:.2f}s — detector: {det}  {p.get('source')}  sim {sim}  ({p.get('reason')})"
+            )
+        else:
+            self._status.showMessage(f"{m.t:.2f}s — added by you ({m.kind})")
+        self._update_mode_ui()
+
+    def _review_step(self, direction: int):
+        if self._mode != "review":
+            return
+        marks = self._review_marks
+        pending = [m for m in marks if m.state == "pending"]
+        if not pending:
+            if marks:
+                self._status.showMessage(
+                    f"All {len(marks)} marks reviewed ✓ — saved as complete: {self._gt_path}"
+                )
+            return
+        if self._review_sel in marks:
+            k = marks.index(self._review_sel)
+            order = marks[k + 1:] + marks[:k] if direction > 0 else marks[:k][::-1] + marks[k + 1:][::-1]
+        else:
+            now = self._video.current_t
+            order = [m for m in marks if m.t >= now - 0.01] + [m for m in marks if m.t < now - 0.01]
+            if direction < 0:
+                order = order[::-1]
+        nxt = next((m for m in order if m.state == "pending"), None)
+        self._review_select(nxt)
+
+    def _review_digit(self, d: int):
+        if self._review_sel is None:
+            self._status.showMessage("Select a pass first (N, or click it).")
+            return
+        now = time.monotonic()
+        buf = self._digit_buf + str(d) if self._digit_buf and now - self._digit_t < 0.8 else str(d)
+        self._digit_t = now
+        n = len(self._mem_gates)
+        if not 1 <= int(buf) <= n:
+            buf = str(d)                       # too big → start a new number
+        if not 1 <= int(buf) <= n:
+            self._status.showMessage(f"No gate G{buf} — this track has G1…G{n}.")
+            self._digit_buf = ""
+            self._update_mode_ui()
+            return
+        self._digit_buf = buf
+        self._set_sel_gate(int(buf))
+
+    def _set_sel_gate(self, gid: int):
+        m = self._review_sel
+        if m is None:
+            return
+        m.gate_id = gid
+        if m.state != "pending":
+            m.state = "pending"                # changed ID needs Enter again
+        self._review_changed()
+
+    def _review_accept(self):
+        if self._mode != "review":
+            return
+        m = self._review_sel
+        if m is None:
+            self._review_step(+1)
+            return
+        if m.gate_id < 1:
+            self._status.showMessage("Type a gate ID first.")
+            return
+        playhead = self._video.current_t
+        if abs(playhead - m.t) > 1.0:
+            self._status.showMessage(
+                f"Playhead is {playhead - m.t:+.2f}s from this pass — click it again or press N."
+            )
+            return
+        half_frame = 0.5 / max(self._review_fps, 1.0)
+        if abs(playhead - m.t) > half_frame:
+            m.t = round(playhead, 4)
+        m.time_adjusted = bool(m.pred) and abs(m.t - m.pred["t"]) > half_frame
+        if m.kind == "skipped":
+            m.state = "skipped"
+        elif m.origin == "added" or not m.pred:
+            m.state = "added"
+        elif m.gate_id != m.pred.get("gate_id"):
+            m.state = "fixed_id"
+        else:
+            m.state = "accepted"
+        if m.kind == "pass":
+            m.track_at_pass = self._track_at(m.t, m.pred.get("track_id") if m.pred else None)
+        self._digit_buf = ""
+        self._review_changed()
+        self._review_step(+1)
+
+    def _review_reject(self):
+        if self._mode != "review" or self._review_sel is None:
+            return
+        m = self._review_sel
+        if m.origin == "added":
+            self._review_marks.remove(m)
+            self._review_sel = None
+            self._status.showMessage("Removed the mark you added.")
+        else:
+            m.state = "rejected"
+        self._digit_buf = ""
+        self._review_changed()
+        self._review_step(+1)
+
+    def _review_add(self, kind: str):
+        if self._mode != "review" or self._video.duration <= 0:
+            return
+        t = round(self._video.current_t, 4)
+        m = ReviewMark(t=t, gate_id=self._suggest_gate(t), kind=kind, origin="added")
+        self._review_marks.append(m)
+        self._review_sel = m
+        self._digit_buf = ""
+        self._review_changed()
+        self._show_review_crops(m)
+        what = "Missed pass" if kind == "pass" else "Skipped gate"
+        self._status.showMessage(
+            f"{what} added at {t:.2f}s as G{m.gate_id} — type a gate ID to change it, Enter to confirm."
+        )
+
+    def _review_cycle_tag(self):
+        if self._mode != "review" or self._review_sel is None:
+            return
+        m = self._review_sel
+        m.tag = _REVIEW_TAGS[(_REVIEW_TAGS.index(m.tag) + 1) % len(_REVIEW_TAGS)]
+        self._review_changed()
+        self._status.showMessage(f"Tag: {_TAG_LABELS[m.tag] or 'none'}")
+
+    def _review_undo(self):
+        if self._mode != "review" or self._review_sel is None:
+            return
+        m = self._review_sel
+        if m.origin == "added" or not m.pred:
+            self._review_marks.remove(m)
+            self._review_sel = None
+            self._status.showMessage("Removed the mark you added.")
+        else:
+            m.t = m.pred["t"]
+            m.gate_id = m.pred["gate_id"] if m.pred["gate_id"] >= 1 else self._suggest_gate(m.t, exclude=m)
+            m.state = "pending"
+            m.time_adjusted = False
+            m.track_at_pass = self._track_at(m.t, m.pred.get("track_id"))
+            self._on_seek(m.t)
+            self._status.showMessage("Back to pending.")
+        self._digit_buf = ""
+        self._review_changed()
+
+    def _review_changed(self, save: bool = True):
+        self._review_marks.sort(key=lambda m: m.t)
+        lap = 0
+        for m in self._review_marks:
+            if m.state not in ("pending", "rejected") and m.gate_id == 1:
+                lap += 1               # G1 is start/finish: each reviewed crossing starts a lap
+            m.lap = lap
+        self._update_mode_ui()
+        if self._review_sel is not None:
+            self._show_review_crops(self._review_sel)
+        if save:
+            self._save_gt()
+
+    # ── REVIEW mode: panels ───────────────────────────────────
+
+    def _refresh_marks_list(self):
+        icons = {"pending": "…", "accepted": "✓", "fixed_id": "✎", "added": "+", "skipped": "⤼"}
+        self._marks_list.blockSignals(True)
+        self._marks_list.clear()
+        for m in self._review_marks:
+            if m.state == "rejected":
+                text = f"{m.t:7.2f}s      ✕ false pass"
+            else:
+                gid = f"G{m.gate_id}" if m.gate_id >= 1 else "G?"
+                skip = "SKIP " if m.kind == "skipped" else ""
+                text = f"{m.t:7.2f}s L{m.lap:<2} {skip}{gid:<4}{icons[m.state]} {m.state}"
+                if m.state == "pending" and m.pred and m.pred.get("source") != "RACE":
+                    text += f" ({m.pred.get('source')})"
+            if m.tag:
+                text += f"  [{_TAG_LABELS[m.tag]}]"
+            item = QListWidgetItem(text)
+            item.setForeground(_REVIEW_COLORS.get(m.state, _REVIEW_COLORS["pending"]))
+            self._marks_list.addItem(item)
+        if self._review_sel in self._review_marks:
+            row = self._review_marks.index(self._review_sel)
+            self._marks_list.setCurrentRow(row)
+            self._marks_list.scrollToItem(self._marks_list.item(row))
+        self._marks_list.blockSignals(False)
+
+    def _on_mark_item_clicked(self, item: QListWidgetItem):
+        row = self._marks_list.row(item)
+        if 0 <= row < len(self._review_marks):
+            self._review_select(self._review_marks[row])
+
+    def _on_gate_item_clicked(self, item: QListWidgetItem):
+        if self._mode != "review":
+            return
+        self._digit_buf = ""
+        self._set_sel_gate(self._gate_list.row(item) + 1)
+
+    def _show_review_crops(self, m: ReviewMark):
+        def show(label: QLabel, path: str, missing: str):
+            if path and os.path.exists(path):
+                label.setPixmap(QPixmap(path).scaled(
+                    label.width(), label.height(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                ))
+            else:
+                label.clear()
+                label.setText(missing)
+
+        q = _abs(m.pred.get("query_img")) if m.pred else ""
+        show(self._query_crop, q, "no detector crop")
+        self._query_caption.setText("Detector" if m.pred else "Detector (none)")
+
+        gate = self._mem_gates[m.gate_id - 1] if 1 <= m.gate_id <= len(self._mem_gates) else {}
+        imgs = [gate.get("last_img")] + list(reversed(gate.get("embed_imgs") or []))
+        mem_img = next((p for p in imgs if p and os.path.exists(p)), "")
+        show(self._mem_crop, mem_img, "no memory crop")
+        self._mem_caption.setText(f"Memory G{m.gate_id}" if gate else "Memory")
+
+    # ── REVIEW mode: gt.json ──────────────────────────────────
+
+    def _mark_to_json(self, m: ReviewMark) -> dict:
+        gate = self._mem_gates[m.gate_id - 1] if 1 <= m.gate_id <= len(self._mem_gates) else {}
+        return {
+            "kind":          m.kind,
+            "t":             round(m.t, 4),
+            "frame":         int(round(m.t * self._review_fps)),
+            "gate_id":       m.gate_id,
+            "gate_type":     gate.get("gate_type"),
+            "lap":           m.lap,
+            "tag":           m.tag,
+            "origin":        m.origin,
+            "verdict":       m.state,
+            "time_adjusted": m.time_adjusted,
+            "pred":          m.pred,
+            "track_at_pass": m.track_at_pass,
+        }
+
+    def _save_gt(self, announce: bool = False):
+        if not self._gt_path:
+            return
+        marks = self._review_marks
+        pending = any(m.state == "pending" for m in marks)
+        out = {
+            "version":     1,
+            "track":       self._track.name if self._track else "",
+            "video":       _rel(self._current_video_path),
+            "gate_memory": _rel(self._mem_path),
+            "race_data":   _rel(self._race_path) if Path(self._race_path).exists() else "",
+            "det_model":   self._review_det_model,
+            "fps":         self._review_fps,
+            "duration":    self._video.duration,
+            "n_gates":     len(self._mem_gates),
+            "status":      "in_progress" if pending or not marks else "complete",
+            "updated":     datetime.now().isoformat(timespec="seconds"),
+            "marks":       [self._mark_to_json(m) for m in marks if m.state != "rejected"],
+            "false_passes": [
+                {"t": round(m.t, 4), "pred": m.pred, "tag": m.tag, "track_at_pass": m.track_at_pass}
+                for m in marks if m.state == "rejected"
+            ],
+        }
+        try:
+            Path(self._gt_path).parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._gt_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(out, f, indent=2)
+            os.replace(tmp, self._gt_path)
+        except OSError as e:
+            self._status.showMessage(f"Could not save {self._gt_path}: {e}")
+            return
+        if announce:
+            self._status.showMessage(f"Saved ({out['status']}) → {self._gt_path}")
+
+    def _load_gt(self):
+        try:
+            with open(self._gt_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Cannot read {self._gt_path}:\n{e}")
+            return
+        marks = []
+        for d in data.get("marks", []):
+            state = d.get("verdict", "pending")
+            marks.append(ReviewMark(
+                t=float(d.get("t", 0.0)),
+                gate_id=int(d.get("gate_id", -1)),
+                kind=d.get("kind", "pass"),
+                origin=d.get("origin", "prefill"),
+                state=state if state in _REVIEW_COLORS and state != "rejected" else "pending",
+                tag=d.get("tag") if d.get("tag") in _REVIEW_TAGS else None,
+                time_adjusted=bool(d.get("time_adjusted", False)),
+                lap=int(d.get("lap", 0)),
+                pred=d.get("pred"),
+                track_at_pass=d.get("track_at_pass"),
+            ))
+        for d in data.get("false_passes", []):
+            pred = d.get("pred") or {}
+            marks.append(ReviewMark(
+                t=float(d.get("t", pred.get("t", 0.0))),
+                gate_id=int(pred.get("gate_id", -1)),
+                state="rejected",
+                tag=d.get("tag") if d.get("tag") in _REVIEW_TAGS else None,
+                pred=d.get("pred"),
+                track_at_pass=d.get("track_at_pass"),
+            ))
+        self._review_marks = marks
+        self._review_sel = None
+        self._review_det_model = data.get("det_model")
+        if data.get("fps"):
+            self._review_fps = float(data["fps"])
+        self._status.showMessage(
+            f"Loaded {len(marks)} marks ({data.get('status', '?')}) from {Path(self._gt_path).name}"
+        )
+
     # ── Save ──────────────────────────────────────────────────
 
     def _on_save(self):
+        if self._mode == "review":
+            self._save_gt(announce=True)
+            return
         if not self._gate_slots:
             QMessageBox.warning(self, "Nothing to save", "Define at least one gate first.")
             return
@@ -1488,8 +2392,14 @@ class MainWindow(QMainWindow):
             if ans == QMessageBox.StandardButton.No:
                 return
 
+        if self._track is None:
+            QMessageBox.information(self, "Pick a track", "Pick or create the track folder to save this gate memory in.")
+            self._on_open_track()
+            if self._track is None:
+                return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Gate Memory", "gate_memory.json", "JSON Files (*.json)"
+            self, f"Save Gate Memory — track '{self._track.name}'",
+            str(self._track.gate_memory), "JSON Files (*.json)",
         )
         if not path:
             return

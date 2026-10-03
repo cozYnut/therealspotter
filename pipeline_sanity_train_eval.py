@@ -35,6 +35,8 @@ from typing import List, Tuple, Optional
 # ultralytics must be installed in the venv you run this with
 from ultralytics import YOLO
 
+from dataset_paths import training_dir
+
 
 # ----------------------------
 # Sanity checking
@@ -271,7 +273,7 @@ def main():
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--device", default="", help="Ultralytics device string: '' (auto), 'cpu', '0', 'mps', etc.")
 
-    ap.add_argument("--project", default="runs/detect", help="Training output base folder")
+    ap.add_argument("--project", default=str(training_dir() / "runs" / "detect"), help="Training output base folder")
     ap.add_argument("--name", default="fpv_gate_train", help="Training run name")
 
     args = ap.parse_args()
