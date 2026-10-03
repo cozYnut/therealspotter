@@ -5,6 +5,16 @@ Headless race extraction for race_ui.py.
 Runs the full pipeline (YOLO + tracker + PassDetector + CLIP + GateDB race matching)
 on a video and saves per-frame data + race results to JSON.
 
+Passes are decided post-race by pass_scorer.py (--pass-logic scorer, default):
+while the video is read, the live PassDetector runs as before and every pass
+candidate (a big track ending or suddenly shrinking) gets a CLIP embedding,
+camera motion is measured (extract_motion.MotionEstimator).  After the last
+frame the saved model (<data_root>/training/pass_scorer.json) picks the passes
+with hindsight, and gate matching + laps are replayed over them in time order.
+"passes"/"laps" hold that result; "live_passes"/"live_laps" keep the live
+detector's for comparison.  Without a saved model it falls back to the live
+detector (--pass-logic live).
+
 Usage (video inside a track folder — memory and output come from the track):
     python extract_race.py \
         --video  "<data_root>/track1/test_videos/myvideo.mp4" \
@@ -26,6 +36,7 @@ import numpy as np
 from ultralytics import YOLO
 
 from dataset_paths import track_of
+from extract_motion import MotionEstimator, save_motion
 from pass_detector import PassDetector, detect_camera_edges
 from gate_db import GateDB
 from collections import deque
@@ -50,6 +61,11 @@ def _crop_padded(frame: np.ndarray, bbox: list, pad_frac: float = 0.5):
     return frame[ny1:ny2, nx1:nx2], [nx1, ny1, nx2, ny2]
 
 
+def _area_ratio(bbox, frame_area: float) -> float:
+    x1, y1, x2, y2 = bbox
+    return max(0, x2 - x1) * max(0, y2 - y1) / max(frame_area, 1.0)
+
+
 def run_race_extraction(
     video_path: str,
     det_model_path: str,
@@ -63,6 +79,7 @@ def run_race_extraction(
     g1_sim_thresh: Optional[float] = None,
     g1_margin: Optional[float] = None,
     require_same_type: bool = False,
+    pass_logic: str = "scorer",
 ):
     print(f"Loading detector: {det_model_path}")
     det = YOLO(det_model_path)
@@ -110,6 +127,34 @@ def run_race_extraction(
     query_frames_dir = str(Path(output_json).parent / f"{stem}.race_query")
     Path(query_frames_dir).mkdir(parents=True, exist_ok=True)
 
+    import pass_scorer
+    saved_model = pass_scorer.load_model() if pass_logic == "scorer" else None
+    if pass_logic == "scorer" and saved_model is None:
+        print(f"No pass scorer model at {pass_scorer.model_path()} — using the live pass detector")
+        pass_logic = "live"
+    if saved_model and Path(det_model_path).name not in saved_model.get("det_models", [Path(det_model_path).name]):
+        print(f"WARNING: the pass scorer was trained on tracks from {', '.join(saved_model['det_models'])}, "
+              f"not {Path(det_model_path).name} — its decisions may be worse than the live detector's")
+    motion = MotionEstimator()
+    cand_embeds = []                 # CLIP embedding for every pass candidate
+    prev_tracks = {}                 # tid → (bbox, area_ratio, type) in the previous frame
+    recent_area = {}                 # tid → deque of (t, area_ratio)
+    prev_t = 0.0
+
+    def embed_candidate(tid: int, t_c: float, gate_type: str):
+        """Same crop as a live pass: the frame 4 back, padded box of that track."""
+        frames, bboxes = list(frame_buffer), list(bbox_buffer)
+        past = bboxes[0].get(tid) if bboxes else None
+        if not frames or not past:
+            return
+        crop, _ = _crop_padded(frames[0], past)
+        if crop.size == 0:
+            return
+        img = str(Path(query_frames_dir) / f"{stem}_c{frame_idx:06d}_{t_c:.3f}s.jpg")
+        cv2.imwrite(img, crop)
+        cand_embeds.append({"t": round(t_c, 4), "track_id": tid, "gate_type": gate_type,
+                            "query_img": img, "query_embedding": clip.embed_bgr(crop).tolist()})
+
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -133,12 +178,34 @@ def run_race_extraction(
         typed = sorted(typed, key=lambda d: d["det_conf"], reverse=True)[:10]
 
         # ── Track + pass detector ───────────────────────────────
+        if pass_logic == "scorer":
+            motion.update(frame)
         frame_buffer.append(frame)
         tracks = tracker.update(typed, t)
         passdet.update(tracks, t, frame_w=W, frame_h=H)
         bbox_buffer.append({int(tr.track_id): list(tr.bbox) for tr in tracks})
 
         st_map = getattr(passdet, "states", {}) or {}
+
+        # ── Pass candidates for the scorer: big tracks that end or shrink ─
+        if pass_logic == "scorer":
+            cur = {int(tr.track_id): (list(tr.bbox), _area_ratio(tr.bbox, frame_area), str(tr.locked_type))
+                   for tr in tracks}
+            for tid, (bb, a, ty) in cur.items():
+                dq = recent_area.setdefault(tid, deque())
+                dq.append((t, a))
+                while dq and dq[0][0] < t - 0.5:
+                    dq.popleft()
+                if tid in prev_tracks:
+                    pa = prev_tracks[tid][1]
+                    if pa >= pass_scorer.BIG and a <= pass_scorer.SHRINK * pa:
+                        embed_candidate(tid, prev_t, ty)
+            for tid, (bb, pa, ty) in prev_tracks.items():
+                if tid not in cur:
+                    if max((x for _, x in recent_area.get(tid, [])), default=0.0) >= pass_scorer.BIG:
+                        embed_candidate(tid, prev_t, ty)
+                    recent_area.pop(tid, None)
+            prev_tracks, prev_t = cur, t
 
         # ── Per-frame track info ────────────────────────────────
         frame_tracks = []
@@ -251,18 +318,67 @@ def run_race_extraction(
     output = {
         "video": str(video_path),
         "gate_memory": str(gate_memory_path),
+        "det_model": Path(det_model_path).name,
         "duration": float(duration),
         "fps": float(fps),
         "total_frames": int(total_frames),
+        "pass_logic": "live",
         "passes": all_passes,
         "laps": race_laps,
         "frames": frames_data,
     }
 
+    if pass_logic == "scorer":
+        motion_data = motion.result(video_path, fps)
+        save_motion(motion_data, str(Path(output_json).parent / f"{stem}.motion.json"))
+        decided = pass_scorer.decide_race({"frames": frames_data, "passes": all_passes},
+                                          motion_data, W, H, saved_model, stem)
+        if pass_offset_sec > 0:
+            for p in decided:
+                if p.get("source") == "NEW":
+                    p["t"] = round(max(0.0, p["t"] - pass_offset_sec), 4)
+        for p in decided:            # a new pass takes its candidate's embedding
+            if p.get("query_embedding") is None:
+                near = [c for c in cand_embeds if abs(c["t"] - p["t"]) <= 0.15]
+                if near:            # prefer the same track, then the closest in time
+                    c = min(near, key=lambda c: (c["track_id"] != p.get("track_id"), abs(c["t"] - p["t"])))
+                    p["query_embedding"], p["query_img"] = c["query_embedding"], c["query_img"]
+        from gate_db import replay_race
+        passes, laps = replay_race(decided, gate_memory_path, sim_thresh=sim_thresh,
+                                   min_match_margin=min_match_margin, g1_sim_thresh=g1_sim_thresh,
+                                   g1_margin=g1_margin, require_same_type=require_same_type)
+        # per-frame overlays (race_ui) follow the decided passes and laps
+        frame_ts = [e["t"] for e in frames_data]
+        for e in frames_data:
+            if "passes" in e:
+                e["live_passes"] = e.pop("passes")
+            if "laps" in e:
+                e["live_laps"] = e.pop("laps")
+        import bisect
+        def frame_at(tt):
+            i = min(max(bisect.bisect_left(frame_ts, tt), 0), len(frame_ts) - 1)
+            if i > 0 and abs(frame_ts[i - 1] - tt) < abs(frame_ts[i] - tt):
+                i -= 1
+            return frames_data[i]
+        for p in passes:
+            frame_at(p["t"]).setdefault("passes", []).append(p)
+        for lp in laps:
+            frame_at(float(lp.get("t1", 0.0))).setdefault("laps", []).append(
+                {"lap": int(lp.get("lap", 0)), "t": float(lp.get("t1", 0.0))})
+        output.update({
+            "pass_logic": f"scorer:{saved_model.get('logic')}",
+            "passes": passes, "laps": laps,
+            "live_passes": all_passes, "live_laps": race_laps,
+            "candidates": len(cand_embeds),
+        })
+        n_new = sum(p.get("reason", "").startswith("scorer_") for p in passes)
+        print(f"Pass scorer: {len(passes)} passes ({n_new} not fired by the live detector), "
+              f"live detector had {len(all_passes)}")
+
     with open(output_json, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2)
 
-    print(f"\nDone. {len(all_passes)} passes  {len(race_laps)} laps → {output_json}")
+    print(f"\nDone. {len(output['passes'])} passes  {len(output['laps'])} laps ({output['pass_logic']}) → {output_json}")
     return len(all_passes)
 
 
@@ -285,6 +401,9 @@ def main():
                         help="Minimum cosine similarity for G1 (start gate); defaults to --sim-thresh")
     parser.add_argument("--g1-margin",         type=float, default=None,
                         help="Minimum margin for G1 (start gate); defaults to --min-match-margin")
+    parser.add_argument("--pass-logic", choices=["scorer", "live"], default="scorer",
+                        help="scorer: passes decided post-race by pass_scorer.py (saved model); "
+                             "live: the live PassDetector's passes")
     parser.add_argument("--require-same-type", action="store_true", default=False,
                         help="Only match a detected gate against memory slots of the same type")
     args = parser.parse_args()
@@ -311,6 +430,7 @@ def main():
         g1_sim_thresh=args.g1_sim_thresh,
         g1_margin=args.g1_margin,
         require_same_type=args.require_same_type,
+        pass_logic=args.pass_logic,
     )
 
 

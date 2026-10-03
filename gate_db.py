@@ -1308,3 +1308,43 @@ def compute_track_gate_hints(
             hints[int(tr.track_id)] = (int(gid), float(sim))
 
     return hints
+
+
+def replay_race(passes: List[dict], memory_path: str, sim_thresh: float = 0.88, min_match_margin: float = 0.03,
+                g1_sim_thresh: Optional[float] = None, g1_margin: Optional[float] = None,
+                require_same_type: bool = False, quiet: bool = True) -> Tuple[List[dict], List[dict]]:
+    """Race-match a finished list of passes (each with "query_embedding") in time
+    order, as extract_race.py does live.  Returns (copies of the passes with
+    gate_id / source / sim / exp_before filled in, closed laps)."""
+    import contextlib
+    import io
+
+    db = GateDB(
+        sim_thresh=sim_thresh, require_same_type=require_same_type,
+        min_lap_gap_sec=6.0, min_gates_between_laps=2,
+        min_match_margin=min_match_margin, race_lookahead=3, max_embeds_per_gate=6,
+        g1_sim_thresh=g1_sim_thresh, g1_margin=g1_margin,
+    )
+    db.set_mode("race")
+    db.load_memory(str(memory_path))
+    out = []
+    mute = contextlib.redirect_stdout(io.StringIO()) if quiet else contextlib.nullcontext()
+    with mute:
+        for p in sorted(passes, key=lambda p: p["t"]):
+            q = dict(p)
+            emb = p.get("query_embedding")
+            if emb is None or len(emb) == 0:
+                q.update(gate_id=-1, source="NOEMB", sim=0.0)
+                out.append(q)
+                continue
+            gtype = p.get("gate_type", "")
+            gid, sim, source, _s2, _mg, exp_before, _wsz = db.race_match(
+                now=p["t"], gate_type=gtype, emb=np.asarray(emb, dtype=np.float32))
+            if source == "RACE":
+                db.on_pass(now=p["t"], gate_id=gid, gate_type=gtype, sim=sim,
+                           reason=str(p.get("reason", "")), track_id=int(p.get("track_id", -1)))
+            else:
+                gid = -1
+            q.update(gate_id=int(gid), source=source, sim=round(float(sim), 4), exp_before=int(exp_before))
+            out.append(q)
+    return out, list(getattr(db, "_race_laps", []))

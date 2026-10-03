@@ -34,8 +34,6 @@ Usage:
 """
 
 import argparse
-import contextlib
-import io
 import json
 from datetime import datetime
 from pathlib import Path
@@ -55,36 +53,10 @@ TAGS = ("crash_clipped", "bad_video")
 def rematch(passes: List[dict], memory_path: Path, args):
     """Re-run GateDB race matching on saved pass embeddings, in time order.
     Returns (copies of the passes with gate_id / source / sim replaced, laps)."""
-    from gate_db import GateDB
-    db = GateDB(
-        sim_thresh=args.sim_thresh, require_same_type=args.require_same_type,
-        min_lap_gap_sec=6.0, min_gates_between_laps=2,
-        min_match_margin=args.min_margin, race_lookahead=3, max_embeds_per_gate=6,
-        g1_sim_thresh=args.g1_sim_thresh, g1_margin=args.g1_margin,
-    )
-    db.set_mode("race")
-    db.load_memory(str(memory_path))
-    out = []
-    for p in sorted(passes, key=lambda p: p["t"]):
-        q = dict(p)
-        emb = p.get("query_embedding")
-        if not emb:
-            q.update(gate_id=-1, source="NOEMB", sim=0.0)
-            out.append(q)
-            continue
-        with contextlib.redirect_stdout(io.StringIO()):     # GateDB prints debug lines
-            gid, sim, source, *_ = db.race_match(now=p["t"], gate_type=p.get("gate_type", ""),
-                                                 emb=np.asarray(emb, dtype=np.float32))
-        if source == "RACE":
-            with contextlib.redirect_stdout(io.StringIO()):
-                db.on_pass(now=p["t"], gate_id=gid, gate_type=p.get("gate_type", ""),
-                           sim=sim, reason=str(p.get("reason", "")), track_id=int(p.get("track_id", -1)))
-        else:
-            gid = -1
-        q.update(gate_id=int(gid), source=source, sim=float(sim))
-        out.append(q)
-    out_laps = list(getattr(db, "_race_laps", []))
-    return out, out_laps
+    from gate_db import replay_race
+    return replay_race(passes, str(memory_path), sim_thresh=args.sim_thresh, min_match_margin=args.min_margin,
+                       g1_sim_thresh=args.g1_sim_thresh, g1_margin=args.g1_margin,
+                       require_same_type=args.require_same_type)
 
 
 def clip_top1(passes: List[dict], memory_path: Path) -> dict:
@@ -126,7 +98,8 @@ def match_by_time(gt_t: List[float], pr_t: List[float], tol: float):
     return out
 
 
-def score_video(tp: TrackPaths, gt_path: Path, args) -> Optional[dict]:
+def score_video(tp: TrackPaths, gt_path: Path, args, passes: Optional[List[dict]] = None) -> Optional[dict]:
+    """Score one video. `passes` replaces the saved race_data passes (e.g. pass_scorer output)."""
     gt = json.loads(gt_path.read_text(encoding="utf-8"))
     stem = gt_path.name[: -len(".gt.json")]
     if gt.get("status") != "complete" and not args.include_incomplete:
@@ -135,15 +108,17 @@ def score_video(tp: TrackPaths, gt_path: Path, args) -> Optional[dict]:
     if not race_path.exists():
         return {"video": stem, "skipped": "no race_data"}
     race = json.loads(race_path.read_text(encoding="utf-8"))
-    passes = race.get("passes", [])
-    sys_laps = race.get("laps", [])
+    sys_laps = race.get("laps", []) if passes is None else []
+    if passes is None:
+        passes = race.get("passes", [])
     if args.rematch:
         passes, sys_laps = rematch(passes, tp.gate_memory, args)
     top1 = clip_top1(passes, tp.gate_memory) if args.rematch else {}
 
     marks = gt.get("marks", [])
-    unsure = [m for m in marks if m.get("tag") == "unsure"]
-    real = [m for m in marks if m["kind"] == "pass" and m.get("tag") != "unsure"]
+    # "unsure" marks and marks still pending review are left out of every score
+    unsure = [m for m in marks if m.get("tag") == "unsure" or m.get("verdict") == "pending"]
+    real = [m for m in marks if m["kind"] == "pass" and m not in unsure]
     skipped = [m for m in marks if m["kind"] == "skipped"]
     unsure_t = [m["t"] for m in unsure]
     # detector passes on an "unsure" mark or a tagged-unsure false pass count for nothing
@@ -273,7 +248,10 @@ def print_total(name: str, t: dict, args):
           f"   correct when given {pct(t['correct'], t['assigned'])}   (memory videos left out)")
     if args.rematch:
         print(f"    CLIP top-1       {pct(t['clip_top1'], t['id_found'])}   (most similar gate, no order, no threshold)")
-    print(f"    Laps             found {t['laps_found']} / marked {t['laps_marked']}")
+    if getattr(args, "passes", "runs") == "scorer" and not args.rematch:
+        print(f"    Laps             marked {t['laps_marked']} (add --rematch to rebuild laps from the new passes)")
+    else:
+        print(f"    Laps             found {t['laps_found']} / marked {t['laps_marked']}")
     print(f"    Missed gates     {t['skipped_marks']} marked — the current system can't flag them yet")
     for k in TAGS:
         g = t["tags"][k]
@@ -297,6 +275,11 @@ def main():
     ap.add_argument("--g1-margin", type=float, default=None)
     ap.add_argument("--require-same-type", action="store_true")
     ap.add_argument("--include-incomplete", action="store_true", help="Also score gt files still in progress")
+    ap.add_argument("--passes", choices=["runs", "live", "scorer"], default="runs",
+                    help="runs: the passes saved in race_data (what race_ui / Review show); "
+                         "live: the live PassDetector's passes kept in race_data; "
+                         "scorer: pass_scorer.py decisions, each video by a model trained on the other videos")
+    ap.add_argument("--scorer-logic", default=None, help="pass_scorer logic (default: its BEST_LOGIC)")
     ap.add_argument("--list", action="store_true", help="List every missed pass, false pass and wrong gate")
     ap.add_argument("--save", metavar="LABEL", help="Write results to <data_root>/scores/<date>_<LABEL>.json")
     args = ap.parse_args()
@@ -314,6 +297,9 @@ def main():
 
     print(f"Data root: {data_root()}")
     print(f"Gate matching: {'replayed with current gate memory' if args.rematch else 'as saved in runs/'}")
+    print("Passes: " + {"runs": "as saved in runs/ (pass_logic of each run)",
+                        "live": "live PassDetector (live_passes in runs/)",
+                        "scorer": "pass_scorer, leave-one-video-out"}[args.passes])
     results = {"real": [], "sim": []}
     per_track = {}
     for tp in units:
@@ -324,7 +310,18 @@ def main():
             print(f"\n{tp.name}: no gate_memory.json — skipped")
             continue
         print(f"\n{tp.name}")
-        vs = [score_video(tp, g, args) for g in gts]
+        override = {}
+        if args.passes == "live":
+            for g in gts:
+                stem = g.name[: -len(".gt.json")]
+                if tp.race_data(stem).exists():
+                    race = json.loads(tp.race_data(stem).read_text(encoding="utf-8"))
+                    override[stem] = race.get("live_passes", race.get("passes", []))
+        if args.passes == "scorer":
+            import pass_scorer
+            videos, cands = pass_scorer.prepare(tp, include_incomplete=args.include_incomplete)
+            override = pass_scorer.lovo_passes(videos, cands, args.scorer_logic or pass_scorer.BEST_LOGIC)
+        vs = [score_video(tp, g, args, passes=override.get(g.name[: -len(".gt.json")])) for g in gts]
         for v in vs:
             print_video(v, args)
         scored = [v for v in vs if "skipped" not in v]

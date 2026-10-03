@@ -99,6 +99,64 @@ Pass detection is already usable. Telling gates apart by appearance alone is the
 
 ---
 
+## 🎯 Pass detector v2 — deciding passes after the fact (`pass_scorer.py`)
+
+The live `PassDetector` decides at one instant, while the drone flies. For post-race review, `pass_scorer.py` decides each pass with hindsight instead. **`extract_race.py` uses it by default**, so race_ui, learn_ui Review, gate matching and laps all get its passes:
+
+- While the video is read, the live detector runs as before. Every pass candidate also gets a gate image (CLIP embedding), and camera motion is measured in the same pass.
+- After the last frame, the saved model (`FPVdatasets/training/pass_scorer.json`) picks the passes. Gate matching and laps are then replayed over them in time order.
+- `race_data.json` holds the result in `passes` / `laps`, keeps the live detector's in `live_passes` / `live_laps`, and records `pass_logic` and `det_model`.
+- `--pass-logic live` gives the old behaviour. Without a saved model it falls back to `live` and says so.
+- **Use the same YOLO model the scorer was trained on** (currently `cyn_current-20260715_best.pt`; set it with 🔧 Set Model). Its decisions depend on the tracks that model produces, and `extract_race` warns on a mismatch.
+- Existing `runs/` files keep their old passes until the video is re-run (▶ Run Race Analysis in race_ui, or delete the race_data file and open the video in Review).
+
+How the decision works:
+
+1. **Candidates:** every pass the live detector fired, every track that ends while big, and every sudden shrink of a big box, merged within 0.1 s. Together they cover 286 of the 296 reviewed passes on track1.
+2. **Features per candidate:**
+   - **Approach of the gate**, stitched across track IDs, because the tracker often splits one gate into several short tracks. Covers how big it got, growth, how long it was aligned, centring, YOLO confidence, and angle of attack from the box's width/height.
+   - **Exit:** which frame borders the box touched.
+   - **After the pass:** whether the same gate is still there 0.3 s later.
+   - **Camera motion** from `extract_motion.py`: optical flow, giving forward motion, turning and chaos.
+   - Whether the live detector fired.
+3. **Decision:** a small logistic model (numpy, no new dependencies) gives each candidate a pass probability. Passes are kept at ≥ 0.5, at most one per 0.25 s. Kept detector passes keep their time, gate match and embedding.
+
+```bash
+python extract_motion.py --video "<FPVdatasets>/track1/test_videos/<video>.mp4"   # optional; pass_scorer runs it if missing
+python pass_scorer.py track1                    # compare all decision logics, leave-one-video-out
+python pass_scorer.py track1 --logic tracks_motion_det --list   # remaining misses / false / off-time passes
+python pass_scorer.py track1 --save             # train on all videos → FPVdatasets/training/pass_scorer.json
+python score.py track1 --passes scorer          # full score report, leave-one-video-out (add --rematch for gate ID and laps)
+python score.py track1 --passes live            # the live detector's passes kept in re-run videos, to compare old vs new
+```
+
+After adding reviewed videos, retrain with `python pass_scorer.py track1 --save`. The model also records which YOLO model and videos it was trained on. Fair numbers for the videos it was trained on come only from the leave-one-video-out comparison. Re-running those videos and scoring them would be in-sample.
+
+**Logic comparison on track1** (11 reviewed videos, 501 real passes). Each video was decided by a model trained on the other ten:
+
+| Logic | On time | Off-time | Missed | False | Errors | Precision |
+|---|---|---|---|---|---|---|
+| live detector (baseline) | 446 | 17 | 38 | 25 | 80 | 95% |
+| detector minus "gate still there after" | 400 | 13 | 88 | 14 | 115 | 97% |
+| hand rules on all candidates | 421 | 32 | 48 | 64 | 144 | 88% |
+| model: track features | 459 | 19 | 23 | 15 | 57 | 97% |
+| **model: tracks + motion** (default) | **460** | **18** | **23** | **12** | **53** | **98%** |
+| model: tracks + detector fired | 455 | 14 | 32 | 14 | 60 | 97% |
+| model: tracks + motion + detector fired | 453 | 13 | 35 | 10 | 58 | 98% |
+| boosted stumps (same feature sets) | 453–458 | 13–17 | 26–35 | 14–20 | 60–63 | 96–97% |
+
+**Out-of-sample check:** Q3 Aviv, Naco, Nadav and cozYnut were run with the scorer before they were reviewed (model trained only on the 7 Q24/Q25 videos). Their errors fell from 21 (live detector) to 13, and every video improved. Precision was 99%.
+
+Findings:
+- The default removes about a third of the errors.
+- **Stitching the approach across track IDs** was the step that mattered most: without it the same models scored much worse and less steadily.
+- Leaving out "the live detector fired here" works better with more data. With that input, the model inherits the live detector's misses (35 vs 23).
+- Camera motion helps a little (57 → 53).
+- A gate still being there afterwards is a strong cue combined with the others, but too blunt as a filter on its own.
+- 10 of 501 real passes have no candidate within ±0.15 s, because the tracker lost the gate early. Fixing those is a tracking or YOLO job, not a decision job.
+
+---
+
 ## Current Gaps
 - Circle gate class not supported (insufficient training data)
 - Model trained on a limited dataset with some auto-annotation errors
@@ -112,6 +170,8 @@ Pass detection is already usable. Telling gates apart by appearance alone is the
 therealspotter/
 ├── dataset_paths.py         # Where every dataset file lives (one folder per track)
 ├── score.py                 # Score the current system against reviewed ground truth
+├── pass_scorer.py           # Pass detector v2: decide passes after the fact (post-race)
+├── extract_motion.py        # Per-frame camera motion from optical flow (for pass_scorer)
 ├── learn_ui.py              # Gate learning UI + REVIEW mode (ground-truth marking)
 ├── extract_candidates.py    # Phase 1: headless candidate extraction (for learn_ui)
 ├── race_ui.py               # Race review UI (timeline, lap timing, match candidates)

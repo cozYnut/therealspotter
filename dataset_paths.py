@@ -15,6 +15,7 @@ data sorts together:
         candidates/<video>.crops/            candidate / Force Clip crops (memory images)
         runs/<video>.race_data.json          extract_race.py output
         runs/<video>.race_query/             its query crops
+        runs/<video>.motion.json             per-frame camera motion (extract_motion.py)
         gt/<video>.gt.json                   reviewed marks (learn_ui REVIEW mode)
         velocidrone/                 same layout, for the sim version of the track
       training/                      shared YOLO data (gate_annotator)
@@ -122,6 +123,10 @@ class TrackPaths:
 
     def race_data(self, stem: str) -> Path:
         return self.runs_dir / f"{stem}.race_data.json"
+
+    def motion(self, stem: str) -> Path:
+        # extract_motion.py: per-frame camera motion from optical flow
+        return self.runs_dir / f"{stem}.motion.json"
 
     def race_query_dir(self, stem: str) -> Path:
         # extract_race.py writes this next to its --output
