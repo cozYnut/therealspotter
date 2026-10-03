@@ -172,6 +172,7 @@ therealspotter/
 ├── score.py                 # Score the current system against reviewed ground truth
 ├── pass_scorer.py           # Pass detector v2: decide passes after the fact (post-race)
 ├── extract_motion.py        # Per-frame camera motion from optical flow (for pass_scorer)
+├── gate_decoder.py          # Gate identity + laps by sequence decoding (order, timing, appearance)
 ├── learn_ui.py              # Gate learning UI + REVIEW mode (ground-truth marking)
 ├── extract_candidates.py    # Phase 1: headless candidate extraction (for learn_ui)
 ├── race_ui.py               # Race review UI (timeline, lap timing, match candidates)
@@ -187,6 +188,44 @@ therealspotter/
 ├── video_labeler_yolo.py    # Manual YOLO annotator
 └── vocab/                   # Optional vocabulary embeddings
 ```
+
+---
+
+## 🔢 Gate identity by sequence decoding (`gate_decoder.py`)
+
+The old GateDB matcher labels each pass on its own from CLIP similarity. On track1 that's right only 5% of the time. Gates of the same type look alike, and one wrong match shifts every later pass. `gate_decoder.py` labels **all passes of a video at once**: it finds the most likely sequence G1…GN given
+
+- **order:** the next pass is normally the next gate. Skipping k gates (probability 0.02^k), flying the same gate again (0.01), or a pass that isn't real (0.01) are allowed but cost extra;
+- **timing:** each gate-to-gate duration, learned from the track's reviewed videos as a log-normal per gate pair, scaled to this pilot's speed. The speed is estimated from the video itself, in two rounds;
+- **appearance:** CLIP similarity to each gate's memory images, weighted lightly. It's a tie-breaker, not the main cue;
+- a prior that the first pass is G1.
+
+A dynamic program (Viterbi-style, letting up to 4 passes in a row be false) picks the best labelling. Laps are counted from the labelled G1s. If G1 itself was missed, a lap starts where the order wraps; a G1 flown twice in a row counts once.
+
+`extract_race.py` uses it by default (`--gate-id sequence`; `--gate-id greedy` gives the old matcher). race_ui, Review and laps all get its labels. If the track has no reviewed videos yet, the gate-to-gate timing is learned from the video itself: laps repeat, so it decodes, re-estimates the durations, and decodes again.
+
+```bash
+python gate_decoder.py track1                       # compare decoders, leave-one-video-out
+python score.py track1 --include-incomplete --decoder   # full report with sequence-decoded gate IDs and laps
+```
+
+**Results on track1:** 8 test videos, 368 real passes found by the detector. Each video was labelled with timing learned from the other videos:
+
+| Decoder | Gate ID correct |
+|---|---|
+| greedy GateDB (old) | 18 / 368 = 5% |
+| appearance only, best gate per pass | 124 / 368 = 34% |
+| order only | 102 / 368 = 28% |
+| order + appearance | 306 / 368 = 83% |
+| order + timing | 360 / 368 = 97.8% |
+| **order + timing + appearance** (default) | **363 / 368 = 98.6%** |
+| order + timing + appearance from reviewed passes | 361 / 368 = 98.1% |
+| timing learned from the video itself (no reviewed videos) | 331 / 368 = 89.9% |
+
+- **Settings check:** the skip, false-pass, start and appearance settings were also chosen per video using only the other videos, over 48 combinations. That gave 97.8%, so the result doesn't depend on tuning to the test videos.
+- **End to end:** 91.9% of *all* real passes on the test videos get the right gate. The rest are mostly passes the detector missed. Laps: 34 of 35 found.
+
+**Why this works:** the rhythm of the track is the strongest fingerprint. G9→G10 takes 0.55 ± 0.14 s, while G5→G6 takes 4.8 ± 1.5 s, and the 13 durations in a row form a pattern no other alignment fits. Order alone can't tell where in the lap you are, and appearance alone confuses look-alike gates. Timing fixes the position in the lap, and order plus appearance clean up the rest. Appearance from more reviewed examples didn't add anything beyond the gate memory.
 
 ---
 

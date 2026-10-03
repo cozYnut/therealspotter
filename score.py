@@ -114,6 +114,9 @@ def score_video(tp: TrackPaths, gt_path: Path, args, passes: Optional[List[dict]
     if args.rematch:
         passes, sys_laps = rematch(passes, tp.gate_memory, args)
     top1 = clip_top1(passes, tp.gate_memory) if args.rematch else {}
+    if getattr(args, "decoder", False):
+        import gate_decoder      # timing from the other reviewed videos only
+        passes, sys_laps, _ = gate_decoder.label_race(passes, tp.gate_memory, tp, exclude_stem=stem)
 
     marks = gt.get("marks", [])
     # "unsure" marks and marks still pending review are left out of every score
@@ -248,7 +251,7 @@ def print_total(name: str, t: dict, args):
           f"   correct when given {pct(t['correct'], t['assigned'])}   (memory videos left out)")
     if args.rematch:
         print(f"    CLIP top-1       {pct(t['clip_top1'], t['id_found'])}   (most similar gate, no order, no threshold)")
-    if getattr(args, "passes", "runs") == "scorer" and not args.rematch:
+    if getattr(args, "passes", "runs") == "scorer" and not (args.rematch or args.decoder):
         print(f"    Laps             marked {t['laps_marked']} (add --rematch to rebuild laps from the new passes)")
     else:
         print(f"    Laps             found {t['laps_found']} / marked {t['laps_marked']}")
@@ -269,6 +272,9 @@ def main():
                     help="Wider gap: a detector pass this close is 'off-time', not a miss + false pass (s)")
     ap.add_argument("--rematch", action="store_true",
                     help="Redo gate matching on saved embeddings with the current gate_memory.json")
+    ap.add_argument("--decoder", action="store_true",
+                    help="Label gate IDs and laps with gate_decoder.py (sequence decoding; timing from the "
+                         "other reviewed videos)")
     ap.add_argument("--sim-thresh", type=float, default=0.88)
     ap.add_argument("--min-margin", type=float, default=0.03)
     ap.add_argument("--g1-sim-thresh", type=float, default=None)
@@ -296,7 +302,8 @@ def main():
             units.append(TrackPaths(tp.dir / SIM_DIR))
 
     print(f"Data root: {data_root()}")
-    print(f"Gate matching: {'replayed with current gate memory' if args.rematch else 'as saved in runs/'}")
+    print("Gate matching: " + ("sequence decoder (gate_decoder.py)" if args.decoder else
+                               "greedy, replayed with current gate memory" if args.rematch else "as saved in runs/"))
     print("Passes: " + {"runs": "as saved in runs/ (pass_logic of each run)",
                         "live": "live PassDetector (live_passes in runs/)",
                         "scorer": "pass_scorer, leave-one-video-out"}[args.passes])

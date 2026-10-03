@@ -11,8 +11,10 @@ candidate (a big track ending or suddenly shrinking) gets a CLIP embedding,
 camera motion is measured (extract_motion.MotionEstimator).  After the last
 frame the saved model (<data_root>/training/pass_scorer.json) picks the passes
 with hindsight, and gate matching + laps are replayed over them in time order.
-"passes"/"laps" hold that result; "live_passes"/"live_laps" keep the live
-detector's for comparison.  Without a saved model it falls back to the live
+Gate IDs and laps then come from gate_decoder.py (--gate-id sequence, default):
+all passes are labelled at once from gate order, gate-to-gate timing and
+appearance.  "passes"/"laps" hold the result; "live_passes"/"live_laps" keep
+the live detector's (with its greedy GateDB gate IDs) for comparison.  Without a saved model it falls back to the live
 detector (--pass-logic live).
 
 Usage (video inside a track folder — memory and output come from the track):
@@ -80,6 +82,7 @@ def run_race_extraction(
     g1_margin: Optional[float] = None,
     require_same_type: bool = False,
     pass_logic: str = "scorer",
+    gate_id_logic: str = "sequence",
 ):
     print(f"Loading detector: {det_model_path}")
     det = YOLO(det_model_path)
@@ -328,6 +331,7 @@ def run_race_extraction(
         "frames": frames_data,
     }
 
+    final = all_passes
     if pass_logic == "scorer":
         motion_data = motion.result(video_path, fps)
         save_motion(motion_data, str(Path(output_json).parent / f"{stem}.motion.json"))
@@ -344,10 +348,26 @@ def run_race_extraction(
                     c = min(near, key=lambda c: (c["track_id"] != p.get("track_id"), abs(c["t"] - p["t"])))
                     p["query_embedding"], p["query_img"] = c["query_embedding"], c["query_img"]
         from gate_db import replay_race
-        passes, laps = replay_race(decided, gate_memory_path, sim_thresh=sim_thresh,
-                                   min_match_margin=min_match_margin, g1_sim_thresh=g1_sim_thresh,
-                                   g1_margin=g1_margin, require_same_type=require_same_type)
-        # per-frame overlays (race_ui) follow the decided passes and laps
+        final, _ = replay_race(decided, gate_memory_path, sim_thresh=sim_thresh,
+                               min_match_margin=min_match_margin, g1_sim_thresh=g1_sim_thresh,
+                               g1_margin=g1_margin, require_same_type=require_same_type)
+        output.update({"pass_logic": f"scorer:{saved_model.get('logic')}", "candidates": len(cand_embeds)})
+        n_new = sum(p.get("reason", "").startswith("scorer_") for p in final)
+        print(f"Pass scorer: {len(final)} passes ({n_new} not fired by the live detector), "
+              f"live detector had {len(all_passes)}")
+
+    passes, laps = final, race_laps
+    if gate_id_logic == "sequence":
+        import gate_decoder
+        passes, laps, info = gate_decoder.label_race(final, gate_memory_path, track_of(output_json))
+        output.update(info)
+        print(f"Gate IDs by sequence decoding (timing: {info['timing']}): "
+              f"{sum(p['gate_id'] >= 1 for p in passes)} passes labelled, {len(laps)} laps")
+    else:
+        output["gate_id_logic"] = "greedy"
+
+    if passes is not all_passes:
+        # per-frame overlays (race_ui) follow the final passes and laps
         frame_ts = [e["t"] for e in frames_data]
         for e in frames_data:
             if "passes" in e:
@@ -355,6 +375,7 @@ def run_race_extraction(
             if "laps" in e:
                 e["live_laps"] = e.pop("laps")
         import bisect
+
         def frame_at(tt):
             i = min(max(bisect.bisect_left(frame_ts, tt), 0), len(frame_ts) - 1)
             if i > 0 and abs(frame_ts[i - 1] - tt) < abs(frame_ts[i] - tt):
@@ -365,15 +386,7 @@ def run_race_extraction(
         for lp in laps:
             frame_at(float(lp.get("t1", 0.0))).setdefault("laps", []).append(
                 {"lap": int(lp.get("lap", 0)), "t": float(lp.get("t1", 0.0))})
-        output.update({
-            "pass_logic": f"scorer:{saved_model.get('logic')}",
-            "passes": passes, "laps": laps,
-            "live_passes": all_passes, "live_laps": race_laps,
-            "candidates": len(cand_embeds),
-        })
-        n_new = sum(p.get("reason", "").startswith("scorer_") for p in passes)
-        print(f"Pass scorer: {len(passes)} passes ({n_new} not fired by the live detector), "
-              f"live detector had {len(all_passes)}")
+        output.update({"passes": passes, "laps": laps, "live_passes": all_passes, "live_laps": race_laps})
 
     with open(output_json, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2)
@@ -404,6 +417,9 @@ def main():
     parser.add_argument("--pass-logic", choices=["scorer", "live"], default="scorer",
                         help="scorer: passes decided post-race by pass_scorer.py (saved model); "
                              "live: the live PassDetector's passes")
+    parser.add_argument("--gate-id", choices=["sequence", "greedy"], default="sequence",
+                        help="sequence: label all passes at once from gate order + timing + appearance "
+                             "(gate_decoder.py); greedy: GateDB one pass at a time")
     parser.add_argument("--require-same-type", action="store_true", default=False,
                         help="Only match a detected gate against memory slots of the same type")
     args = parser.parse_args()
@@ -431,6 +447,7 @@ def main():
         g1_margin=args.g1_margin,
         require_same_type=args.require_same_type,
         pass_logic=args.pass_logic,
+        gate_id_logic=args.gate_id,
     )
 
 
