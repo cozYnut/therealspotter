@@ -38,6 +38,8 @@ You have 2 tracks with about 30 videos each from different pilots. The goal is t
 4. **Marking-only mode**, so test videos never add embeddings to the gate memory.
 5. **Start small.** About 5 test videos per track are enough for a first test set. The rest are marked later, as needed.
 
+**Status:** steps 1–4 are built as REVIEW mode in `learn_ui` (see the README for the keys and the `gt.json` contents). On track1, 4 test videos and 1 memory video are reviewed: the detector finds 91% of real passes, 95% of its passes are real, and timing is within about 1 frame. Gate ID by CLIP similarity alone is right on only 19–54% of passes per test video. No reviewed video has a gate the pilot actually skipped yet.
+
 **Optional tag per mark**, only when something unusual happens: *crash / clipped gate*, *bad video* (static or breakup) or *unsure*. `score.py` reports accuracy per tag, unsure marks are left out of the score, and tagged frames are candidates for future YOLO training data.
 
 **Pass rule (decided):** a clipped gate counts as a pass if the drone went through. A crash in the gate counts only if the drone flies on.
@@ -55,23 +57,23 @@ Velocidrone sends live race data over a websocket (`ws://<pc>:60003/velocidrone`
 
 ### Shared pieces
 
-**Dataset location (decided).** All training and test data lives outside the git repos, in one folder on your Mac: `/Users/eyalcozac/Codes and apps/FPVdatasets`. Nothing in it is committed.
+**Dataset location (decided).** All training and test data lives outside the git repos, in one folder on your Mac: `/Users/eyalcozac/Codes and apps/FPVdatasets`. Nothing in it is committed, and no UI or script writes data into the repo. Each track has one folder holding everything about it. When the same track also exists in Velocidrone, the sim data goes in a `velocidrone/` subfolder of that track with the same layout. Every file made from a video starts with the video's name, so one video's data sorts together.
 
 ```
 FPVdatasets/
-  real/<track>/                 Branch 1, one folder per real track
-    gate_memory.json            built from the memory videos only
-    memory_videos/              1-2 videos used to learn the gates
-    test_videos/                videos used only for scoring
-    gt/<video>.gt.json          reviewed marks
-    runs/<video>.race_data.json output of extract_race.py
-  velocidrone/<track>/          Branch 2, same layout
-    gt/<video>.gt.json          converted websocket log
-    logs/<video>.ws.jsonl       raw websocket log
-  training/                     YOLO images and labels for future retraining
+  <track>/                              one folder per track, e.g. track1
+    gate_memory.json                    built from the memory videos only
+    memory_videos/                      1-2 videos used to learn the gates
+    test_videos/                        videos used only for scoring
+    candidates/<video>.candidates.json  learn_ui extraction, + <video>.crops/
+    runs/<video>.race_data.json         output of extract_race.py, + <video>.race_query/
+    gt/<video>.gt.json                  reviewed marks (Branch 1) or converted websocket log (Branch 2)
+    velocidrone/                        Branch 2: the sim version of the track, same layout
+      logs/<video>.ws.jsonl             raw websocket log
+  training/                             shared YOLO data: gate_annotations/, gate_models/, runs/
 ```
 
-**How the code finds it.** One data-root setting, read in this order: the `FPV_DATA_ROOT` environment variable, then `data_root` in a local `local_config.json` next to the code, then the default path above. Files inside the dataset refer to each other by paths relative to the root, so the folder can move. The repo's `.gitignore` excludes `local_config.json`, videos, files named \*.race\_data.json or \*.gt.json, and any local data folder (settings like debug\_ui\_defaults.json stay tracked), and the README names the dataset folder and its layout. The path contains spaces, so it must be quoted in shell commands.
+**How the code finds it.** `dataset_paths.py` is the one place that knows this layout. It reads the data root from the `FPV_DATA_ROOT` environment variable, then `data_root` in a local `local_config.json` next to the code, then the default path above. In `learn_ui` and `race_ui`, **📁 Open Track** picks the track folder. Videos, gate memory, results and marks are then read from and saved to it, and a video picked from outside the dataset is copied in first. The command-line scripts find the track from the video's path. Files inside the dataset refer to each other by paths relative to the root, so the folder can move. The README describes the layout and the review workflow. The path contains spaces, so it must be quoted in shell commands.
 
 **Score script** `score.py`: compares `race_data.json` with `gt.json` and prints the metrics in "How we measure": pass detection (a detected pass within ±0.15 s of a mark), gate-ID accuracy, missed-gate recall, false flags and lap count, split by tag. It runs on all tracks at once and prints real and Velocidrone results separately.
 
