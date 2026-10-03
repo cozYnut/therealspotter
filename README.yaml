@@ -15,12 +15,12 @@ YT video demonstration: https://www.youtube.com/watch?v=6A2gmpzc6iU
 
 ---
 
-## 🧪 This branch: `dataset/real-video-marking` — collecting test data
+## 🧪 Test dataset collection
 
-**This branch is for building a scored test dataset, not for changing detection.**
-Before we change the pass detector or the gate matching, we need ground truth to measure them against: for real race videos, every real gate pass with its exact time and gate ID. Nothing here changes how passes are detected or matched. The code only adds tools to collect and store that data.
+**Collecting a scored test dataset comes before changing detection** (built on branch `dataset/real-video-marking`).
+Before we change the pass detector or the gate matching, we need ground truth to measure them against: for real race videos, every real gate pass with its exact time and gate ID. These tools collect and store that data and score the current system against it. They don't change how passes are detected or matched.
 
-What this branch adds:
+What it adds:
 - **One dataset folder outside the repo, one folder per track** (`dataset_paths.py`). Every UI and script reads from and saves to it, so no data files are written into the repo.
 - **REVIEW mode in `learn_ui.py`.** The current system pre-fills every pass on a test video. You confirm or fix each one with the keyboard and add what it missed. The result is saved as `<video>.gt.json`. Review never changes the gate memory.
 - **Every file made from a video starts with the video's name**, so one video's data sorts together.
@@ -69,16 +69,33 @@ A video picked from outside the dataset is copied into the open track first. Reo
 
 For every real pass: time and frame, gate ID and type, lap, tag, and the verdict (`accepted`, `fixed_id`, `added` = detector missed it, `skipped` = pilot missed the gate). It also records whether the time was adjusted, the detector's original prediction (time, gate, CLIP similarity, pass reason, track ID), and the tracker box at the pass frame (`track_at_pass`). Detector passes that weren't real are listed in `false_passes`. Together these give pass-detection recall and precision, timing error and gate-ID accuracy, without rerunning YOLO.
 
-### Status (track1, first 4 test videos + 1 memory video reviewed)
+### Scoring — `score.py`
+
+Compares `runs/<video>.race_data.json` with `gt/<video>.gt.json` for every track and prints, per video and per track, with real and Velocidrone tracks totalled separately:
+
+- **Pass detection:** a detector pass within ±0.15 s of a real pass is *on time*. Within ±0.5 s it's *off-time*: it fired for that gate, but at the wrong moment, so it isn't counted as a miss plus a false pass. Also reports recall, precision and timing error.
+- **Gate ID** on every real pass the detector fired for. Videos in `memory_videos/` are left out.
+- **Laps**, **skipped gates** marked, and results **per tag**. Marks tagged *unsure* are left out of all scores.
+
+```bash
+python score.py                       # all tracks, gate IDs as saved in runs/
+python score.py track1 --rematch      # redo gate matching with the current gate_memory.json (no YOLO, seconds)
+python score.py --list                # also list every missed / off-time / false pass and wrong gate, with times
+python score.py --rematch --save baseline   # write <FPVdatasets>/scores/<date>_baseline.json
+```
+
+### Baseline (track1, `score.py --rematch`, 4 test videos + 1 memory video)
 
 | | Current system |
 |---|---|
-| Pass recall | 173 / 190 real passes found (91%) |
-| Pass precision | 173 / 182 detector passes were real (95%) |
-| Pass timing | median 0 ms, 90% within 33 ms (~1 frame) |
-| Gate ID (CLIP, most similar gate) | right on 19–54% of passes per test video |
+| Pass recall | 186 / 213 on time (87%), 196 / 213 including 10 off-time (92%), 17 missed |
+| Pass precision | 196 / 205 detector passes were real (96%) |
+| Pass timing | median 0 ms, 90% within 67 ms |
+| Gate ID | 8 / 173 correct (5%); a gate was given on 17%, and was right on 27% of those |
+| CLIP most-similar gate | right on 64 / 173 (37%), with no gate order and no threshold |
+| Laps | 4 found / 15 marked |
 
-Pass detection is already usable. Telling gates apart by appearance alone is the weak point. Next: `score.py` to print these numbers for every track, then the work on the pass detector and gate order described in `docs/PLAN.md`.
+Pass detection is already usable. Telling gates apart by appearance alone is the weak point, so the next steps are the pass detector's misses and off-time passes, and using gate order (`docs/PLAN.md`, Milestone 2).
 
 ---
 
@@ -94,6 +111,7 @@ Pass detection is already usable. Telling gates apart by appearance alone is the
 ```
 therealspotter/
 ├── dataset_paths.py         # Where every dataset file lives (one folder per track)
+├── score.py                 # Score the current system against reviewed ground truth
 ├── learn_ui.py              # Gate learning UI + REVIEW mode (ground-truth marking)
 ├── extract_candidates.py    # Phase 1: headless candidate extraction (for learn_ui)
 ├── race_ui.py               # Race review UI (timeline, lap timing, match candidates)
