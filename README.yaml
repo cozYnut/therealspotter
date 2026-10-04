@@ -173,6 +173,7 @@ therealspotter/
 ├── pass_scorer.py           # Pass detector v2: decide passes after the fact (post-race)
 ├── extract_motion.py        # Per-frame camera motion from optical flow (for pass_scorer)
 ├── gate_decoder.py          # Gate identity + laps by sequence decoding (order, timing, appearance)
+├── learn_track.py           # Learn a track's gates and timing from unreviewed videos
 ├── learn_ui.py              # Gate learning UI + REVIEW mode (ground-truth marking)
 ├── extract_candidates.py    # Phase 1: headless candidate extraction (for learn_ui)
 ├── race_ui.py               # Race review UI (timeline, lap timing, match candidates)
@@ -226,6 +227,40 @@ python score.py track1 --include-incomplete --decoder   # full report with seque
 - **End to end:** 91.9% of *all* real passes on the test videos get the right gate. The rest are mostly passes the detector missed. Laps: 34 of 35 found.
 
 **Why this works:** the rhythm of the track is the strongest fingerprint. G9→G10 takes 0.55 ± 0.14 s, while G5→G6 takes 4.8 ± 1.5 s, and the 13 durations in a row form a pattern no other alignment fits. Order alone can't tell where in the lap you are, and appearance alone confuses look-alike gates. Timing fixes the position in the lap, and order plus appearance clean up the rest. Appearance from more reviewed examples didn't add anything beyond the gate memory.
+
+---
+
+## 🎓 Learning a track from videos — no teaching (`learn_track.py`)
+
+Instead of marking every gate in learn_ui, a track can be learned from a few unreviewed videos. You only give the number of gates. The first gate passed in every video is G1 (start/finish).
+
+1. Put the videos in `<track>/learn_videos/` and run the pass pipeline on each. A blank 13-gate memory keeps the taught one out:
+   `python extract_race.py --video "<track>/learn_videos/<video>.mp4" --det-model cyn_current-20260715_best.pt --gate-memory <blank 13-gate memory> --gate-id greedy`
+2. `python learn_track.py track1 --gates 13 --evaluate`
+3. `python learn_track.py track1 --gates 13 --install` makes the learned memory the track's `gate_memory.json`. The old one is kept as `.bak`.
+
+**How it learns:**
+- **A first-lap template:** each video's first lap gives a candidate template, its 13 leg durations, assuming that lap was clean.
+- **Refining each candidate on all videos:** each one is refined using timing only. That means labelling with order and timing, then re-estimating each leg's duration with every pilot's speed factored out.
+- **Picking the best:** the template that explains all videos best wins, so a first lap with a missed or extra pass can't win.
+- **Adding appearance:** timing and gate appearance are then re-learned together, alternating with relabelling until the labels stop changing.
+- **Outputs:** `gate_timing.learned.json` (leg durations) and `gate_memory.learned.json` (13 gates, type, and up to 24 varied images each).
+- **Six images per gate was too few:** they don't cover other pilots and light. With 24, accuracy went from 97.2% to 98.2%.
+
+**Lap times:** `<video>.laps.txt` next to a learn video holds G1 times, one per line in seconds. A lap-timer clock is shifted automatically to the video. With lap times, every lap holding exactly 13 passes is labelled G1…G13 directly. No template search is needed, and G1 is pinned at those times. Simulated on the reviewed videos, this gave 98.9% (98.6% without).
+
+`gate_decoder.label_race` uses timing from reviewed videos first, then the learned timing, then timing learned from the video itself.
+
+**Result on track1:** learned from 7 unreviewed videos (Q7 ×3, Q8 ×4, 362 passes). Scored on the 13 reviewed videos, which were not used for learning:
+
+| Track knowledge | Gate ID |
+|---|---|
+| taught (learn_ui memory + timing from reviewed videos) | 98.6% |
+| **learned from 7 videos (timing + 24 images per gate)** | **98.2%** (559/569); lap count exact in 12 of 13 videos |
+| learned timing, no images at all | 97.9% |
+| learned, but only 6 images per gate | 97.2% |
+
+The learned leg durations match the reviewed ones: G5→6 4.74 s vs 4.84 s, G9→10 0.54 s vs 0.55 s. The learned timing alone is as good as the taught timing. The remaining gap is images, and adding more videos to `learn_videos/` adds more.
 
 ---
 

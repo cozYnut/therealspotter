@@ -50,6 +50,7 @@ class VideoSeq:
     obs: List[Obs]
     real: List[dict] = field(default_factory=list)   # reviewed real passes (t, gate_id)
     memory_video: bool = False
+    g1_times: List[float] = field(default_factory=list)   # known G1 (lap) times, e.g. from a lap timer
 
 
 def _norm(e) -> Optional[np.ndarray]:
@@ -171,6 +172,8 @@ class Cfg:
     start_g1: float = 3.0           # extra log-prior for the first real pass being G1
     speed_iters: int = 2            # re-estimate the pilot's speed this many times
     window: int = 4                 # max consecutive false observations
+    g1_tol: float = 0.35            # a pass within this of a known G1 time is G1
+    g1_weight: float = 6.0          # how strongly known G1 times pin the labels
 
 
 def emissions(v: VideoSeq, m: Model, cfg: Cfg) -> np.ndarray:
@@ -188,6 +191,9 @@ def emissions(v: VideoSeq, m: Model, cfg: Cfg) -> np.ndarray:
         if cfg.use_type:
             lp = np.array([m.type_logp.get((o.gtype, g), np.log(0.25)) for g in range(1, m.n + 1)])
             E[j, 1:] += lp - np.log(np.exp(lp).mean())
+        if v.g1_times:              # known lap times: G1 exactly there, nowhere else
+            near = min(abs(o.t - a) for a in v.g1_times) <= cfg.g1_tol
+            E[j, 1] += cfg.g1_weight if near else -cfg.g1_weight
     return E
 
 
@@ -201,12 +207,14 @@ def _timing(m: Model, g0: int, d: int, dt: float, scale: float) -> float:
     return float(-0.5 * z * z - np.log(sd))
 
 
-def decode(v: VideoSeq, m: Model, cfg: Cfg, scale: float = 1.0) -> List[int]:
-    """Labels (gate id, or 0 for a false pass) for every observation."""
+def decode(v: VideoSeq, m: Model, cfg: Cfg, scale: float = 1.0, return_score: bool = False):
+    """Labels (gate id, or 0 for a false pass) for every observation
+    (and the best path's log-score with return_score)."""
     n, N = len(v.obs), m.n
     E = emissions(v, m, cfg)
     if not cfg.order:
-        return [int(np.argmax(E[j, 1:]) + 1) for j in range(n)]
+        labels = [int(np.argmax(E[j, 1:]) + 1) for j in range(n)]
+        return (labels, 0.0) if return_score else labels
     lf = np.log(cfg.p_false) + cfg.false_emit
     lr = np.log(1 - cfg.p_false)
     step = np.full(N, -np.inf)                       # log P(step d), d = 0…N-1
@@ -240,13 +248,13 @@ def decode(v: VideoSeq, m: Model, cfg: Cfg, scale: float = 1.0) -> List[int]:
     # end: the remaining observations are false
     final = [(best[j, g] + (n - 1 - j) * lf, j, g) for j in range(n) for g in range(1, N + 1)]
     if not final:
-        return []
-    _, j, g = max(final)
+        return ([], 0.0) if return_score else []
+    score, j, g = max(final)
     labels = [0] * n
     while j >= 0:
         labels[j] = g
         j, g = back[j, g]
-    return labels
+    return (labels, float(score)) if return_score else labels
 
 
 def estimate_scale(v: VideoSeq, labels: List[int], m: Model) -> float:
@@ -335,11 +343,14 @@ def build_laps(passes: List[dict], n: int) -> List[dict]:
 
 
 def label_race(passes: List[dict], memory_path, tp: Optional[TrackPaths] = None,
-               exclude_stem: Optional[str] = None, cfg: Optional[Cfg] = None) -> Tuple[List[dict], List[dict], dict]:
+               exclude_stem: Optional[str] = None, cfg: Optional[Cfg] = None,
+               timing: str = "auto") -> Tuple[List[dict], List[dict], dict]:
     """Label every pass with its gate by sequence decoding.
 
     Timing comes from the track's reviewed videos (minus exclude_stem); with
-    none, it is learned from this video. Returns (passes with gate_id / source
+    none, from the timing learn_track.py learned from learn_videos/; with
+    neither, it is learned from this video. timing="reviewed" / "learned" /
+    "self" forces one source. Returns (passes with gate_id / source
     / sim set, laps, info). Source is RACE for a labelled pass and NOPASS for
     one the decoder judges not real."""
     cfg = cfg or Cfg()
@@ -348,12 +359,21 @@ def label_race(passes: List[dict], memory_path, tp: Optional[TrackPaths] = None,
     ordered = sorted(passes, key=lambda p: p["t"])
     v = VideoSeq(exclude_stem or "", [Obs(p["t"], _norm(p.get("query_embedding")), str(p.get("gate_type", "")),
                                          p.get("p_pass")) for p in ordered])
-    train = reviewed_sequences(tp, exclude_stem)
+    train = reviewed_sequences(tp, exclude_stem) if timing in ("auto", "reviewed") else []
+    learned = tp.learned_timing if tp is not None and timing in ("auto", "learned") else None
     m = fit(train, n, gate_types, banks, use_reviewed=False)
     if train:
-        labels, timing = decode_video(v, m, cfg), f"reviewed videos ({len(train)})"
+        labels, src = decode_video(v, m, cfg), f"reviewed videos ({len(train)})"
+    elif learned is not None and learned.exists():
+        d = json.loads(learned.read_text(encoding="utf-8"))
+        if int(d.get("n_gates", n)) == n:
+            m.log_mu, m.log_sd = np.array(d["log_mu"]), np.array(d["log_sd"])
+            train = [None]                     # timing known: fit the pilot's speed below
+            labels, src = decode_video(v, m, cfg), f"learned from {len(d.get('learned_from', []))} learn videos"
+        else:
+            labels, src = self_timing_labels(v, m, cfg), "learned from this video"
     else:
-        labels, timing = self_timing_labels(v, m, cfg), "learned from this video"
+        labels, src = self_timing_labels(v, m, cfg), "learned from this video"
     out = []
     for p, o, g in zip(ordered, v.obs, labels):
         q = dict(p)
@@ -363,7 +383,7 @@ def label_race(passes: List[dict], memory_path, tp: Optional[TrackPaths] = None,
             with np.errstate(all="ignore"):
                 q["sim"] = round(float((banks[g - 1] @ o.emb).max()), 4)
         out.append(q)
-    info = {"gate_id_logic": "sequence", "timing": timing,
+    info = {"gate_id_logic": "sequence", "timing": src,
             "speed_scale": round(estimate_scale(v, labels, m), 3) if train else None}
     return out, build_laps(out, n), info
 

@@ -68,7 +68,7 @@ class Video:
 
 
 def _video_file(tp: TrackPaths, stem: str) -> Optional[Path]:
-    for d in (tp.test_videos, tp.memory_videos):
+    for d in (tp.test_videos, tp.memory_videos, tp.learn_videos):
         for f in d.glob(stem + ".*"):
             if f.stem == stem:
                 return f

@@ -11,6 +11,7 @@ data sorts together:
         gate_memory.json             the track's learned gates
         memory_videos/               videos used to learn the gates
         test_videos/                 videos used only for scoring
+        learn_videos/                unreviewed videos the track is learned from (learn_track.py)
         candidates/<video>.candidates.json   learn_ui candidate extraction
         candidates/<video>.crops/            candidate / Force Clip crops (memory images)
         runs/<video>.race_data.json          extract_race.py output
@@ -105,6 +106,20 @@ class TrackPaths:
     @property
     def test_videos(self) -> Path:
         return self.dir / "test_videos"
+
+    @property
+    def learn_videos(self) -> Path:
+        return self.dir / "learn_videos"
+
+    @property
+    def learned_memory(self) -> Path:
+        # learn_track.py: gates (order, type, images) learned from learn_videos/
+        return self.dir / "gate_memory.learned.json"
+
+    @property
+    def learned_timing(self) -> Path:
+        # learn_track.py: gate-to-gate durations learned from learn_videos/
+        return self.dir / "gate_timing.learned.json"
 
     @property
     def gt_dir(self) -> Path:
