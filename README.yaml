@@ -174,6 +174,7 @@ therealspotter/
 ├── extract_motion.py        # Per-frame camera motion from optical flow (for pass_scorer)
 ├── gate_decoder.py          # Gate identity + laps by sequence decoding (order, timing, appearance)
 ├── learn_track.py           # Learn a track's gates and timing from unreviewed videos
+├── race_day_app.py          # Race-day desktop app (Live / Replays) + race_day/ package and dashboard
 ├── learn_ui.py              # Gate learning UI + REVIEW mode (ground-truth marking)
 ├── extract_candidates.py    # Phase 1: headless candidate extraction (for learn_ui)
 ├── race_ui.py               # Race review UI (timeline, lap timing, match candidates)
@@ -260,6 +261,29 @@ Instead of marking every gate in learn_ui, a track can be learned from a few unr
 | learned, but only 6 images per gate | 97.2% |
 
 The learned leg durations match the reviewed ones: G5→6 4.74 s vs 4.84 s, G9→10 0.54 s vs 0.55 s. The learned timing alone is as good as the taught timing. The remaining gap is images, and adding more videos to `learn_videos/` adds more.
+
+---
+
+## 🏁 Race day (`race_day_app.py`)
+
+Runs a race day from the director's 2×2 HDMI output (4 pilot feeds, 1080p) with no input after setup. The full plan and results are in `docs/RACE_DAY_PLAN.md`.
+
+```bash
+python race_day_app.py
+```
+
+- **Live track:**
+  - **Setup:** a track name, the number of gates, the channel layout (default R1 R3 / R6 R8) and the capture card.
+  - **Recording:** every channel is recorded when its feed is live (not gray, not static). Runs of at least 40 s are saved, video and data. A run ends after 10 s of gray, or 45 s while others in the heat still fly, so a crash doesn't cut it.
+  - **Learning:** the track is learned from the first 24 runs.
+  - **Results:** after that, every run is labelled (gates, laps) and gets stats. The track is re-learned every 12 runs.
+- **Replays:** a learned track plus 2×2 video files are cut into runs, analysed and shown. No learning, no recording.
+- **Dashboard:** a read-only web page on the local network (QR code in the app). It has pages for:
+  - results and leaderboard;
+  - each run (video with gate and lap marks, laps, section grid against the field);
+  - heats (synced videos, gap chart);
+  - pilots and the track.
+- **Analysis:** 4 GPU worker processes, one per channel. Results are identical to the CPU pipeline, 3–4× faster.
 
 ---
 

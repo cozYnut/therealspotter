@@ -1,0 +1,51 @@
+:root{--bg:#0b0f17;--panel:#141a26;--panel2:#1b2232;--text:#e8edf6;--muted:#8a96ad;--line:#2a3347;
+--accent:#4da3ff;--good:#3ecf8e;--ok:#f5c451;--bad:#ff6b6b;--live:#ff3b5c}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+a{color:var(--accent);text-decoration:none}
+header{position:sticky;top:0;z-index:5;background:rgba(11,15,23,.95);backdrop-filter:blur(6px);border-bottom:1px solid var(--line);
+padding:10px 16px;display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;justify-content:space-between}
+.brand{font-weight:700;font-size:18px;display:flex;gap:8px;align-items:center}
+.brand a{color:var(--text)}
+nav a{margin-left:14px;font-weight:600}
+.badge{font-size:12px;font-weight:600;padding:2px 8px;border-radius:999px;background:var(--panel2);color:var(--muted)}
+.badge.learn{background:#3a2f0b;color:var(--ok)}.badge.result{background:#0d3324;color:var(--good)}
+.live{display:flex;gap:6px;flex-wrap:wrap}
+.chip{font-size:12px;padding:3px 8px;border-radius:8px;background:var(--panel);border:1px solid var(--line);white-space:nowrap}
+.chip.on{border-color:var(--live);color:#fff}.chip.on::before{content:"● ";color:var(--live)}
+.chip.drop{border-color:var(--ok)}
+main{max-width:1100px;margin:0 auto;padding:16px}
+h1{font-size:22px;margin:4px 0 12px}h2{font-size:17px;margin:22px 0 10px;color:var(--muted);font-weight:600}
+.muted{color:var(--muted)}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:14px}
+.grid{display:grid;gap:12px}.cards{grid-template-columns:repeat(auto-fill,minmax(230px,1fr))}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px;color:var(--text);display:block}
+.card:hover{border-color:var(--accent)}
+.card .who{font-weight:700;font-size:16px}.card .meta{color:var(--muted);font-size:12px}
+.big{font-size:28px;font-weight:800;font-variant-numeric:tabular-nums}
+.facts{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px}
+.fact{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px}
+.fact .k{font-size:12px;color:var(--muted)}.fact .v{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th,td{padding:7px 8px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+th{color:var(--muted);font-weight:600;font-size:12px;cursor:pointer;user-select:none}
+tr.best td{color:var(--good);font-weight:700}
+tr.click{cursor:pointer}tr.click:hover td{background:var(--panel2)}
+.scroll{overflow-x:auto}
+.good{color:var(--good)}.bad{color:var(--bad)}.ok{color:var(--ok)}
+.pill{display:inline-block;font-size:11px;padding:1px 7px;border-radius:999px;background:var(--panel2);margin-right:4px}
+.pill.good{background:#0d3324}.pill.ok{background:#3a2f0b}.pill.bad{background:#3d1418}
+.progress{height:14px;background:var(--panel2);border-radius:999px;overflow:hidden}
+.progress>div{height:100%;background:linear-gradient(90deg,var(--accent),var(--good))}
+video{width:100%;max-height:60vh;background:#000;border-radius:10px}
+svg{display:block;width:100%}
+.lapbar{display:flex;height:34px;border-radius:8px;overflow:hidden;border:1px solid var(--line)}
+.lapbar div{display:flex;align-items:center;justify-content:center;font-size:11px;border-right:1px solid var(--bg);overflow:hidden}
+.gates{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px}
+.gate img{width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:8px;background:#000}
+.quad{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.quad video{max-height:none}
+.cell{padding:5px 6px;text-align:center;border-radius:4px}
+.btn{display:inline-block;background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:6px 12px;font-weight:600;cursor:pointer}
+@media (max-width:600px){main{padding:10px}.big{font-size:24px}th,td{padding:6px 5px}}

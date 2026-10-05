@@ -1,0 +1,117 @@
+"""
+Race-day statistics.
+
+run_stats(race, meta, n)  one run: laps, lap times, consistency, section
+                          (gate-to-gate leg) times, theoretical best,
+                          holeshot, missed gates, run ended mid-lap
+field_stats(all_stats)    across the track's runs: per-section median and
+                          best, lap median — the "field" each run and pilot
+                          is compared with
+"""
+
+from statistics import median
+from typing import Dict, List, Optional
+
+import numpy as np
+
+
+def _sections(n: int) -> List[str]:
+    return [f"G{g}→G{g % n + 1}" for g in range(1, n + 1)]
+
+
+def run_stats(race: dict, meta: dict, n: int) -> dict:
+    passes = sorted([p for p in race.get("passes", []) if p.get("gate_id", -1) >= 1], key=lambda p: p["t"])
+    laps = race.get("laps", [])
+    lap_times = [round(l["dt"], 3) for l in laps]
+    # every leg flown gate g → g+1 (consecutive passes), with the lap it belongs to
+    lap_of = lambda t: next((i for i, l in enumerate(laps) if l["t0"] <= t < l["t1"]), None)
+    legs: Dict[int, List[float]] = {g: [] for g in range(1, n + 1)}
+    grid = [[None] * n for _ in laps]                 # laps × sections
+    missed = []
+    for a, b in zip(passes, passes[1:]):
+        step = (b["gate_id"] - a["gate_id"]) % n
+        if step == 1:
+            dt = round(b["t"] - a["t"], 3)
+            legs[a["gate_id"]].append(dt)
+            li = lap_of(a["t"])
+            if li is not None:
+                grid[li][a["gate_id"] - 1] = dt
+        elif step > 1:
+            missed += [{"gate": (a["gate_id"] + k - 1) % n + 1, "t": round(a["t"], 2)} for k in range(1, step)]
+    best_leg = {g: min(v) for g, v in legs.items() if v}
+    live_start = float(meta.get("live_start_s", 0.0))
+    last_lap_end = laps[-1]["t1"] if laps else None
+    ended_mid_lap = bool(laps) and any(p["t"] > last_lap_end + 0.05 for p in passes) and passes[-1]["gate_id"] != 1
+    best3 = None
+    if len(lap_times) >= 3:
+        best3 = round(min(sum(lap_times[i:i + 3]) for i in range(len(lap_times) - 2)), 3)
+    return {
+        "n_gates": n,
+        "sections": _sections(n),
+        "passes": len(passes),
+        "laps": len(laps),
+        "lap_times": lap_times,
+        "best_lap": min(lap_times) if lap_times else None,
+        "best_lap_index": int(np.argmin(lap_times)) if lap_times else None,
+        "mean_lap": round(float(np.mean(lap_times)), 3) if lap_times else None,
+        "median_lap": round(float(np.median(lap_times)), 3) if lap_times else None,
+        "lap_sd": round(float(np.std(lap_times)), 3) if len(lap_times) >= 2 else None,
+        "lap_cv": round(float(np.std(lap_times) / np.mean(lap_times)), 4) if len(lap_times) >= 2 else None,
+        "best3": best3,
+        "section_best": [best_leg.get(g) for g in range(1, n + 1)],
+        "section_median": [round(float(np.median(legs[g])), 3) if legs[g] else None for g in range(1, n + 1)],
+        "section_grid": grid,
+        "theoretical_best": round(sum(best_leg.values()), 3) if len(best_leg) == n else None,
+        "holeshot": round(passes[0]["t"] - live_start, 2) if passes else None,
+        "first_gate": passes[0]["gate_id"] if passes else None,
+        "flight_time": round(passes[-1]["t"] - passes[0]["t"], 2) if len(passes) >= 2 else None,
+        "missed_gates": missed,
+        "ended_mid_lap": ended_mid_lap,
+    }
+
+
+def field_stats(all_stats: List[dict]) -> dict:
+    """The field: per-section median and best over every run's legs, lap median."""
+    if not all_stats:
+        return {}
+    n = all_stats[0]["n_gates"]
+    sec_all = [[] for _ in range(n)]
+    laps = []
+    best = [None] * n
+    for s in all_stats:
+        laps += s["lap_times"]
+        for row in s["section_grid"]:
+            for i, v in enumerate(row):
+                if v is not None:
+                    sec_all[i].append(v)
+        for i, v in enumerate(s["section_best"]):
+            if v is not None and (best[i] is None or v < best[i]["time"]):
+                best[i] = {"time": v, "run": s.get("stem"), "pilot": s.get("pilot")}
+    best_lap = min(((x, s) for s in all_stats for x in s["lap_times"]), default=None, key=lambda z: z[0])
+    return {
+        "n_gates": n,
+        "sections": all_stats[0]["sections"],
+        "median_lap": round(median(laps), 3) if laps else None,
+        "best_lap": {"time": best_lap[0], "run": best_lap[1].get("stem"), "pilot": best_lap[1].get("pilot")}
+                    if best_lap else None,
+        "section_median": [round(median(v), 3) if v else None for v in sec_all],
+        "section_best": best,
+        "section_spread": [round(float(np.percentile(v, 90) - np.percentile(v, 10)), 3) if len(v) >= 3 else None
+                           for v in sec_all],
+        "runs": len(all_stats),
+    }
+
+
+def compare(run: dict, field: dict) -> dict:
+    """How a run compares with the field: speed index (field median lap ÷
+    this run's median lap, > 1 = faster) and per-section differences."""
+    out = {"speed_index": None, "section_vs_median": [], "section_vs_best": []}
+    if run.get("median_lap") and field.get("median_lap"):
+        out["speed_index"] = round(field["median_lap"] / run["median_lap"], 3)
+    for i in range(run["n_gates"]):
+        mine = run["section_best"][i]
+        med = field["section_median"][i] if field.get("section_median") else None
+        bst = (field.get("section_best") or [None] * run["n_gates"])[i]
+        out["section_vs_median"].append(round(mine - med, 3) if mine is not None and med else None)
+        out["section_vs_best"].append(round(mine - bst["time"], 3) if mine is not None and bst else None)
+    return out

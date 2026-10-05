@@ -83,9 +83,13 @@ def run_race_extraction(
     require_same_type: bool = False,
     pass_logic: str = "scorer",
     gate_id_logic: str = "sequence",
+    det_device: Optional[str] = None,
 ):
     print(f"Loading detector: {det_model_path}")
     det = YOLO(det_model_path)
+    # a Core ML model (.mlpackage) picks its own hardware; a .pt runs on det_device
+    # (Ultralytics' default is the CPU, even on Apple Silicon)
+    det_kw = {} if str(det_model_path).endswith(".mlpackage") or not det_device else {"device": det_device}
     names = _get_yolo_names(det)
     print(f"Classes: {list(names.values())}")
 
@@ -168,7 +172,7 @@ def run_race_extraction(
         frame_area = float(W * H)
 
         # ── YOLO ───────────────────────────────────────────────
-        res = det(frame, conf=det_conf, verbose=False, max_det=50)[0]
+        res = det(frame, conf=det_conf, verbose=False, max_det=50, **det_kw)[0]
         typed = []
         for b in res.boxes:
             x1, y1, x2, y2 = map(int, b.xyxy[0])
@@ -322,6 +326,7 @@ def run_race_extraction(
         "video": str(video_path),
         "gate_memory": str(gate_memory_path),
         "det_model": Path(det_model_path).name,
+        "det_device": "coreml" if str(det_model_path).endswith(".mlpackage") else (det_device or "cpu"),
         "duration": float(duration),
         "fps": float(fps),
         "total_frames": int(total_frames),
@@ -403,6 +408,7 @@ def main():
     parser.add_argument("--output",            default=None,  help="Output JSON (default: <track>/runs/<video>.race_data.json)")
     parser.add_argument("--det-conf",        type=float, default=0.25)
     parser.add_argument("--clip-device",     default="cpu",            help="cpu / mps / cuda")
+    parser.add_argument("--det-device",      default=None,  help="cpu / mps / cuda for a .pt detector (default: cpu)")
     parser.add_argument("--pass-offset-sec", type=float, default=0.0,
                         help="Shift pass event timestamps back by this many seconds to align "
                              "timeline ticks with the visual pass moment (default: 0.0)")
@@ -448,6 +454,7 @@ def main():
         require_same_type=args.require_same_type,
         pass_logic=args.pass_logic,
         gate_id_logic=args.gate_id,
+        det_device=args.det_device,
     )
 
 

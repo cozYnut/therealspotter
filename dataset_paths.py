@@ -12,6 +12,8 @@ data sorts together:
         memory_videos/               videos used to learn the gates
         test_videos/                 videos used only for scoring
         learn_videos/                unreviewed videos the track is learned from (learn_track.py)
+        videos/                      race_day: runs recorded live or cut from 2×2 replays
+        race_day.json                race_day: setup + state of the race day
         candidates/<video>.candidates.json   learn_ui candidate extraction
         candidates/<video>.crops/            candidate / Force Clip crops (memory images)
         runs/<video>.race_data.json          extract_race.py output
@@ -107,6 +109,15 @@ class TrackPaths:
     @property
     def test_videos(self) -> Path:
         return self.dir / "test_videos"
+
+    @property
+    def videos(self) -> Path:
+        # race_day: every run recorded (Live) or cut from a 2×2 file (Replays)
+        return self.dir / "videos"
+
+    @property
+    def race_day_state(self) -> Path:
+        return self.dir / "race_day.json"
 
     @property
     def learn_videos(self) -> Path:
