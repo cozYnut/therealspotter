@@ -22,11 +22,16 @@ re-estimated from those labels, and again until the labels stop changing
      each gate's images from the passes labelled with it;
   3. relabel every video with the pooled timing + appearance; repeat.
 
+Passes: a learn video's normal runs/<video>.race_data.json is used if it
+exists (its gate labels are ignored). Otherwise learn_track runs the pass
+analysis itself with a blank memory and saves runs/<video>.learn_passes.json
+— never race_data.json, so Review and race_ui don't load a run without gates.
+
 Outputs (track level):
   <track>/gate_memory.learned.json   gates in order with type and images
   <track>/gate_timing.learned.json   leg durations (log-normal per leg)
 
-    python learn_track.py track1 --gates 13
+    python learn_track.py track1 --gates 13          # analyses new learn videos first (YOLO, ~1.5 min each)
     python learn_track.py track1 --gates 13 --evaluate   # test on the reviewed videos
     python learn_track.py track1 --gates 13 --install    # also make it the track's gate_memory.json
 """
@@ -87,12 +92,50 @@ def lap_file(video: Path) -> Optional[Path]:
     return f if f.exists() else None
 
 
+VIDEO_EXT = {".mp4", ".mov", ".avi", ".mkv"}
+
+
+def learn_video_files(tp: TrackPaths) -> List[Path]:
+    return sorted(p for p in tp.learn_videos.glob("*") if p.suffix.lower() in VIDEO_EXT)
+
+
+def passes_file(tp: TrackPaths, stem: str) -> Optional[Path]:
+    """A normal run if there is one (gate labels are ignored), else the learn run."""
+    for p in (tp.race_data(stem), tp.learn_passes(stem)):
+        if p.exists():
+            return p
+    return None
+
+
+def analyse_learn_videos(tp: TrackPaths, n: int, det_model: str, clip_device: str):
+    """Find the passes of every learn video that has none yet. A blank
+    n-gate memory and greedy matching keep any taught track data out."""
+    todo = [f for f in learn_video_files(tp) if passes_file(tp, f.stem) is None]
+    if not todo:
+        return
+    import tempfile
+    from extract_race import run_race_extraction
+    blank = {"version": 2, "mode": "blank", "race_lookahead": 3, "expected_idx": 0, "max_embeds_per_gate": 6,
+             "memory": [{"order_idx": i, "gate_id": i + 1, "gate_type": "unknown", "embeds": [],
+                         "created_t": 0.0, "last_img": "", "embed_imgs": []} for i in range(n)]}
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tmp:
+        json.dump(blank, tmp)
+    try:
+        for i, f in enumerate(todo, 1):
+            print(f"  analysing {f.name} ({i}/{len(todo)})…")
+            tp.runs_dir.mkdir(parents=True, exist_ok=True)
+            run_race_extraction(str(f), det_model, tmp.name, str(tp.learn_passes(f.stem)),
+                                clip_device=clip_device, gate_id_logic="greedy")
+    finally:
+        Path(tmp.name).unlink(missing_ok=True)
+
+
 def load_learn_videos(tp: TrackPaths) -> Tuple[List[gd.VideoSeq], Dict[str, List[dict]]]:
     vids, raw = [], {}
-    for f in sorted(p for p in tp.learn_videos.glob("*") if not p.name.endswith(".laps.txt")):
-        rd = tp.race_data(f.stem)
-        if not rd.exists():
-            print(f"  {f.name}: no race_data — run extract_race.py on it first (skipped)")
+    for f in learn_video_files(tp):
+        rd = passes_file(tp, f.stem)
+        if rd is None:
+            print(f"  {f.name}: no passes found (skipped)")
             continue
         race = json.loads(rd.read_text(encoding="utf-8"))
         passes = sorted(race.get("passes", []), key=lambda p: p["t"])
@@ -243,6 +286,8 @@ def learn(videos: List[gd.VideoSeq], n: int, cfg: gd.Cfg, iters: int = 8, verbos
             print(f"  template from {stem:12} → score {score:9.1f}")
         if best is None or score > best[0]:
             best = (score, stem, m, labels)
+    if best is None:
+        raise SystemExit(f"Need at least one learn video with a full lap ({n + 1}+ passes) to learn from.")
     _, stem, m, labels = best
     if verbose:
         print(f"  using the template from {stem}")
@@ -337,11 +382,19 @@ def main():
     ap.add_argument("track")
     ap.add_argument("--gates", type=int, required=True, help="Number of gates on the track")
     ap.add_argument("--iters", type=int, default=8)
+    ap.add_argument("--det-model", default=str(Path(__file__).parent / "cyn_current-20260715_best.pt"),
+                    help="YOLO model for analysing new learn videos (use the one the pass scorer was trained on)")
+    ap.add_argument("--clip-device", default=None, help="cpu / mps / cuda (default: auto)")
     ap.add_argument("--evaluate", action="store_true", help="Score the learned track on the reviewed videos")
     ap.add_argument("--install", action="store_true",
                     help="Make the learned memory the track's gate_memory.json (the old one is kept as .bak)")
     args = ap.parse_args()
     tp = next(t for t in list_tracks() if t.dir.name == args.track)
+    if args.clip_device is None:
+        import torch
+        args.clip_device = "mps" if torch.backends.mps.is_available() else (
+            "cuda" if torch.cuda.is_available() else "cpu")
+    analyse_learn_videos(tp, args.gates, args.det_model, args.clip_device)
     videos, raw = load_learn_videos(tp)
     if not videos:
         ap.error(f"no analysed videos in {tp.learn_videos}")

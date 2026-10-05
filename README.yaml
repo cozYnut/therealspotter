@@ -234,9 +234,8 @@ python score.py track1 --include-incomplete --decoder   # full report with seque
 
 Instead of marking every gate in learn_ui, a track can be learned from a few unreviewed videos. You only give the number of gates. The first gate passed in every video is G1 (start/finish).
 
-1. Put the videos in `<track>/learn_videos/` and run the pass pipeline on each. A blank 13-gate memory keeps the taught one out:
-   `python extract_race.py --video "<track>/learn_videos/<video>.mp4" --det-model cyn_current-20260715_best.pt --gate-memory <blank 13-gate memory> --gate-id greedy`
-2. `python learn_track.py track1 --gates 13 --evaluate`
+1. Put the videos in `<track>/learn_videos/`, optionally with `<video>.laps.txt` lap times.
+2. `python learn_track.py track1 --gates 13 --evaluate`. A learn video without a run is analysed first, with a blank memory so taught track data can't leak in (about 1.5 min per video). The result is saved as `runs/<video>.learn_passes.json`, never `race_data.json`, so Review and race_ui never load a run without gate labels. A normal `race_data.json` is reused if it exists, because its gate labels are ignored.
 3. `python learn_track.py track1 --gates 13 --install` makes the learned memory the track's `gate_memory.json`. The old one is kept as `.bak`.
 
 **How it learns:**

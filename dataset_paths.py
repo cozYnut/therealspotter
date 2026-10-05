@@ -17,6 +17,7 @@ data sorts together:
         runs/<video>.race_data.json          extract_race.py output
         runs/<video>.race_query/             its query crops
         runs/<video>.motion.json             per-frame camera motion (extract_motion.py)
+        runs/<video>.learn_passes.json       passes of a learn video (learn_track.py, never shown in UIs)
         gt/<video>.gt.json                   reviewed marks (learn_ui REVIEW mode)
         velocidrone/                 same layout, for the sim version of the track
       training/                      shared YOLO data (gate_annotator)
@@ -138,6 +139,11 @@ class TrackPaths:
 
     def race_data(self, stem: str) -> Path:
         return self.runs_dir / f"{stem}.race_data.json"
+
+    def learn_passes(self, stem: str) -> Path:
+        # learn_track.py: passes of a learn video, found with no track knowledge.
+        # Kept apart from race_data.json so Review / race_ui never load them.
+        return self.runs_dir / f"{stem}.learn_passes.json"
 
     def motion(self, stem: str) -> Path:
         # extract_motion.py: per-frame camera motion from optical flow
