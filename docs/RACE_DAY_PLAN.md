@@ -18,7 +18,7 @@ It's doable with what exists:
 The new parts are capture, the race-day app, orchestration and the dashboard. The gate count is now typed in at setup, which removes the biggest unknown. The remaining risks:
 
 1. **Pass detection on unseen cameras and gates.** On USGQ2025 (HDZero, fisheye), pass recall was 89%, with most misses on two gate types. A race mixes analog, HDZero and DJI feeds. The decoder tolerates missed gates. Analog static and breakup are new, and must not be taken for a live feed.
-2. **Throughput.** Analysis takes about 1× real time per video on the current Mac. Four runs per heat means about 4× the heat's length of compute, so a queue can build up. The M5 should be faster; the dry run will measure it. If needed, the analysis can run at lower resolution or skip frames.
+2. **Throughput — measured, about 2× headroom.** YOLO is the only heavy step. Four live feeds at 30 fps need 120 detections/s. On the race laptop (M5 Pro, 24 GB), running the analysis in parallel with a Core ML copy of the detector gives up to 276/s (see *Parallel processing*). What remains is checking that the full pipeline gives the same results with Core ML.
 3. **The first runs must be good enough to learn from.** The track is learned from the first 24 runs of Live mode. Crashes or very short runs are filtered by the 40 s minimum, and the learning tolerates missed passes.
 
 ## Two modes (chosen when the app starts)
@@ -79,7 +79,7 @@ race_day.py (desktop app: mode, setup, live view, progress)
 - **Heats:** runs that are live at the same time form one heat. The heat number and pilot names come from the website's heat info.
 - **Pilot and heat info** (`race_day/pilots.py`): an interface `heat_info(time) → {heat, round, {channel: pilot}}`. The fril provider is implemented later (there will be internet). **Without internet or data**, names are a sequence: heat number plus channel, e.g. `H12-R1`, `H12-R3`.
 - **Controller** (`race_day/controller.py`):
-  - **One queue worker:** analyse a run, then label it and compute its stats, in order.
+  - **Parallel workers:** one analysis process per channel (see *Parallel processing*). A run is analysed, then labelled and its stats computed. A heat's 4 runs are analysed at the same time.
   - **Live:** the state is `learn` until 24 runs are analysed. Then it learns the track with the gate count from setup, installs the result, relabels all runs and switches to `result`. Re-learning happens every K new runs.
   - **Replays:** label with the existing learned track; no learning.
   - **Resumable:** everything restarts from `race_day.json` after a crash or restart, so nothing is lost.
@@ -89,6 +89,30 @@ race_day.py (desktop app: mode, setup, live view, progress)
   - **speed vs the field** (per-section time against the field median, plus an overall speed index), rank per section;
   - **holeshot** (time to the first gate, G1), missed or skipped gates, crash or run-ended-early flags;
   - progression across a pilot's runs.
+
+## Parallel processing (run time)
+
+The 4 runs of a heat are analysed **at the same time**, not one after another.
+
+**Measured on the race laptop (Apple M5 Pro, 24 GB), YOLO detections per second:**
+
+| Setup | Detections/s | 4 live feeds at 30 fps need 120/s |
+|---|---|---|
+| 1 process, GPU (today's pipeline) | 51 | no, about 0.4× real time |
+| 4 processes, all GPU | 105 | almost |
+| 1 process, Core ML (Neural Engine) | 104 | — |
+| 4 processes, all Core ML | 210 | yes, about 1.75× |
+| **2 Core ML + 2 GPU processes** | **276** | **yes, about 2.3×** |
+
+The Core ML model is the same detector converted once for Apple's Neural Engine. It found the same boxes as the `.pt` model on 60 of 60 test frames. Mixing Neural Engine and GPU processes is fastest, because two different chips work at once. Everything else per frame (decoding at about 1,770 frames/s, optical flow, tracker, pass logic, CLIP only at pass candidates) is light and spreads over the CPU cores. Labelling gates and laps, and learning the track, take seconds.
+
+**Design:**
+- **Core ML model:** converted automatically from the `.pt` on first use and kept in `FPVdatasets/training/` with the `.pt` name. It's only used once `score.py` gives the same results with it on the reviewed videos; otherwise it falls back to the GPU.
+- **One worker process per channel** (4 in total), each with its own copy of the models: 2 on the Neural Engine, 2 on the GPU. About 3–4 GB of memory in total.
+- **Live, version 1:** when a heat's runs are saved, the 4 are analysed in parallel. Results are ready about 1 minute after the heat ends, before the next heat. Learning (after 24 runs) and re-learning run between heats.
+- **Live, version 2 (later, if wanted):** each feed is analysed *while it's flown*. Frames go to the channel's worker as they arrive, so results appear a few seconds after landing. This needs `extract_race` turned into a frame-by-frame analyser. It's only worth it once version 1 works.
+- **Replays:** each 2×2 file is decoded once and split, and its 4 channels are analysed in parallel. That's about 2× faster than real time.
+- **The desktop app** shows each worker's progress, and warns if analysis falls behind the capture.
 
 ## Desktop app — `race_day.py` (operator)
 
@@ -148,12 +172,13 @@ A local web server started by `race_day.py`. Anyone on the same Wi-Fi opens it o
 |---|---|---|
 | 0 | This plan in `docs/RACE_DAY_PLAN.md`, committed | in the repo, open for edits |
 | 1 | `race_day.py` skeleton: start screen, Live / Replays setup, track folder and `race_day.json`, channel layout | both modes can be opened and set up, and settings are saved per track |
+| 1b | Core ML detector + one worker process per channel | `score.py` results on the reviewed videos are the same with Core ML; 4 runs analysed in parallel at ≥ 2× real time |
 | 2 | Splitter and run detector, plus a 2×2 test-video maker (from existing videos, with gray gaps and static) | from a test 2×2 file, exactly the runs ≥ 40 s are saved (video + data) under the right channels, with no gray or static |
 | 3 | Controller: queue, Live learn → result after 24 runs, relabel, re-learn; Replays with the existing learned track | a simulated Live day runs unattended and survives a restart; Replays analyses added files |
 | 4 | Stats | numbers match the reviewed videos (lap times = reviewed G1 times) |
 | 5 | Browser dashboard (read-only, open track only, phone replay) | a simulated event shows live on a laptop and a phone, and runs play on the phone |
 | 6 | Heat and pilot info from the website, with sequential naming as the fallback | names and heats per run, with and without internet |
-| 7 | Dry run on the M5 with the real capture card | real-time throughput measured, race-day checklist written |
+| 7 | Dry run on the M5 with the real capture card | a full simulated heat analysed within about 1 minute of ending, race-day checklist written |
 
 ## Decided
 - **Capture:** 1080p, no borders, no overlays.
@@ -165,6 +190,7 @@ A local web server started by `race_day.py`. Anyone on the same Wi-Fi opens it o
 - **Run end:** about 10 s of gray, not 3 s.
 - **Saving:** both video and data.
 - **Learning:** only in Live mode.
+- **Laptop speed:** the M5 Pro analyses 4 feeds at about 2× real time with Core ML + GPU workers (measured).
 
 ## Open questions
 - **Channel layout:** confirm the default reading order (is R1 top-left or top-right?).
