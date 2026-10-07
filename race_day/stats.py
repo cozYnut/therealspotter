@@ -19,9 +19,15 @@ def _sections(n: int) -> List[str]:
     return [f"G{g}→G{g % n + 1}" for g in range(1, n + 1)]
 
 
-def run_stats(race: dict, meta: dict, n: int) -> dict:
+def run_stats(race: dict, meta: dict, n: int, window=None) -> dict:
+    """window = [t0, t1] (video seconds): only that part counts — a video that
+    also covers a restarted (void) attempt of the heat."""
     passes = sorted([p for p in race.get("passes", []) if p.get("gate_id", -1) >= 1], key=lambda p: p["t"])
     laps = race.get("laps", [])
+    if window:
+        w0, w1 = window
+        passes = [p for p in passes if w0 <= p["t"] <= w1]
+        laps = [l for l in laps if l["t0"] >= w0 and l["t1"] <= w1]
     lap_times = [round(l["dt"], 3) for l in laps]
     # every leg flown gate g → g+1 (consecutive passes), with the lap it belongs to
     lap_of = lambda t: next((i for i, l in enumerate(laps) if l["t0"] <= t < l["t1"]), None)
@@ -39,7 +45,7 @@ def run_stats(race: dict, meta: dict, n: int) -> dict:
         elif step > 1:
             missed += [{"gate": (a["gate_id"] + k - 1) % n + 1, "t": round(a["t"], 2)} for k in range(1, step)]
     best_leg = {g: min(v) for g, v in legs.items() if v}
-    live_start = float(meta.get("live_start_s", 0.0))
+    live_start = max(float(meta.get("live_start_s", 0.0)), window[0] if window else 0.0)
     last_lap_end = laps[-1]["t1"] if laps else None
     ended_mid_lap = bool(laps) and any(p["t"] > last_lap_end + 0.05 for p in passes) and passes[-1]["gate_id"] != 1
     best3 = None

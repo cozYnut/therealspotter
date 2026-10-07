@@ -77,7 +77,16 @@ race_day.py (desktop app: mode, setup, live view, progress)
   - **dropouts:** a feed must stay gray for **about 10 s** before the run counts as ended, so analog breakups or a reboot don't split one run in two. **While other pilots of the heat are still flying, it waits up to 45 s**, because a crash with a video blackout mid-heat must not cut the run. Q25 Maman's video goes blank for 15 s during a crash;
   - **saving:** a run of **≥ 40 s** is kept — **the video file and its data** (`<run>.mp4` + `<run>.meta.json` with channel, start/end time, heat, pilot). Shorter runs are discarded.
 - **Heats:** runs that are live at the same time form one heat. The heat number and pilot names come from the website's heat info.
-- **Pilot and heat info** (`race_day/pilots.py`): an interface `heat_info(time) → {heat, round, {channel: pilot}}`. The fril provider is implemented later (there will be internet). **Without internet or data**, names are a sequence: heat number plus channel, e.g. `H12-R1`, `H12-R3`.
+- **Restarted heats (attempts).** A heat (stage + round + race) can be flown more than once. Tested on a session with Qualifying Race 3 run twice:
+  - From fril's `phase`, each time a heat becomes `running` an attempt starts. It ends **completed** at `finished`, or **abandoned** if another heat replaces it first or it's reset.
+  - Per heat, **the latest completed attempt is official**, and earlier attempts are **void** — the same rule as fril, which keeps only the last result.
+  - Runs are matched to attempts by time on our own clock. **Void runs keep their video and data on disk, are still used for learning, and are hidden completely from the dashboard** (lists, pages, comparisons and video).
+  - A video that covers both attempts, because the drone stayed powered, is kept whole. Only its official part counts in the stats.
+  - Labels read "Stage · Round · Race", because each stage restarts at Round 1 · Race 1.
+- **Pilot and heat info** (`race_day/pilots.py`):
+  - `FrilLiveProvider` polls `https://fril.co.il/api/live/state`, the public API the fril live page reads, every 2 s. It reads `currentHeat.round`, `currentHeat.race`, and each pilot's `pilotName` and `channel` {band, number}, which maps onto the 2×2 layout. The layout's channel names must match the channels set in the timing system.
+  - Only that API is used. It needs a named User-Agent; Cloudflare refuses Python's default.
+  - The provider is used in Live mode, and can be switched off in setup. **Without internet or data**, names are a sequence: heat number plus channel, e.g. `H012-R1`.
 - **Controller** (`race_day/controller.py`):
   - **Parallel workers:** one analysis process per channel (see *Parallel processing*). A run is analysed, then labelled and its stats computed. A heat's 4 runs are analysed at the same time.
   - **Live:** the state is `learn` until 24 runs are analysed. Then it learns the track with the gate count from setup, installs the result, relabels all runs and switches to `result`. Re-learning happens every K new runs.
@@ -189,7 +198,7 @@ A local web server started by `race_day.py`. Anyone on the same Wi-Fi opens it o
 | 3 | ✅ Controller: queue, Live learn → result after 24 runs, relabel, re-learn; Replays with the existing learned track | a simulated Live day runs unattended and survives a restart; Replays analyses added files |
 | 4 | ✅ Stats | numbers match the reviewed videos (lap times = reviewed G1 times) |
 | 5 | ✅ Browser dashboard (read-only, open track only, phone replay) | a simulated event shows live on a laptop and a phone, and runs play on the phone |
-| 6 | Heat and pilot info from the website (⏳ the provider interface and sequential naming are done; the fril provider is still to do) | names and heats per run, with and without internet |
+| 6 | ✅ Heat and pilot info from the website: `GET https://fril.co.il/api/live/state` only, polled every 2 s — round, race, and each pilot's name and channel (Raceband 1 → `R1`). Asked when a heat starts and again when each run ends, since the timing PC may load the heat late. Falls back to `H012-R3` names without internet or data. | names and heats per run, with and without internet |
 | 7 | Dry run on the M5 with the real capture card | a full simulated heat analysed within about 1 minute of ending, race-day checklist written |
 
 ## How to run (implemented)

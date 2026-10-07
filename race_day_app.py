@@ -25,7 +25,7 @@ import numpy as np
 from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QImage, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox,
+    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox,
     QHBoxLayout, QLabel, QListWidget, QMainWindow, QMessageBox, QPushButton, QSpinBox,
     QStackedWidget, QVBoxLayout, QWidget,
 )
@@ -34,6 +34,7 @@ from dataset_paths import TrackPaths, data_root, list_tracks
 from race_day import labeling
 from race_day.capture import QUADS, DeviceSource, FileSource
 from race_day.controller import DayConfig, RaceDay
+from race_day.pilots import FrilLiveProvider
 from race_day.server import Dashboard
 
 CHANNELS = [f"{b}{i}" for b in "RFEAL" for i in range(1, 9)]
@@ -150,6 +151,9 @@ class LiveSetupPage(QWidget):
         form.addRow("Track", self.track)
         form.addRow("Number of gates", self.gates)
         form.addRow("Capture device", self.device)
+        self.fril = QCheckBox("Pilot names, round and race from fril.co.il live")
+        self.fril.setChecked(True)
+        form.addRow("", self.fril)
         v.addLayout(form)
         self.layout_ed = LayoutEditor()
         v.addWidget(self.layout_ed)
@@ -202,6 +206,7 @@ class LiveSetupPage(QWidget):
             self.end_gray.setValue(cfg.get("end_gray_s", 10))
             self.learn_runs.setValue(cfg.get("learn_runs", 24))
             self.relearn.setValue(cfg.get("relearn_every", 12))
+            self.fril.setChecked(cfg.get("fril_live", True))
 
     def _preview(self):
         d = self.device.currentData()
@@ -238,7 +243,8 @@ class LiveSetupPage(QWidget):
                 return QMessageBox.critical(self, "Capture device", str(e))
         cfg = DayConfig(mode="live", n_gates=self.gates.value(), layout=self.layout_ed.get(),
                         min_run_s=self.min_run.value(), end_gray_s=self.end_gray.value(),
-                        learn_runs=self.learn_runs.value(), relearn_every=self.relearn.value())
+                        learn_runs=self.learn_runs.value(), relearn_every=self.relearn.value(),
+                        fril_live=self.fril.isChecked())
         self.win.start_day(TrackPaths(data_root() / name), cfg, live_source=source)
 
 
@@ -317,7 +323,7 @@ class ReplaySetupPage(QWidget):
         self.win.start_day(tp, cfg, replay_files=files)
 
 
-def _pixmap(frame: np.ndarray, w: int, h: int, layout=None, status=None) -> QPixmap:
+def _pixmap(frame: np.ndarray, w: int, h: int, layout=None, status=None, names=None) -> QPixmap:
     img = frame.copy()
     H, W = img.shape[:2]
     if layout:
@@ -329,6 +335,10 @@ def _pixmap(frame: np.ndarray, w: int, h: int, layout=None, status=None) -> QPix
             col = {"live": (60, 60, 255), "dropout": (0, 190, 255)}.get(state, (180, 180, 180))
             cv2.rectangle(img, (x + 10, y + 10), (x + 30 + 24 * len(text), y + 70), (0, 0, 0), -1)
             cv2.putText(img, text, (x + 20, y + 55), cv2.FONT_HERSHEY_SIMPLEX, 1.4, col, 3, cv2.LINE_AA)
+            name = (names or {}).get(ch.replace(" ", "").upper())
+            if name:
+                cv2.rectangle(img, (x + 10, y + 74), (x + 30 + 24 * len(name), y + 130), (0, 0, 0), -1)
+                cv2.putText(img, name, (x + 20, y + 118), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (255, 255, 255), 3, cv2.LINE_AA)
         cv2.line(img, (W // 2, 0), (W // 2, H), (40, 40, 40), 2)
         cv2.line(img, (0, H // 2), (W, H // 2), (40, 40, 40), 2)
     rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -406,9 +416,10 @@ class RunningPage(QWidget):
             return
         st = day.status()
         live = st.get("live", {})
+        pi = st.get("pilot_info") or {}
         if self.frame is not None:
             self.preview.setPixmap(_pixmap(self.frame, self.preview.width(), self.preview.height(),
-                                           day.cfg.layout, live.get("channels")))
+                                           day.cfg.layout, live.get("channels"), pi.get("pilots")))
         if st["phase"] == "learn":
             n, need = st["learn_progress"]
             self.phase.setText(f"Learning the track\n{n} / {need} runs")
@@ -424,6 +435,18 @@ class RunningPage(QWidget):
                  + (f" · failed: {by['failed']}" if by.get("failed") else "")]
         if live.get("heat"):
             lines.append(f"Heat {live['heat']} in the air")
+        if pi.get("source") == "fril":
+            if not pi.get("reachable"):
+                lines.append(f"fril live: <span style='color:#e55'>not reachable</span> — pilots named by heat and channel"
+                             + (f" ({pi['error']})" if pi.get("error") else ""))
+            elif pi.get("round") is None:
+                lines.append("fril live: reachable, no heat loaded yet")
+            else:
+                heat_txt = " · ".join(x for x in (pi.get("stage"), f"Round {pi['round']}", f"Race {pi.get('race', '–')}") if x)
+                names = ", ".join(f"{c} {n}" for c, n in sorted(pi.get("pilots", {}).items())) or "no pilots"
+                lines.append(f"fril live: <b>{heat_txt}</b> — {pi.get('phase') or '?'} — {names}")
+        if st.get("void_runs"):
+            lines.append(f"{st['void_runs']} run(s) kept as void (restarted race) — saved, hidden from the dashboard")
         for p, f in st.get("replay_files", {}).items():
             lines.append(f"{Path(p).name}: {f['status']} ({f['runs']} runs)")
         if st.get("error"):
@@ -463,7 +486,9 @@ class Main(QMainWindow):
 
     def start_day(self, tp: TrackPaths, cfg: DayConfig, live_source=None, replay_files=None):
         try:
-            self.day = RaceDay(tp, cfg, log=lambda s: self.bridge.log.emit(time.strftime("%H:%M:%S  ") + s))
+            provider = FrilLiveProvider() if cfg.mode == "live" and cfg.fril_live else None
+            self.day = RaceDay(tp, cfg, provider=provider,
+                               log=lambda s: self.bridge.log.emit(time.strftime("%H:%M:%S  ") + s))
             self.day.on_preview = lambda f: self.bridge.preview.emit(f)
             self.day.start()
         except Exception as e:

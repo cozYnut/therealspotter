@@ -70,9 +70,19 @@ class DataView:
             self._cache[path] = (mt, data)
         return data
 
-    def all_stats(self):
+    def visible_runs(self):
+        """Every run except void ones (an earlier attempt of a restarted heat):
+        those are kept on disk but never shown."""
         with self.day.lock:
-            runs = list(self.day.state["runs"].values())
+            return [dict(r) for r in self.day.state["runs"].values() if not r.get("void")]
+
+    def visible(self, stem: str) -> bool:
+        with self.day.lock:
+            r = self.day.state["runs"].get(stem)
+            return bool(r) and not r.get("void")
+
+    def all_stats(self):
+        runs = self.visible_runs()
         out = []
         for r in runs:
             if r["status"] == "labelled":
@@ -87,8 +97,7 @@ class DataView:
     def runs(self):
         field = self.field()
         stats = {s["stem"]: s for s in self.all_stats()}
-        with self.day.lock:
-            runs = [dict(r) for r in self.day.state["runs"].values()]
+        runs = self.visible_runs()
         out = []
         for r in sorted(runs, key=lambda r: r.get("recorded_at", 0), reverse=True):
             st = stats.get(r["stem"])
@@ -102,8 +111,7 @@ class DataView:
         return out
 
     def run(self, stem: str):
-        with self.day.lock:
-            r = dict(self.day.state["runs"].get(stem) or {})
+        r = next((x for x in self.visible_runs() if x["stem"] == stem), None)
         if not r:
             return None
         st = self._json(self.tp.runs_dir / f"{stem}.stats.json")
@@ -113,20 +121,24 @@ class DataView:
         r["compare"] = rstats.compare(st, field) if st else None
         r["field"] = field
         r["passes"] = [{"t": p["t"], "gate": p.get("gate_id", -1)} for p in race.get("passes", [])]
-        r["lap_marks"] = [{"lap": l["lap"], "t0": l["t0"], "t1": l["t1"]} for l in race.get("laps", [])]
+        w = r.get("window") or [float("-inf"), float("inf")]
+        r["lap_marks"] = [{"lap": l["lap"], "t0": l["t0"], "t1": l["t1"]} for l in race.get("laps", [])
+                          if l["t0"] >= w[0] and l["t1"] <= w[1]]
         r["video_url"] = f"/video/{stem}.mp4"
         return r
 
     def heat(self, n: int):
+        runs = [r for r in self.visible_runs() if r["heat"] == n]
         with self.day.lock:
-            runs = [dict(r) for r in self.day.state["runs"].values() if r["heat"] == n]
             heat = dict(self.day.state["heats"].get(str(n)) or {})
         out = []
         for r in sorted(runs, key=lambda r: r["quad"]):
             race = self._json(self.tp.race_data(r["stem"])) or {}
             st = self._json(self.tp.runs_dir / f"{r['stem']}.stats.json")
-            r["passes"] = [{"t": p["t"] - r["live_start_s"], "gate": p["gate_id"]}
-                           for p in race.get("passes", []) if p.get("gate_id", -1) >= 1]
+            w = r.get("window") or [float("-inf"), float("inf")]
+            off = max(r["live_start_s"], w[0]) if r.get("window") else r["live_start_s"]
+            r["passes"] = [{"t": p["t"] - off, "gate": p["gate_id"]} for p in race.get("passes", [])
+                           if p.get("gate_id", -1) >= 1 and w[0] <= p["t"] <= w[1]]
             r["stats"] = st
             r["video_url"] = f"/video/{r['stem']}.mp4"
             out.append(r)
@@ -245,6 +257,8 @@ def make_handler(view: DataView):
                     return self._json(view.track())
                 if p.startswith("/video/"):
                     name = Path(p).name
+                    if not view.visible(Path(name).stem):          # void runs aren't served
+                        return self._send(404, b"not found", "text/plain")
                     return self._file(view.tp.videos / name)
                 if p == "/img":
                     q = urllib.parse.parse_qs(u.query).get("p", [""])[0]

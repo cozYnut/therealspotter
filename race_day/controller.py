@@ -24,7 +24,7 @@ from dataset_paths import TrackPaths
 from race_day import labeling, stats as rstats
 from race_day.capture import CaptureConfig, CaptureSession, FileSource, RunInfo
 from race_day.models import DEFAULT_DET_MODEL
-from race_day.pilots import HeatInfoProvider, pilot_name
+from race_day.pilots import AttemptTracker, HeatInfoProvider, norm_channel, pilot_name
 
 
 @dataclass
@@ -39,6 +39,7 @@ class DayConfig:
     det_model: str = str(DEFAULT_DET_MODEL)
     workers: int = 4
     use_coreml: bool = False              # Core ML was less accurate on reviewed videos
+    fril_live: bool = True                # Live: pilot names, round and race from fril.co.il/api/live/state
     clip_device: str = "mps"
 
 
@@ -53,15 +54,17 @@ class RaceDay:
         self.events: "queue.Queue" = queue.Queue()
         self.state = {"track": tp.dir.name, "mode": cfg.mode, "config": asdict(cfg), "phase": "learn",
                       "learned_from": [], "learned_at": None, "runs": {}, "heats": {}, "discarded": 0,
-                      "replay_files": {}}
+                      "replay_files": {}, "attempts": []}
         if tp.race_day_state.exists():
             saved = json.loads(tp.race_day_state.read_text(encoding="utf-8"))
-            for k in ("runs", "heats", "learned_from", "learned_at", "discarded", "replay_files", "phase"):
+            for k in ("runs", "heats", "learned_from", "learned_at", "discarded", "replay_files", "phase", "attempts"):
                 if k in saved:
                     self.state[k] = saved[k]
         if cfg.mode == "replays" or labeling.is_learned(tp):
             if labeling.is_learned(tp):
                 self.state["phase"] = "result"
+        if hasattr(self.provider, "tracker") and self.state["attempts"]:
+            self.provider.tracker = AttemptTracker(self.state["attempts"])   # resume: keep attempt numbering
         self.live: dict = {}                       # capture status (channels, heat)
         self.pool = None
         self.capture: Optional[CaptureSession] = None
@@ -111,6 +114,7 @@ class RaceDay:
         self.events.put(("stop",))
         if self.pool:
             self.pool.shutdown(wait=False)
+        self.provider.stop()
         self._save()
 
     def _next_heat(self) -> int:
@@ -179,6 +183,7 @@ class RaceDay:
             info = None
         with self.lock:
             self.state["heats"][str(heat)] = {"heat": heat, "wall_start": wall, "info": info,
+                                              "round": (info or {}).get("round"), "race": (info or {}).get("race"),
                                               "source": getattr(self, "_current_file", "live")}
         self._save()
 
@@ -190,10 +195,21 @@ class RaceDay:
             self.log(f"{info.stem}: {info.live_s:.0f}s — too short, discarded")
             return
         with self.lock:
-            heat = self.state["heats"].get(str(info.heat), {})
+            heat = self.state["heats"].setdefault(str(info.heat), {"heat": info.heat, "info": None})
+        if not (heat.get("info") or {}).get("pilots"):
+            # the timing PC may load the heat only after the drones are live — ask again
+            try:
+                late = self.provider.heat_info(time.time(), list(self.cfg.layout))
+            except Exception:
+                late = None
+            if late:
+                with self.lock:
+                    heat.update(info=late, round=late.get("round"), race=late.get("race"))
+        with self.lock:
             self.state["runs"][info.stem] = {
                 "stem": info.stem, "heat": info.heat, "channel": info.channel, "quad": info.quad,
                 "pilot": pilot_name(heat.get("info"), info.heat, info.channel),
+                "round": heat.get("round"), "race": heat.get("race"),
                 "wall_start": info.wall_start, "live_start_s": info.live_start_s, "live_s": info.live_s,
                 "video": Path(info.video).name, "source": info.source, "status": "recorded",
                 "recorded_at": time.time()}
@@ -201,8 +217,10 @@ class RaceDay:
                 for p, f in self.state["replay_files"].items():
                     if Path(p).name == info.source:
                         f["runs"] += 1
+        self._sync_attempts(force=True)
         self._save()
-        self.log(f"{info.stem}: {info.live_s:.0f}s saved")
+        r = self.state["runs"][info.stem]
+        self.log(f"{info.stem}: {info.live_s:.0f}s saved" + (f" — {r['pilot']}, {r['heat_label']}" if r.get("heat_label") else ""))
         self._submit(info.stem)
 
     # ── analysis ───────────────────────────────────────────────
@@ -216,7 +234,16 @@ class RaceDay:
 
     def _loop(self):
         while True:
-            ev = self.events.get()
+            try:
+                ev = self.events.get(timeout=2.0)
+            except queue.Empty:
+                if self.provider.changed:          # a heat started/finished/was restarted
+                    try:
+                        self._sync_attempts()
+                    except Exception:
+                        self.log(traceback.format_exc())
+                    self._save()
+                continue
             if ev[0] == "stop":
                 break
             try:
@@ -276,15 +303,68 @@ class RaceDay:
             self._label(s)
 
     def _label(self, stem: str):
+        labeling.label_run(self.tp, stem)
+        self._stats(stem)
+
+    def _stats(self, stem: str):
+        """Stats of a labelled run — only its official part when the video
+        covers a restarted heat too (window)."""
         r = self.state["runs"][stem]
-        summary = labeling.label_run(self.tp, stem)
         race = json.loads(self.tp.race_data(stem).read_text(encoding="utf-8"))
-        st = rstats.run_stats(race, r, self._n_gates())
-        st.update(stem=stem, pilot=r["pilot"], heat=r["heat"], channel=r["channel"])
+        st = rstats.run_stats(race, r, self._n_gates(), window=r.get("window"))
+        st.update(stem=stem, pilot=r["pilot"], heat=r["heat"], channel=r["channel"],
+                  stage=r.get("stage"), round=r.get("round"), race=r.get("race"))
         labeling._write_json(self.tp.runs_dir / f"{stem}.stats.json", st)
         with self.lock:
             r.update(status="labelled", summary={"laps": st["laps"], "best_lap": st["best_lap"],
                                                  "passes": st["passes"]})
+
+    # ── heats from fril: attempts, official / void ─────────────
+
+    def _sync_attempts(self, force: bool = False):
+        """Copy the provider's attempts into the state and re-match every run."""
+        if not (force or self.provider.changed):
+            return
+        atts = self.provider.attempts()
+        with self.lock:
+            self.state["attempts"] = atts
+            runs = list(self.state["runs"].values())
+        restat = []
+        for r in runs:
+            if self._match(r, atts) and r["status"] == "labelled":
+                restat.append(r["stem"])
+        for stem in restat:
+            self._stats(stem)
+
+    def _match(self, r: dict, atts: List[dict]) -> bool:
+        """Tie a run to the fril attempt(s) that were running while its feed
+        was live (our own clock). Returns True if its stats window changed."""
+        t0 = r["wall_start"] + r.get("live_start_s", 0.0)
+        t1 = t0 + r.get("live_s", 0.0)
+        now = time.time()
+        hits = [a for a in atts if min(t1, a["end"] or now) - max(t0, a["start"]) > 3.0]
+        old = r.get("window")
+        with self.lock:
+            if not hits:
+                r.update(fril=None, void=False, window=None)
+                return old is not None
+            official = [a for a in hits if a.get("official")]
+            show = official[-1] if official else max(hits, key=lambda a: a["start"])
+            void = not official and all(a["status"] != "running" for a in hits)
+            window = None
+            if official and len(hits) > 1:      # one video covering a restart: only the official part counts
+                window = [round(show["start"] - r["wall_start"] - 2.0, 2),
+                          round((show["end"] or now) - r["wall_start"] + 5.0, 2)]
+            name = (show.get("pilots") or {}).get(norm_channel(r["channel"]))
+            if name:
+                r["pilot"] = name
+            r.update(fril={"attempt_id": show["id"], "attempt": show["attempt"], "status": show["status"],
+                           "official": bool(show.get("official")), "attempts": [a["id"] for a in hits]},
+                     stage=show["stage"] or None, round=show["round"], race=show["race"], void=void,
+                     window=window,
+                     heat_label=" · ".join(x for x in (show["stage"] or None, f"Round {show['round']}",
+                                                     f"Race {show['race']}") if x))
+        return window != old
 
     def _n_gates(self) -> int:
         if self.cfg.n_gates:
@@ -309,4 +389,6 @@ class RaceDay:
                           "waiting": sum(1 for f in self.pending.values() if not f.running() and not f.done())},
                 "live": dict(self.live), "heats": len(self.state["heats"]),
                 "replay_files": dict(self.state["replay_files"]), "error": self.error,
+                "pilot_info": self.provider.status(),
+                "void_runs": sum(1 for r in runs if r.get("void")),
             }

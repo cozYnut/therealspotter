@@ -49,3 +49,7 @@ svg{display:block;width:100%}
 .cell{padding:5px 6px;text-align:center;border-radius:4px}
 .btn{display:inline-block;background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:6px 12px;font-weight:600;cursor:pointer}
 @media (max-width:600px){main{padding:10px}.big{font-size:24px}th,td{padding:6px 5px}}
+/* "how to read" hints under titles and numbers */
+.hint{font-size:12px;line-height:1.35;color:var(--muted);margin:-6px 0 10px;max-width:760px}
+.fact .hint{margin:4px 0 0;font-size:11px}
+h1+.hint{margin-top:-8px}
