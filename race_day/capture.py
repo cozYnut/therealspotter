@@ -21,6 +21,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field, asdict
@@ -87,17 +88,40 @@ class FileSource:
         self.stopped = True
 
 
+def open_device(index: int) -> cv2.VideoCapture:
+    """OpenCV capture by OpenCV's device index (see list_devices)."""
+    if sys.platform == "darwin":
+        return cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
+    return cv2.VideoCapture(index)
+
+
+def list_devices() -> List[tuple]:
+    """[(opencv_index, name)] for the connected cameras.
+
+    Names come from Qt. On macOS, OpenCV numbers the cameras in the order of
+    their unique IDs, not in the order Qt (or macOS) lists them — e.g. a USB
+    capture card (ID 0x1100…) is 0 and the built-in camera (6C70…) is 1 — so
+    Qt's list is sorted by ID to give each name its OpenCV index."""
+    from PyQt6.QtMultimedia import QMediaDevices
+    devs = [(bytes(d.id()).decode(errors="ignore"), d.description()) for d in QMediaDevices.videoInputs()]
+    if sys.platform == "darwin":
+        devs.sort(key=lambda x: x[0])
+    return [(i, name) for i, (_, name) in enumerate(devs)]
+
+
 class DeviceSource:
     """An HDMI capture card (UVC) through OpenCV."""
 
     def __init__(self, index: int, width: int = 1920, height: int = 1080, fps: float = 30.0):
-        self.cap = cv2.VideoCapture(index)
+        self.cap = open_device(index)
         if not self.cap.isOpened():
             raise IOError(f"cannot open capture device {index}")
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.cap.set(cv2.CAP_PROP_FPS, fps)
         self.fps = self.cap.get(cv2.CAP_PROP_FPS) or fps
+        # the size the device actually gives (a wrong camera shows up here)
+        self.size = (int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
         self.stopped = False
 
     def __iter__(self):

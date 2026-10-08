@@ -32,7 +32,7 @@ from PyQt6.QtWidgets import (
 
 from dataset_paths import TrackPaths, data_root, list_tracks
 from race_day import labeling
-from race_day.capture import QUADS, DeviceSource, FileSource
+from race_day.capture import QUADS, DeviceSource, FileSource, list_devices, open_device
 from race_day.controller import DayConfig, RaceDay
 from race_day.pilots import FrilLiveProvider
 from race_day.server import Dashboard
@@ -150,7 +150,13 @@ class LiveSetupPage(QWidget):
         self._fill_devices()
         form.addRow("Track", self.track)
         form.addRow("Number of gates", self.gates)
-        form.addRow("Capture device", self.device)
+        dev_row = QHBoxLayout()
+        dev_row.addWidget(self.device, 1)
+        refresh = _btn("Refresh")
+        refresh.setToolTip("List the devices again (after plugging in a capture card)")
+        refresh.clicked.connect(self._fill_devices)
+        dev_row.addWidget(refresh)
+        form.addRow("Capture device", dev_row)
         self.fril = QCheckBox("Pilot names, round and race from fril.co.il live")
         self.fril.setChecked(True)
         form.addRow("", self.fril)
@@ -173,6 +179,9 @@ class LiveSetupPage(QWidget):
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview.setStyleSheet("background:#111;color:#666")
         v.addWidget(self.preview)
+        self.preview_info = QLabel("")
+        self.preview_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(self.preview_info)
         row = QHBoxLayout()
         back = _btn("← Back")
         back.clicked.connect(lambda: win.show_page(win.start))
@@ -187,15 +196,18 @@ class LiveSetupPage(QWidget):
         v.addLayout(row)
 
     def _fill_devices(self):
+        current = self.device.currentText().split(": ", 1)[-1]
         self.device.clear()
         try:
-            from PyQt6.QtMultimedia import QMediaDevices
-            for i, d in enumerate(QMediaDevices.videoInputs()):
-                self.device.addItem(f"{i}: {d.description()}", i)
+            for i, name in list_devices():           # OpenCV's index for each name
+                self.device.addItem(f"{i}: {name}", i)
         except Exception:
             for i in range(4):
                 self.device.addItem(f"device {i}", i)
         self.device.addItem("Test: play a 2×2 video file as if live…", "file")
+        for k in range(self.device.count()):         # keep the chosen device after a refresh
+            if self.device.itemText(k).split(": ", 1)[-1] == current:
+                self.device.setCurrentIndex(k)
 
     def _load_saved(self, name):
         cfg = _saved_config(name.strip()) if name.strip() else {}
@@ -212,7 +224,7 @@ class LiveSetupPage(QWidget):
         d = self.device.currentData()
         if d == "file":
             return
-        cap = cv2.VideoCapture(int(d))
+        cap = open_device(int(d))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
         ok, frame = False, None
@@ -221,9 +233,10 @@ class LiveSetupPage(QWidget):
         cap.release()
         if ok:
             self.preview.setPixmap(_pixmap(frame, self.preview.width(), self.preview.height(), self.layout_ed.get()))
-            self.preview.setToolTip(f"{frame.shape[1]}×{frame.shape[0]}")
+            self.preview_info.setText(_size_note(frame.shape[1], frame.shape[0]))
         else:
             self.preview.setText("No picture from this device")
+            self.preview_info.setText("")
 
     def _start(self):
         name = self.track.currentText().strip()
@@ -241,6 +254,14 @@ class LiveSetupPage(QWidget):
                 source = DeviceSource(int(d))
             except Exception as e:
                 return QMessageBox.critical(self, "Capture device", str(e))
+            if source.size != (1920, 1080):
+                ans = QMessageBox.question(
+                    self, "Capture device",
+                    f"{self.device.currentText()} gives {source.size[0]}×{source.size[1]}, not 1920×1080 — "
+                    "it may not be the capture card. Start anyway?")
+                if ans != QMessageBox.StandardButton.Yes:
+                    source.cap.release()
+                    return
         cfg = DayConfig(mode="live", n_gates=self.gates.value(), layout=self.layout_ed.get(),
                         min_run_s=self.min_run.value(), end_gray_s=self.end_gray.value(),
                         learn_runs=self.learn_runs.value(), relearn_every=self.relearn.value(),
@@ -321,6 +342,12 @@ class ReplaySetupPage(QWidget):
         n = len(json.loads(tp.gate_memory.read_text(encoding="utf-8")).get("memory", []))
         cfg = DayConfig(mode="replays", n_gates=n, layout=self.layout_ed.get())
         self.win.start_day(tp, cfg, replay_files=files)
+
+
+def _size_note(w: int, h: int) -> str:
+    if (w, h) == (1920, 1080):
+        return f"<span style='color:#4caf50'>{w}×{h} ✓</span>"
+    return f"<span style='color:#e0a030'>{w}×{h} — the capture card should give 1920×1080; is this the right device?</span>"
 
 
 def _pixmap(frame: np.ndarray, w: int, h: int, layout=None, status=None, names=None) -> QPixmap:
