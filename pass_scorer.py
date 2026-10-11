@@ -22,7 +22,7 @@ Input per video: runs/<video>.race_data.json and runs/<video>.motion.json
 
     python pass_scorer.py track1                 # compare all logics
     python pass_scorer.py track1 --logic tracks_motion --list
-    python pass_scorer.py track1 --save          # train on all videos → training/pass_scorer.json
+    python pass_scorer.py track1 --save          # train on all videos → pass_scorer.json (repo)
 """
 
 import argparse
@@ -35,7 +35,7 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-from dataset_paths import TrackPaths, list_tracks, training_dir
+from dataset_paths import TrackPaths, list_tracks
 
 TOL = 0.15          # on-time window, same as score.py
 MERGE = 0.10        # candidates closer than this are one event
@@ -619,7 +619,9 @@ def train_all(videos, cands_by, logic: str, l2: float = 1.0):
 # ──────────────────────────────────────────────────────────────
 
 def model_path() -> Path:
-    return training_dir() / "pass_scorer.json"
+    """The saved model lives in the repo (next to the YOLO model), so it comes
+    with the code to any laptop."""
+    return Path(__file__).resolve().parent / "pass_scorer.json"
 
 
 def load_model(path: Optional[Path] = None) -> Optional[dict]:
@@ -657,7 +659,7 @@ def main():
     ap.add_argument("--l2", type=float, default=1.0, help="L2 regularisation of the learned logics")
     ap.add_argument("--list", action="store_true", help="List remaining misses / false / off-time passes")
     ap.add_argument("--save", action="store_true",
-                    help="Train --logic (default BEST_LOGIC) on all videos → training/pass_scorer.json")
+                    help="Train --logic (default BEST_LOGIC) on all videos → pass_scorer.json (repo)")
     args = ap.parse_args()
 
     tracks = [tp for tp in list_tracks() if not args.tracks or tp.dir.name in args.tracks]
