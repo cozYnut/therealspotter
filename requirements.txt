@@ -20,3 +20,6 @@ PyYAML
 
 # Learning UI — legacy (learn_ui.py still imports PyQt6)
 PyQt6
+
+# Race day (race_day_app.py): QR code for the dashboard
+segno

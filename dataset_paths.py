@@ -11,10 +11,15 @@ data sorts together:
         gate_memory.json             the track's learned gates
         memory_videos/               videos used to learn the gates
         test_videos/                 videos used only for scoring
+        learn_videos/                unreviewed videos the track is learned from (learn_track.py)
+        videos/                      race_day: runs recorded live or cut from 2×2 replays
+        race_day.json                race_day: setup + state of the race day
         candidates/<video>.candidates.json   learn_ui candidate extraction
         candidates/<video>.crops/            candidate / Force Clip crops (memory images)
         runs/<video>.race_data.json          extract_race.py output
         runs/<video>.race_query/             its query crops
+        runs/<video>.motion.json             per-frame camera motion (extract_motion.py)
+        runs/<video>.learn_passes.json       passes of a learn video (learn_track.py, never shown in UIs)
         gt/<video>.gt.json                   reviewed marks (learn_ui REVIEW mode)
         velocidrone/                 same layout, for the sim version of the track
       training/                      shared YOLO data (gate_annotator)
@@ -106,6 +111,29 @@ class TrackPaths:
         return self.dir / "test_videos"
 
     @property
+    def videos(self) -> Path:
+        # race_day: every run recorded (Live) or cut from a 2×2 file (Replays)
+        return self.dir / "videos"
+
+    @property
+    def race_day_state(self) -> Path:
+        return self.dir / "race_day.json"
+
+    @property
+    def learn_videos(self) -> Path:
+        return self.dir / "learn_videos"
+
+    @property
+    def learned_memory(self) -> Path:
+        # learn_track.py: gates (order, type, images) learned from learn_videos/
+        return self.dir / "gate_memory.learned.json"
+
+    @property
+    def learned_timing(self) -> Path:
+        # learn_track.py: gate-to-gate durations learned from learn_videos/
+        return self.dir / "gate_timing.learned.json"
+
+    @property
     def gt_dir(self) -> Path:
         return self.dir / "gt"
 
@@ -122,6 +150,15 @@ class TrackPaths:
 
     def race_data(self, stem: str) -> Path:
         return self.runs_dir / f"{stem}.race_data.json"
+
+    def learn_passes(self, stem: str) -> Path:
+        # learn_track.py: passes of a learn video, found with no track knowledge.
+        # Kept apart from race_data.json so Review / race_ui never load them.
+        return self.runs_dir / f"{stem}.learn_passes.json"
+
+    def motion(self, stem: str) -> Path:
+        # extract_motion.py: per-frame camera motion from optical flow
+        return self.runs_dir / f"{stem}.motion.json"
 
     def race_query_dir(self, stem: str) -> Path:
         # extract_race.py writes this next to its --output
