@@ -391,6 +391,7 @@ class VideoPlayer(QWidget):
         self._current_t: float = 0.0
         self._playing: bool = False
         self._last_frame: Optional[np.ndarray] = None
+        self._crop = None            # (x, y, w, h) fractions: show one quadrant of a 2×2 video
 
         lv = QVBoxLayout(self)
         lv.setContentsMargins(0, 0, 0, 0)
@@ -418,6 +419,9 @@ class VideoPlayer(QWidget):
     @property
     def is_playing(self) -> bool:
         return self._playing
+
+    def set_crop(self, rect):
+        self._crop = tuple(rect) if rect else None
 
     def load(self, path: str) -> bool:
         if self._cap:
@@ -477,6 +481,10 @@ class VideoPlayer(QWidget):
         ok, frame = self._cap.read()
         if not ok:
             return
+        if self._crop:
+            H, W = frame.shape[:2]
+            x, y, w, h = self._crop
+            frame = frame[int(round(y * H)):int(round((y + h) * H)), int(round(x * W)):int(round((x + w) * W))]
         self._last_frame = frame
         self._push(frame)
 
@@ -1870,17 +1878,35 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Empty gate memory", f"No gates in:\n{mem_path}")
             return
 
+        stem = Path(path).stem
+        self.open_review(path, str(mem_path), str(tp.gt(stem)), str(tp.race_data(stem)),
+                         title=f"{tp.name} / {Path(path).name}")
+
+    def open_review(self, path: str, mem_path: str, gt_path: str, race_path: str,
+                    title: str = "", crop=None):
+        """Review one video (or one pilot's quadrant of a 2×2 video, crop) —
+        also used by race_day_app: python learn_ui.py --review …"""
+        try:
+            with open(mem_path, encoding="utf-8") as f:
+                mem = json.load(f).get("memory", []) or []
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Cannot read gate memory:\n{mem_path}\n\n{e}")
+            return
+        if crop and not Path(race_path).exists():
+            QMessageBox.warning(self, "Not analysed", "Analyse this heat in race_day_app first.")
+            return
+        self._video.set_crop(crop)
         if not self._video.load(path):
             QMessageBox.critical(self, "Error", f"Cannot open video:\n{path}")
             return
 
         self._enter_review_mode()
         self._current_video_path = path
+        self._review_crop = list(crop) if crop else None
         self._mem_path = str(mem_path)
         self._mem_gates = sorted(mem, key=lambda g: int(g.get("order_idx", 0)))
-        stem = Path(path).stem
-        self._gt_path = str(tp.gt(stem))
-        self._race_path = str(tp.race_data(stem))
+        self._gt_path = str(gt_path)
+        self._race_path = str(race_path)
         self._race_data = None
         self._race_ts = []
         self._review_det_model = None
@@ -1891,8 +1917,8 @@ class MainWindow(QMainWindow):
         self._timeline.set_duration(self._video.duration)
         self._timeline.set_candidates([])
         self._timeline.set_session_markers([])
-        self.setWindowTitle(f"FPV Gate Learning UI  —  REVIEW  —  {tp.name} / {Path(path).name}")
-        self._video_status.setText(f"Review: {tp.name} / {Path(path).name}")
+        self.setWindowTitle(f"FPV Gate Learning UI  —  REVIEW  —  {title}")
+        self._video_status.setText(f"Review: {title}")
 
         if Path(self._race_path).exists():
             self._load_race_data(self._race_path)
@@ -2305,6 +2331,7 @@ class MainWindow(QMainWindow):
             "version":     1,
             "track":       self._track.name if self._track else "",
             "video":       _rel(self._current_video_path),
+            **({"crop": self._review_crop} if getattr(self, "_review_crop", None) else {}),
             "gate_memory": _rel(self._mem_path),
             "race_data":   _rel(self._race_path) if Path(self._race_path).exists() else "",
             "det_model":   self._review_det_model,
@@ -2459,11 +2486,24 @@ def _dark_palette() -> QPalette:
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="FPV gate learning / review UI")
+    ap.add_argument("--review", help="open this video straight in REVIEW mode")
+    ap.add_argument("--crop", help="x,y,w,h (fractions): review one quadrant of a 2×2 video")
+    ap.add_argument("--race-data", help="the video's race_data.json")
+    ap.add_argument("--gt", help="where the review is saved (gt.json)")
+    ap.add_argument("--gate-memory", help="the track's gate_memory.json")
+    ap.add_argument("--title", default="")
+    args, _ = ap.parse_known_args()
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setPalette(_dark_palette())
     win = MainWindow()
     win.show()
+    if args.review:
+        crop = [float(x) for x in args.crop.split(",")] if args.crop else None
+        win.open_review(args.review, args.gate_memory, args.gt, args.race_data,
+                        title=args.title or Path(args.review).name, crop=crop)
     sys.exit(app.exec())
 
 

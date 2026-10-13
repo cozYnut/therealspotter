@@ -358,7 +358,8 @@ class Logistic:
         self.names, self.l2 = names, l2
 
     def _X(self, F: List[Dict[str, float]]) -> np.ndarray:
-        return np.array([[f[n] for n in self.names] for f in F], dtype=float)
+        # (0, n) when there are no candidates (a pilot who never flew) — not (0,)
+        return np.array([[f[n] for n in self.names] for f in F], dtype=float).reshape(len(F), len(self.names))
 
     def fit(self, F: List[Dict[str, float]], y: np.ndarray) -> "Logistic":
         with np.errstate(all="ignore"):          # macOS Accelerate matmul raises spurious FP warnings
@@ -407,7 +408,8 @@ class Stumps:
         self.names, self.rounds, self.lr = names, rounds, lr
 
     def _X(self, F):
-        return np.array([[f[n] for n in self.names] for f in F], dtype=float)
+        # (0, n) when there are no candidates (a pilot who never flew) — not (0,)
+        return np.array([[f[n] for n in self.names] for f in F], dtype=float).reshape(len(F), len(self.names))
 
     def fit(self, F, y) -> "Stumps":
         X = self._X(F)

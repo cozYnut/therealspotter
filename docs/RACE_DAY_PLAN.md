@@ -187,6 +187,48 @@ A local web server started by `race_day.py`. Anyone on the same Wi-Fi opens it o
    - consistency trend.
 7. **Track page:** the learned gates with images and typical section times, and **the hardest sections** (the largest spread between pilots).
 
+## Gate validation integration into FPVTrackside
+
+At 2027Race1 the capture-card recording went choppy from heat 19 on, because learning ran inside the app. FPVTrackside had meanwhile recorded every heat itself, steady at 60 fps, with the pilots, the channels and the LapRF laps. So the main mode is now **⏱ FPVTrackside event**: race_day_app works directly on an FPVTrackside event folder, on the same computer or shared over the network.
+
+**What it does**
+- **Heat list:** every finished heat appears by itself, newest first.
+- **Learning:** pick heats (☑), then press **Learn / Relearn track** and give the number of gates. The last number used is offered next time.
+- **Analysis:** each pilot's quadrant is read in place, with the 4 pilots in parallel worker processes.
+- **Lap check (marshal assist):** for each pilot, the start/finish gate (G1) passes in the video are compared with the timing system's laps. Only the disagreements are shown, each with a confidence:
+  - a lap the timing system missed;
+  - a timing lap that's impossible (far shorter than a lap);
+  - something to check by hand.
+
+  Clicking one jumps the video to that moment. Accept or Reject it, or mark a lap or holeshot by hand.
+- **Update laps in FPVTrackside:** writes the changes the way FPVTrackside's own marshals do:
+  - an added lap is a `Manual` detection with `ValidityType: Auto`;
+  - a removed lap keeps its detection, set to `Valid: false` with `ManualOverride`;
+  - laps are renumbered.
+
+  The original `Race.json` is backed up once, and **Restore original laps** puts it back. Nothing else in the event folder is ever written.
+- **Auto mode:** new heats are analysed and checked, and the confident corrections are written. Unsure ones wait for a person.
+
+**FPVTrackside first**
+- **While a race is running,** race_day pauses completely. It doesn't start jobs, its worker processes are stopped (SIGSTOP), and it reads nothing except the running heat's folder, to see when the race ends.
+- **The event folder:**
+  - is only listed and checked with `stat()`;
+  - a heat's files are opened only when they've been unchanged for 10 s;
+  - writes happen only between races, and are retried if `Race.json` is busy.
+- **Videos are never moved, changed or copied.**
+
+**Where things are:** all of race_day's data is in `<event>/race_day/`: `race_day.json`, the learned track, `runs/`, `gt/`, `backups/`.
+
+**Replays** opens a past event, or a folder of loose videos (single pilot or 2×2), in place. It's the same screen without Auto mode. The timeline shows every gate pass, and **Review gates** opens learn_ui on that pilot's quadrant (`learn_ui.py --review … --crop …`). For each new loose video, the app asks once what it is: single or 2×2, the heat number, and the pilots.
+
+**Code:**
+- `race_day/trackside.py`: reading the event, finished and running heats, frame times, writing laps back;
+- `race_day/lapcheck.py`: the lap check;
+- `race_day/eventday.py`: the controller;
+- `race_day/event_ui.py`: the screen;
+- `race_day/capture.py` `QuadReader`: one quadrant of a video, read in place;
+- `extract_race.run_race_extraction(reader=…)`.
+
 ## Milestones
 
 | # | Milestone | Done when |

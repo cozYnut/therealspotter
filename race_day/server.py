@@ -127,6 +127,12 @@ class DataView:
         r["video_url"] = f"/video/{stem}.mp4"
         return r
 
+    def video_file(self, stem: str) -> Path:
+        """A run's video: its own file, or (FPVTrackside event) the heat video, read in place."""
+        with self.day.lock:
+            r = self.day.state["runs"].get(stem) or {}
+        return Path(r["video_path"]) if r.get("video_path") else self.tp.videos / f"{stem}.mp4"
+
     def heat(self, n: int):
         runs = [r for r in self.visible_runs() if r["heat"] == n]
         with self.day.lock:
@@ -242,7 +248,8 @@ def make_handler(view: DataView):
                     f = (STATIC / p[len("/static/"):]).resolve()
                     return self._file(f) if str(f).startswith(str(STATIC.resolve())) else self._send(403, b"", "text/plain")
                 if p == "/api/status":
-                    return self._json(view.day.status())
+                    return self._json(view.day.dashboard_status() if hasattr(view.day, "dashboard_status")
+                                      else view.day.status())
                 if p == "/api/runs":
                     return self._json({"runs": view.runs(), "field": view.field()})
                 if p.startswith("/api/run/"):
@@ -259,7 +266,7 @@ def make_handler(view: DataView):
                     name = Path(p).name
                     if not view.visible(Path(name).stem):          # void runs aren't served
                         return self._send(404, b"not found", "text/plain")
-                    return self._file(view.tp.videos / name)
+                    return self._file(view.video_file(Path(name).stem))
                 if p == "/img":
                     q = urllib.parse.parse_qs(u.query).get("p", [""])[0]
                     f = (view.tp.dir / q).resolve()

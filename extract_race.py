@@ -68,6 +68,27 @@ def _area_ratio(bbox, frame_area: float) -> float:
     return max(0, x2 - x1) * max(0, y2 - y1) / max(frame_area, 1.0)
 
 
+class _VideoReader:
+    """The whole video, frame by frame (see run_race_extraction's reader)."""
+
+    def __init__(self, path: str):
+        self.cap = cv2.VideoCapture(path)
+        if not self.cap.isOpened():
+            sys.exit(f"Cannot open video: {path}")
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
+        self.frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.t = 0.0
+
+    def read(self):
+        ok, frame = self.cap.read()
+        if ok:
+            self.t = self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+        return ok, frame
+
+    def release(self):
+        self.cap.release()
+
+
 def run_race_extraction(
     video_path: str,
     det_model_path: str,
@@ -84,7 +105,15 @@ def run_race_extraction(
     pass_logic: str = "scorer",
     gate_id_logic: str = "sequence",
     det_device: Optional[str] = None,
+    reader=None,
+    stem: Optional[str] = None,
+    track=None,
 ):
+    """reader: something with read() → (ok, frame), .t (seconds), .fps,
+    .frame_count and release() — e.g. race_day.capture.QuadReader for one
+    pilot's quadrant of a heat video, read in place. Default: the whole video.
+    track: the TrackPaths whose learned timing labels the gates (default: the
+    track the output file is in)."""
     print(f"Loading detector: {det_model_path}")
     det = YOLO(det_model_path)
     # a Core ML model (.mlpackage) picks its own hardware; a .pt runs on det_device
@@ -108,18 +137,16 @@ def run_race_extraction(
     gatedb.load_memory(gate_memory_path)
     print(f"[GateDB] Loaded {gatedb.memory_size()} gates from {gate_memory_path}")
 
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        sys.exit(f"Cannot open video: {video_path}")
+    cap = reader or _VideoReader(video_path)
 
     ok, first_frame = cap.read()
+    pending = (first_frame, cap.t) if ok else None     # the first frame is analysed too
     if ok:
         left_norm, right_norm = detect_camera_edges(first_frame)
         passdet.set_camera_edges(left_norm, right_norm)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.frame_count)
+    fps = cap.fps or 30.0
     duration = total_frames / max(fps, 1.0)
     print(f"Video: {total_frames} frames  {fps:.1f} fps  {duration:.1f}s")
     print("Running race analysis…")
@@ -130,7 +157,7 @@ def run_race_extraction(
     all_passes = []
     frame_idx = 0
 
-    stem = Path(video_path).stem
+    stem = stem or Path(video_path).stem
     query_frames_dir = str(Path(output_json).parent / f"{stem}.race_query")
     Path(query_frames_dir).mkdir(parents=True, exist_ok=True)
 
@@ -163,10 +190,13 @@ def run_race_extraction(
                             "query_img": img, "query_embedding": clip.embed_bgr(crop).tolist()})
 
     while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        t = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+        if pending:
+            (frame, t), pending = pending, None
+        else:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            t = cap.t
         frame_idx += 1
         H, W = frame.shape[:2]
         frame_area = float(W * H)
@@ -324,6 +354,7 @@ def run_race_extraction(
     race_laps = list(getattr(gatedb, "_race_laps", []))
     output = {
         "video": str(video_path),
+        **({"crop": list(getattr(reader, "rect", ())), "frame_step": getattr(reader, "step", 1)} if reader else {}),
         "gate_memory": str(gate_memory_path),
         "det_model": Path(det_model_path).name,
         "det_device": "coreml" if str(det_model_path).endswith(".mlpackage") else (det_device or "cpu"),
@@ -364,7 +395,7 @@ def run_race_extraction(
     passes, laps = final, race_laps
     if gate_id_logic == "sequence":
         import gate_decoder
-        passes, laps, info = gate_decoder.label_race(final, gate_memory_path, track_of(output_json))
+        passes, laps, info = gate_decoder.label_race(final, gate_memory_path, track or track_of(output_json))
         output.update(info)
         print(f"Gate IDs by sequence decoding (timing: {info['timing']}): "
               f"{sum(p['gate_id'] >= 1 for p in passes)} passes labelled, {len(laps)} laps")

@@ -146,6 +146,43 @@ def split_quads(frame: np.ndarray) -> List[np.ndarray]:
     return [frame[:h2, :w2], frame[:h2, w2:2 * w2], frame[h2:2 * h2, :w2], frame[h2:2 * h2, w2:2 * w2]]
 
 
+class QuadReader:
+    """One pilot's picture from a video, read in place (no copy is made):
+    the quadrant `rect` (x, y, w, h as fractions of the frame) scaled to
+    `size`, at most `max_fps` frames a second (a 60 fps heat video gives
+    every 2nd frame). Same use as extract_race's reader: read() → (ok,
+    frame), then .t is that frame's time in the video (seconds)."""
+
+    def __init__(self, path, rect=(0.0, 0.0, 1.0, 1.0), size=(960, 540), max_fps: float = 31.0):
+        self.path = str(path)
+        self.cap = cv2.VideoCapture(self.path)
+        if not self.cap.isOpened():
+            raise IOError(f"cannot open video: {path}")
+        src_fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
+        self.step = max(1, int(round(src_fps / max_fps)))
+        self.fps = src_fps / self.step
+        self.frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT)) // self.step
+        self.rect, self.size = tuple(rect), tuple(size) if size else None
+        self.t = 0.0
+
+    def read(self):
+        ok, frame = self.cap.read()
+        if not ok:
+            return False, None
+        self.t = self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+        for _ in range(self.step - 1):            # skipped frames: decoded, not converted
+            self.cap.grab()
+        H, W = frame.shape[:2]
+        x, y, w, h = self.rect
+        crop = frame[int(round(y * H)):int(round((y + h) * H)), int(round(x * W)):int(round((x + w) * W))]
+        if self.size and (crop.shape[1], crop.shape[0]) != self.size:
+            crop = cv2.resize(crop, self.size, interpolation=cv2.INTER_AREA)
+        return True, crop
+
+    def release(self):
+        self.cap.release()
+
+
 # ──────────────────────────────────────────────────────────────
 # Live detection
 # ──────────────────────────────────────────────────────────────

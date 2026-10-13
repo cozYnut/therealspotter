@@ -31,6 +31,16 @@ function heat(v, ref) {
   return `background:rgba(${c[0]},${c[1]},${c[2]},${(0.15 + 0.55 * Math.abs(r)).toFixed(2)})`;
 }
 
+// A run's video: a whole file, or one pilot's quadrant of a 2×2 heat video
+// (FPVTrackside event) — the quadrant is cropped here, the file is streamed as is.
+function videoTag(r, attrs) {
+  if (!r.crop) return `<video ${attrs} src="${r.video_url}" controls playsinline preload="metadata"></video>`;
+  const [x, y, w, h] = r.crop;
+  return `<div class="cropbox" onclick="const v=this.querySelector('video');v.paused?v.play():v.pause()">
+    <video ${attrs} src="${r.video_url}" playsinline preload="metadata"
+      style="width:${100 / w}%;left:${-100 * x / w}%;top:${-100 * y / h}%"></video><span class="tap">tap to play / pause</span></div>`;
+}
+
 // ── header: status every 3 s ───────────────────────────────────
 let STATUS = null;
 async function refreshStatus() {
@@ -155,11 +165,11 @@ async function runPage(stem, first) {
   const head = `<h1><span style="color:${colorFor(r.pilot)}">●</span> ${esc(r.pilot)}</h1>
     <p class="muted">${roundRace(r)}<a href="#/heat/${r.heat}">Heat ${r.heat}</a> · ${esc(r.channel)} · <a href="#/pilot/${encodeURIComponent(r.pilot)}">all runs of ${esc(r.pilot)}</a></p>`;
   if (!st) { $("#app").innerHTML = head + `<div class="panel">This run is ${esc(r.status)} — results appear when it's analysed${STATUS && STATUS.phase === "learn" ? " and the track is learned" : ""}.</div>
-    <video src="${r.video_url}" controls playsinline preload="metadata"></video>`; return; }
+    ${videoTag(r, "")}`; return; }
   const best = st.best_lap_index;
   const live0 = r.live_start_s || 0;
   $("#app").innerHTML = head + `
-    <video id="vid" src="${r.video_url}" controls playsinline preload="metadata"></video>
+    ${videoTag(r, 'id="vid"')}
     <div id="timeline" class="panel" style="padding:6px 10px"></div>
     ${hint("Timeline: thin blue lines = gates passed, yellow lines = start/finish (G1, a new lap), L1 L2 … = laps, red = where the video is now. Tap the bar to jump there.")}
     <div class="facts">
@@ -256,7 +266,7 @@ async function heatPage(n, first) {
     <p><span class="btn" onclick="heatPlay(true)">▶ Play all</span> <span class="btn" onclick="heatPlay(false)">❚❚ Pause</span></p>
     ${hint("▶ Play all starts the pilots' videos together, as they flew. Tap a name to open that pilot's run.")}
     <div class="quad">${runs.map((r) => `<div><div class="meta"><span style="color:${colorFor(r.pilot)}">●</span> <a href="#/run/${encodeURIComponent(r.stem)}">${esc(r.pilot)}</a> · ${esc(r.channel)}</div>
-      <video class="hv" data-off="${r.live_start_s}" src="${r.video_url}" playsinline muted preload="metadata"></video></div>`).join("")}</div>
+      ${r.crop ? videoTag(r, `class="hv" muted data-off="${r.live_start_s}"`) : `<video class="hv" data-off="${r.live_start_s}" src="${r.video_url}" playsinline muted preload="metadata"></video>`}</div>`).join("")}</div>
     ${isFinite(L) && order.length ? `<h2>Order over the first ${L} lap${L > 1 ? "s" : ""}</h2>${hint("Total time for the laps everyone completed. Gap +1.20 = 1.2 s behind the leader.")}<div class="panel scroll"><table><thead><tr><th>Pilot</th><th>Time</th><th>Gap</th><th>Best lap</th></tr></thead><tbody>
       ${order.map((o, i) => `<tr><td><b>${i + 1}.</b> ${esc(o.r.pilot)}</td><td>${sec(o.t)}</td><td>${i ? "+" + sec(o.t - order[0].t) : "–"}</td><td>${sec(o.r.stats.best_lap)}</td></tr>`).join("")}</tbody></table></div>` : ""}
     <h2>Gap to the leader at every gate</h2>${hint("One line per pilot. The leader runs along the top. A line dropping lower = falling further behind; a line climbing = catching up. L1 L2 … mark the laps.")}<div class="panel">${gapChart(runs, h.runs[0]?.stats?.n_gates)}</div>`;

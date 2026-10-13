@@ -4,12 +4,16 @@ Race-day desktop app (operator) — see docs/RACE_DAY_PLAN.md.
 
     python race_day_app.py
 
-Start screen: Live track or Replays.
+Start screen: FPVTrackside event, Live track or Replays.
+  FPVTrackside event: an event folder of FPVTrackside — every finished heat
+            is listed; learn the track from chosen heats, check each pilot's
+            laps against the video, write corrections back (race_day/event_ui.py).
   Live:     track name + number of gates + channel layout + capture device
             → records every run, learns the track from the first runs,
             then shows results.
-  Replays:  an already-learned track + 2×2 video files → cut into runs,
-            analysed and shown. No learning, no recording.
+  Replays:  a past FPVTrackside event, or a folder of videos (single pilot
+            or 2×2) — read in place, never copied; gates shown and reviewable
+            in learn_ui. No Auto mode.
 
 The browser dashboard (read-only) is served on the local network; its
 address and QR code are shown on the running screen.
@@ -34,6 +38,7 @@ from dataset_paths import TrackPaths, data_root, list_tracks
 from race_day import labeling
 from race_day.capture import QUADS, DeviceSource, FileSource, list_devices, open_device
 from race_day.controller import DayConfig, RaceDay
+from race_day.event_ui import EventPage
 from race_day.pilots import FrilLiveProvider
 from race_day.server import Dashboard
 
@@ -68,6 +73,23 @@ def _saved_config(name: str) -> dict:
     return {}
 
 
+def _app_settings() -> dict:
+    p = Path.home() / ".race_day_app.json"
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_app_settings(**kw):
+    d = _app_settings()
+    d.update(kw)
+    try:
+        (Path.home() / ".race_day_app.json").write_text(json.dumps(d), encoding="utf-8")
+    except OSError:
+        pass
+
+
 class Bridge(QObject):
     """Capture/controller threads → GUI thread."""
     preview = pyqtSignal(object)
@@ -91,13 +113,16 @@ class StartPage(QWidget):
         sub.setStyleSheet("color:#888")
         v.addWidget(sub)
         row = QHBoxLayout()
-        live = _btn("●  Live track\nrecord, learn and show results", True)
-        rep = _btn("▶  Replays\nanalyse 2×2 videos of a learned track")
-        for b in (live, rep):
-            b.setMinimumSize(320, 120)
+        event = _btn("⏱  FPVTrackside event\ncheck every heat's laps in the video", True)
+        live = _btn("●  Live capture\nrecord from the capture card")
+        rep = _btn("▶  Replays\na past event or a folder of videos")
+        for b in (event, live, rep):
+            b.setMinimumSize(300, 120)
+        event.clicked.connect(lambda: win.choose_event("live"))
         live.clicked.connect(lambda: win.show_page(win.live_setup))
-        rep.clicked.connect(lambda: win.show_page(win.replay_setup))
+        rep.clicked.connect(lambda: win.choose_event("replays"))
         row.addStretch()
+        row.addWidget(event)
         row.addWidget(live)
         row.addWidget(rep)
         row.addStretch()
@@ -269,81 +294,6 @@ class LiveSetupPage(QWidget):
         self.win.start_day(TrackPaths(data_root() / name), cfg, live_source=source)
 
 
-class ReplaySetupPage(QWidget):
-    def __init__(self, win):
-        super().__init__()
-        self.win = win
-        v = QVBoxLayout(self)
-        v.addWidget(_big("Replays — setup"))
-        form = QFormLayout()
-        self.track = QComboBox()
-        self.info = QLabel("")
-        self.info.setStyleSheet("color:#888")
-        self.track.currentTextChanged.connect(self._track_changed)
-        form.addRow("Learned track", self.track)
-        form.addRow("", self.info)
-        v.addLayout(form)
-        self.layout_ed = LayoutEditor()
-        v.addWidget(self.layout_ed)
-        v.addWidget(QLabel("2×2 video files to analyse:"))
-        self.files = QListWidget()
-        self.files.setAcceptDrops(True)
-        v.addWidget(self.files, 1)
-        row = QHBoxLayout()
-        back = _btn("← Back")
-        back.clicked.connect(lambda: win.show_page(win.start))
-        add = _btn("Add videos…")
-        add.clicked.connect(self._add)
-        go = _btn("Analyse", True)
-        go.clicked.connect(self._start)
-        row.addWidget(back)
-        row.addStretch()
-        row.addWidget(add)
-        row.addWidget(go)
-        v.addLayout(row)
-        self.setAcceptDrops(True)
-
-    def refresh(self):
-        self.track.clear()
-        self.track.addItems([t.dir.name for t in list_tracks() if labeling.is_learned(t)])
-
-    def _track_changed(self, name):
-        if not name:
-            return
-        tp = TrackPaths(data_root() / name)
-        n = len(json.loads(tp.gate_memory.read_text(encoding="utf-8")).get("memory", []))
-        self.info.setText(f"{n} gates learned")
-        cfg = _saved_config(name)
-        if cfg.get("layout"):
-            self.layout_ed.set(cfg["layout"])
-
-    def _add(self):
-        ps, _ = QFileDialog.getOpenFileNames(self, "2×2 video files", str(data_root()), VIDEO_FILTER)
-        for p in ps:
-            self.files.addItem(p)
-
-    def dragEnterEvent(self, e):
-        if e.mimeData().hasUrls():
-            e.acceptProposedAction()
-
-    def dropEvent(self, e):
-        for u in e.mimeData().urls():
-            if u.isLocalFile():
-                self.files.addItem(u.toLocalFile())
-
-    def _start(self):
-        name = self.track.currentText()
-        if not name:
-            return QMessageBox.warning(self, "Track", "No learned track — learn one in Live mode or with learn_track.py.")
-        files = [self.files.item(i).text() for i in range(self.files.count())]
-        if not files:
-            return QMessageBox.warning(self, "Videos", "Add at least one 2×2 video.")
-        tp = TrackPaths(data_root() / name)
-        n = len(json.loads(tp.gate_memory.read_text(encoding="utf-8")).get("memory", []))
-        cfg = DayConfig(mode="replays", n_gates=n, layout=self.layout_ed.get())
-        self.win.start_day(tp, cfg, replay_files=files)
-
-
 def _size_note(w: int, h: int) -> str:
     if (w, h) == (1920, 1080):
         return f"<span style='color:#4caf50'>{w}×{h} ✓</span>"
@@ -407,9 +357,6 @@ class RunningPage(QWidget):
         right.addWidget(self.url)
         self.qr = QLabel()
         right.addWidget(self.qr)
-        self.add_more = _btn("Add more videos…")
-        self.add_more.clicked.connect(self._add_more)
-        right.addWidget(self.add_more)
         stop = _btn("Stop")
         stop.clicked.connect(win.stop_day)
         right.addWidget(stop)
@@ -431,11 +378,6 @@ class RunningPage(QWidget):
 
     def on_preview(self, frame):
         self.frame = frame
-
-    def _add_more(self):
-        ps, _ = QFileDialog.getOpenFileNames(self, "2×2 video files", str(data_root()), VIDEO_FILTER)
-        if ps and self.win.day:
-            self.win.day.add_replay_files(ps)
 
     def tick(self):
         day = self.win.day
@@ -497,9 +439,10 @@ class Main(QMainWindow):
         self.setCentralWidget(self.stack)
         self.start = StartPage(self)
         self.live_setup = LiveSetupPage(self)
-        self.replay_setup = ReplaySetupPage(self)
         self.running = RunningPage(self)
-        for p in (self.start, self.live_setup, self.replay_setup, self.running):
+        self.event_page = EventPage(self)
+        self.event_day = None
+        for p in (self.start, self.live_setup, self.running, self.event_page):
             self.stack.addWidget(p)
         self.bridge.preview.connect(self.running.on_preview)
         self.bridge.log.connect(lambda s: (self.running.log.addItem(s), self.running.log.scrollToBottom()))
@@ -507,11 +450,9 @@ class Main(QMainWindow):
         self.timer.timeout.connect(self.running.tick)
 
     def show_page(self, page):
-        if page is self.replay_setup:
-            self.replay_setup.refresh()
         self.stack.setCurrentWidget(page)
 
-    def start_day(self, tp: TrackPaths, cfg: DayConfig, live_source=None, replay_files=None):
+    def start_day(self, tp: TrackPaths, cfg: DayConfig, live_source=None):
         try:
             provider = FrilLiveProvider() if cfg.mode == "live" and cfg.fril_live else None
             self.day = RaceDay(tp, cfg, provider=provider,
@@ -524,13 +465,53 @@ class Main(QMainWindow):
         self.dash = Dashboard(self.day).start()
         self.running.set_dashboard(self.dash.url)
         self.running.title.setText(f"{'LIVE' if cfg.mode == 'live' else 'REPLAYS'} — {tp.name}")
-        self.running.add_more.setVisible(cfg.mode == "replays")
         if live_source is not None:
             self.day.start_live(live_source)
-        if replay_files:
-            self.day.add_replay_files(replay_files)
         self.timer.start(500)
         self.show_page(self.running)
+
+    def choose_event(self, mode: str):
+        start = str(Path.home())
+        last = _app_settings().get("event_dir")
+        if last and Path(last).exists():
+            start = str(Path(last).parent)
+        folder = QFileDialog.getExistingDirectory(
+            self, "FPVTrackside event folder (…/FPVTrackside/events/<event>)" if mode == "live"
+            else "Replays: an FPVTrackside event folder, or a folder of videos", start)
+        if folder:
+            self.start_event(folder, mode)
+
+    def start_event(self, folder: str, mode: str):
+        from race_day.eventday import EventDay
+        try:
+            self.event_day = EventDay(folder, mode=mode,
+                                      log=lambda s: self.bridge.log.emit(time.strftime("%H:%M:%S  ") + s))
+            self.event_day.start()
+        except Exception as e:
+            self.event_day = None
+            return QMessageBox.critical(self, "Can't open the event", str(e))
+        _save_app_settings(event_dir=folder)
+        try:
+            self.dash = Dashboard(self.event_day).start()
+            self.event_page.dash_url = self.dash.url
+        except OSError as e:                     # port in use: the app works without it
+            self.dash = None
+            self.event_page.dash_url = f"dashboard off ({e})"
+        self.event_page.open(self.event_day)
+        self.show_page(self.event_page)
+
+    def stop_event(self):
+        if self.event_day and QMessageBox.question(self, "Close", "Close this event? (Nothing is lost — "
+                                                   "it continues where it was next time.)") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        self.event_page.close_day()
+        if self.event_day:
+            self.event_day.stop()
+        if self.dash:
+            self.dash.stop()
+        self.event_day = self.dash = None
+        self.show_page(self.start)
 
     def stop_day(self):
         if self.day and QMessageBox.question(self, "Stop", "Stop recording / analysing and close the dashboard?") \
@@ -547,6 +528,9 @@ class Main(QMainWindow):
         self.show_page(self.start)
 
     def closeEvent(self, e):
+        if self.event_day:
+            self.event_page.close_day()
+            self.event_day.stop()
         if self.day:
             self.day.stop()
         if self.dash:
