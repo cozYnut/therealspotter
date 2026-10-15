@@ -207,6 +207,7 @@ class EventDay:
                             "learn": "all" if sel and sel >= set(h.pilots) else ("some" if sel else "none"),
                             "learn_pilots": sorted(sel),
                             "timing_laps": {c: max(0, len(v) - 1) for c, v in timing.items()},
+                            "no_video": [c for c, v in hs.get("check", {}).items() if v.get("no_video")],
                             "open": self._open_findings(h.id), "written": bool(hs.get("written"))})
         return out
 
@@ -235,7 +236,8 @@ class EventDay:
                 "stem": h.stem(ch), "race_data": str(self.tp.race_data(h.stem(ch))),
                 "gt": str(self.tp.gt(h.stem(ch))), "reviewed": self.tp.gt(h.stem(ch)).exists(),
                 "findings": check.get("findings", []), "run": hs.get("runs", {}).get(ch, {}),
-                "checked": bool(check),
+                "checked": bool(check), "no_video": bool(check.get("no_video")),
+                "no_video_findings": check.get("no_video_findings", 0),
             }
         return {"id": h.id, "number": h.number, "label": h.label, "start": h.start, "end": h.end,
                 "status": hs.get("status", "new"), "pilots": pilots, "decisions": hs.get("decisions", {}),
@@ -429,8 +431,9 @@ class EventDay:
         if not h:
             return
         stems = [h.stem(c) for c in h.pilots if self.tp.race_data(h.stem(c)).exists()]
+        quads = {h.stem(q.channel): (str(q.video), tuple(q.rect)) for q in h.quads if h.stem(q.channel) in stems}
         if stems:
-            self.jobs[f"l:{hid}"] = ("label", hid, self.pool.submit_label(self.tp.dir, stems), {})
+            self.jobs[f"l:{hid}"] = ("label", hid, self.pool.submit_label(self.tp.dir, stems, quads), {})
 
     # learning ------------------------------------------------------
 
@@ -461,16 +464,25 @@ class EventDay:
                 hs["status"] = "analysing"
 
     def _run_learn(self, runs: List[tuple], n_gates: int):
-        stems = []
+        """Learn from the chosen runs. With FPVTrackside's timing, each run's
+        lap crossings are passed in as known G1 moments (any run with one
+        full lap is enough, and learning is much faster)."""
+        stems, g1 = [], {}
+        offset = self.state.get("offset") or 0.0
         for hid, ch in runs:
             h = self.event.heats.get(hid)
-            if h and self.tp.race_data(h.stem(ch)).exists():
-                stems.append(h.stem(ch))
+            if not h or not self.tp.race_data(h.stem(ch)).exists():
+                continue
+            stems.append(h.stem(ch))
+            q = self._quad(h, ch)
+            if self.event.has_timing and q:
+                dets = self.event.timing(h).get(ch, [])
+                g1[h.stem(ch)] = [float(self.event.to_video(q.video, d["t"] - offset)) for d in dets]
         if not stems:
             self.log("Nothing analysed to learn from")
             return
         self._learn_stems = stems
-        self.learning = self.pool.submit_learn(self.tp.dir, stems, n_gates)
+        self.learning = self.pool.submit_learn(self.tp.dir, stems, n_gates, g1_times=g1 or None)
 
     def _learned(self):
         fut, self.learning = self.learning, None
@@ -527,9 +539,13 @@ class EventDay:
             if not self.event.has_timing:                     # no timing system: the video's own laps
                 out[c] = {"timing_laps": None, "video_laps": len(race.get("laps", [])), "findings": []}
                 continue
+            pic = self.tp.runs_dir / f"{h.stem(c)}.picture.json"
+            gray = json.loads(pic.read_text(encoding="utf-8")).get("gray", []) if pic.exists() else []
             res = lapcheck.check_pilot(race, timing.get(c, []), lambda t, v=q.video: self.event.to_clock(v, t),
                                        self._n_gates(), offset, h.start, h.end, self._lap_ref(),
-                                       low_quality=q.kind == "dji")
+                                       low_quality=q.kind == "dji", gray=gray,
+                                       race_video=(float(self.event.to_video(q.video, h.start)),
+                                                   float(self.event.to_video(q.video, h.end))))
             for f in res["findings"]:
                 f["key"] = lapcheck_key(f)
             out[c] = res

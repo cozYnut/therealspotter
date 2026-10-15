@@ -146,6 +146,48 @@ def split_quads(frame: np.ndarray) -> List[np.ndarray]:
     return [frame[:h2, :w2], frame[:h2, w2:2 * w2], frame[h2:2 * h2, :w2], frame[h2:2 * h2, w2:2 * w2]]
 
 
+NO_PICTURE_STD = 8.0      # a feed this flat (FPVTrackside's gray "no signal") has no picture
+
+
+def no_picture(img) -> bool:
+    """A flat gray feed (measured inside the picture: the 2×2 grid's divider
+    lines at the edges would make a flat feed look busy). Gray feeds measure
+    ~1–3, real pictures 40+."""
+    h, w = img.shape[:2]
+    return img[h // 20: h - h // 20: 4, w // 20: w - w // 20: 4].std() < NO_PICTURE_STD
+
+
+def gray_intervals(times: List[float], step: float, min_len: float = 1.0) -> List[List[float]]:
+    """Times with no picture → [start, end] intervals at least min_len long."""
+    out = []
+    for t in sorted(times):
+        if out and t - out[-1][1] <= 2 * step:
+            out[-1][1] = t
+        else:
+            out.append([t, t])
+    return [[round(a, 2), round(b + step, 2)] for a, b in out if b + step - a >= min_len]
+
+
+def sample_no_picture(path, rect, every: float = 1.0) -> dict:
+    """No-picture intervals of one quadrant by sampling a frame every `every` s
+    (for runs analysed before the analysis recorded it)."""
+    cap = cv2.VideoCapture(str(path))
+    dur = (cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) / (cap.get(cv2.CAP_PROP_FPS) or 30.0)
+    gray, t = [], 0.0
+    x, y, w, h = rect
+    while t < dur:
+        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
+        ok, f = cap.read()
+        if ok:
+            H, W = f.shape[:2]
+            c = f[int(round(y * H)):int(round((y + h) * H)), int(round(x * W)):int(round((x + w) * W))]
+            if no_picture(c):
+                gray.append(t)
+        t += every
+    cap.release()
+    return {"duration": round(dur, 2), "gray": gray_intervals(gray, every)}
+
+
 class QuadReader:
     """One pilot's picture from a video, read in place (no copy is made):
     the quadrant `rect` (x, y, w, h as fractions of the frame) scaled to
@@ -164,6 +206,7 @@ class QuadReader:
         self.frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT)) // self.step
         self.rect, self.size = tuple(rect), tuple(size) if size else None
         self.t = 0.0
+        self.gray_t: List[float] = []            # times with no picture (a flat gray feed)
 
     def read(self):
         ok, frame = self.cap.read()
@@ -177,6 +220,8 @@ class QuadReader:
         crop = frame[int(round(y * H)):int(round((y + h) * H)), int(round(x * W)):int(round((x + w) * W))]
         if self.size and (crop.shape[1], crop.shape[0]) != self.size:
             crop = cv2.resize(crop, self.size, interpolation=cv2.INTER_AREA)
+        if no_picture(crop):
+            self.gray_t.append(self.t)
         return True, crop
 
     def release(self):

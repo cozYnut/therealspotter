@@ -68,24 +68,36 @@ def _analyse_quad(video: str, rect, out_json: str, n_gates: int, log_path: str, 
             reader = QuadReader(video, rect)
             run_race_extraction(video, _W["model"], mem, out_json, clip_device=_W["clip"],
                                 gate_id_logic="greedy", det_device=_W["device"], reader=reader, stem=stem)
+        from race_day.capture import gray_intervals
+        _write_picture(out_json, stem, {"duration": round(reader.frame_count / reader.fps, 2),
+                                        "gray": gray_intervals(reader.gray_t, 1.0 / reader.fps)})
     finally:
         os.unlink(mem)
     return {"seconds": round(time.time() - t0, 1), "device": _W["device"]}
 
 
-def _label(track_dir: str, stems: List[str]) -> dict:
+def _write_picture(race_json, stem: str, data: dict):
+    """<stem>.picture.json: when the pilot's feed had no picture (gray)."""
+    Path(race_json).with_name(f"{stem}.picture.json").write_text(json.dumps(data), encoding="utf-8")
+
+
+def _label(track_dir: str, stems: List[str], quads=None) -> dict:
     from dataset_paths import TrackPaths
     from race_day import labeling
+    from race_day.capture import sample_no_picture
     tp = TrackPaths(Path(track_dir))
+    for s, (video, rect) in (quads or {}).items():      # runs analysed before pictures were recorded
+        if not (tp.runs_dir / f"{s}.picture.json").exists():
+            _write_picture(tp.race_data(s), s, sample_no_picture(video, rect))
     return {s: labeling.label_run(tp, s) for s in stems}
 
 
-def _learn(track_dir: str, stems: List[str], n_gates: int, log_path: str) -> dict:
+def _learn(track_dir: str, stems: List[str], n_gates: int, log_path: str, g1_times=None) -> dict:
     from dataset_paths import TrackPaths
     from race_day import labeling
     t0 = time.time()
     with open(log_path, "w") as log, contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
-        res = labeling.learn(TrackPaths(Path(track_dir)), stems, n_gates, verbose=True)
+        res = labeling.learn(TrackPaths(Path(track_dir)), stems, n_gates, verbose=True, g1_times=g1_times)
     res["seconds"] = round(time.time() - t0, 1)
     return res
 
@@ -109,12 +121,13 @@ class AnalysisPool:
         log = Path(out_json).with_name(f"{stem}.analysis.log")
         return self.pool.submit(_analyse_quad, str(video), tuple(rect), str(out_json), n_gates, str(log), stem)
 
-    def submit_label(self, track_dir: Path, stems: List[str]) -> Future:
-        return self.pool.submit(_label, str(track_dir), list(stems))
+    def submit_label(self, track_dir: Path, stems: List[str], quads=None) -> Future:
+        """quads: stem → (video, rect), to record missing no-picture intervals."""
+        return self.pool.submit(_label, str(track_dir), list(stems), quads)
 
-    def submit_learn(self, track_dir: Path, stems: List[str], n_gates: int) -> Future:
+    def submit_learn(self, track_dir: Path, stems: List[str], n_gates: int, g1_times=None) -> Future:
         log = Path(track_dir) / "learn.log"
-        return self.pool.submit(_learn, str(track_dir), list(stems), n_gates, str(log))
+        return self.pool.submit(_learn, str(track_dir), list(stems), n_gates, str(log), g1_times)
 
     def _pids(self) -> List[int]:
         procs = getattr(self.pool, "_processes", None) or {}

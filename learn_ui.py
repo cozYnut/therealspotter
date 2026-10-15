@@ -42,7 +42,8 @@ auto-saved as <track>/gt/<video>.gt.json.  Pick videos from
   X                Reject: no real pass here (false pass)
   A                Add a pass the detector missed, at the playhead
   M                Mark a gate the pilot skipped, at the playhead
-  T                Cycle tag: crash/clipped → bad video → unsure → none
+  T                Cycle tag: crash/clipped → bad video → reverse → unsure → none
+                   (reverse = the pilot flew the gate from the wrong side)
   Backspace        Undo review of the selected pass (deletes added ones)
   S / Ctrl+S       Save now (saves after every change anyway)
 
@@ -110,8 +111,13 @@ _REVIEW_COLORS = {
     "skipped":  QColor(180, 100, 255),
     "rejected": QColor(230,  60,  60),
 }
-_REVIEW_TAGS = [None, "crash_clipped", "bad_video", "unsure"]
-_TAG_LABELS = {None: "", "crash_clipped": "crash/clipped", "bad_video": "bad video", "unsure": "unsure"}
+# a 2×2 video (four pilots): quadrant name and rect (x, y, w, h as fractions)
+_QUADS = [("top left", (0.0, 0.0, 0.5, 0.5)), ("top right", (0.5, 0.0, 0.5, 0.5)),
+          ("bottom left", (0.0, 0.5, 0.5, 0.5)), ("bottom right", (0.5, 0.5, 0.5, 0.5))]
+
+_REVIEW_TAGS = [None, "crash_clipped", "bad_video", "reverse", "unsure"]
+_TAG_LABELS = {None: "", "crash_clipped": "crash/clipped", "bad_video": "bad video",
+               "reverse": "reverse", "unsure": "unsure"}     # reverse: flown from the wrong side
 
 
 def _gate_color(gate_type: str) -> QColor:
@@ -780,6 +786,23 @@ class MainWindow(QMainWindow):
         lv.setContentsMargins(0, 0, 0, 0)
         lv.setSpacing(4)
 
+        # 2×2 review: switch between the four pilots' feeds
+        self._feed_bar = QWidget()
+        fbl = QHBoxLayout(self._feed_bar)
+        fbl.setContentsMargins(0, 0, 0, 0)
+        fbl.addWidget(QLabel("Feed:"))
+        self._feed_btns = []
+        for i in range(4):
+            b = QPushButton(_QUADS[i][0])
+            b.setCheckable(True)
+            b.clicked.connect(lambda _=False, i=i: self._quad_select(i))
+            fbl.addWidget(b)
+            self._feed_btns.append(b)
+        fbl.addStretch()
+        lv.addWidget(self._feed_bar)
+        self._feed_bar.setVisible(False)
+        self._quad = None
+
         self._video = VideoPlayer()
         self._video.position_changed.connect(self._on_position)
         lv.addWidget(self._video, stretch=1)
@@ -897,7 +920,7 @@ class MainWindow(QMainWindow):
         self._review_help = QLabel(
             "N/⇧N next/prev pending   0-9 gate ID   Enter accept\n"
             "X false pass   A add missed pass   M pilot skipped gate\n"
-            "T tag   ⌫ undo   ↑/↓ nudge 1 frame before Enter"
+            "T tag (crash · bad video · reverse · unsure)   ⌫ undo   ↑/↓ nudge 1 frame before Enter"
         )
         self._review_help.setStyleSheet("color:#888; font-size:9px;")
         rv.addWidget(self._review_help)
@@ -1878,12 +1901,19 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Empty gate memory", f"No gates in:\n{mem_path}")
             return
 
+        kind = self._ask_feed_kind(Path(path).name)
+        if kind is None:
+            return
+        if kind == "2x2":
+            self._open_quad_review(path, tp, str(mem_path))
+            return
+        self._quad_off()
         stem = Path(path).stem
         self.open_review(path, str(mem_path), str(tp.gt(stem)), str(tp.race_data(stem)),
                          title=f"{tp.name} / {Path(path).name}")
 
     def open_review(self, path: str, mem_path: str, gt_path: str, race_path: str,
-                    title: str = "", crop=None):
+                    title: str = "", crop=None, wait: bool = False):
         """Review one video (or one pilot's quadrant of a 2×2 video, crop) —
         also used by race_day_app: python learn_ui.py --review …"""
         try:
@@ -1892,7 +1922,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Cannot read gate memory:\n{mem_path}\n\n{e}")
             return
-        if crop and not Path(race_path).exists():
+        if crop and not Path(race_path).exists() and not wait:
             QMessageBox.warning(self, "Not analysed", "Analyse this heat in race_day_app first.")
             return
         self._video.set_crop(crop)
@@ -1928,9 +1958,146 @@ class MainWindow(QMainWindow):
             self._review_step(+1)
         elif self._race_data is not None:
             self._prefill_from_race_data()
+        elif wait:
+            self._status.showMessage("This feed is still being analysed — its passes appear when it's done.")
         else:
             self._start_race_extraction()
         self._update_mode_ui()
+
+    # ── REVIEW of a 2×2 video: four pilots' feeds ─────────────
+
+    def _ask_feed_kind(self, name: str) -> Optional[str]:
+        box = QMessageBox(self)
+        box.setWindowTitle("Review video")
+        box.setText(f"{name}\n\nIs this one pilot's feed, or a 2×2 grid of four pilots?")
+        single = box.addButton("Single feed", QMessageBox.ButtonRole.AcceptRole)
+        quad = box.addButton("2×2 (four pilots)", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        return {single: "single", quad: "2x2"}.get(box.clickedButton())
+
+    def _open_quad_review(self, path: str, tp, mem_path: str):
+        """Analyse all four feeds (in place, in parallel) and review them one at a
+        time; the feed bar above the video switches pilots. Each feed has its own
+        files: <video>_Q1 … _Q4 (race_data, gt), and <video>.feeds.json keeps
+        the pilot names."""
+        stem = Path(path).stem
+        info_path = tp.runs_dir / f"{stem}.feeds.json"
+        try:
+            names = json.loads(info_path.read_text(encoding="utf-8"))["names"]
+        except Exception:
+            names = self._ask_pilot_names()
+            if names is None:
+                return
+            tp.runs_dir.mkdir(parents=True, exist_ok=True)
+            info_path.write_text(json.dumps({"names": names}), encoding="utf-8")
+        feeds = []
+        for i, (pos, rect) in enumerate(_QUADS):
+            fs = f"{stem}_Q{i + 1}"
+            feeds.append({"name": names[i] or pos, "pos": pos, "rect": rect, "stem": fs,
+                          "gt": str(tp.gt(fs)), "race": str(tp.race_data(fs))})
+        self._quad = {"path": path, "tp": tp, "mem": mem_path, "feeds": feeds, "procs": {}, "pct": {}, "cur": None}
+        self._feed_bar.setVisible(True)
+        self._quad_start_analysis()
+        self._quad_select(0)
+
+    def _ask_pilot_names(self) -> Optional[List[str]]:
+        from PyQt6.QtWidgets import QDialog, QDialogButtonBox, QFormLayout, QLineEdit
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Pilots in the 2×2 video")
+        form = QFormLayout(dlg)
+        edits = []
+        for pos, _ in _QUADS:
+            e = QLineEdit()
+            e.setPlaceholderText("pilot name (optional)")
+            form.addRow(pos, e)
+            edits.append(e)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return [e.text().strip() for e in edits]
+
+    def _quad_start_analysis(self):
+        q = self._quad
+        todo = [i for i, f in enumerate(q["feeds"]) if not Path(f["race"]).exists()]
+        if not todo:
+            return
+        if not self._ensure_model():
+            self._status.showMessage("No detector model — Set Model, then reopen the video.")
+            return
+        for i in todo:
+            f = q["feeds"][i]
+            Path(f["race"]).parent.mkdir(parents=True, exist_ok=True)
+            proc = QProcess(self)
+            proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+            proc.readyReadStandardOutput.connect(lambda i=i, proc=proc: self._quad_output(i, proc))
+            proc.finished.connect(lambda code, _st, i=i: self._quad_done(i, code))
+            args = [str(Path(__file__).parent / "extract_race.py"), "--video", q["path"],
+                    "--crop", ",".join(str(x) for x in f["rect"]), "--stem", f["stem"],
+                    "--det-model", self._det_model_path, "--gate-memory", q["mem"],
+                    "--output", f["race"], "--clip-device", self._clip_device]
+            if self._clip_device == "mps":
+                args += ["--det-device", "mps"]
+            proc.start(sys.executable, args)
+            q["procs"][i] = proc
+            q["pct"][i] = 0
+        self._quad_labels()
+
+    def _quad_output(self, i: int, proc):
+        if self._quad is None:
+            return
+        raw = bytes(proc.readAllStandardOutput()).decode("utf-8", errors="replace")
+        for line in raw.splitlines():
+            if line.startswith("Progress:"):
+                try:
+                    self._quad["pct"][i] = int(float(line.split("%")[0].split()[-1]))
+                except ValueError:
+                    pass
+        self._quad_labels()
+
+    def _quad_done(self, i: int, code: int):
+        q = self._quad
+        if q is None:
+            return
+        q["procs"].pop(i, None)
+        f = q["feeds"][i]
+        q["pct"][i] = 100 if code == 0 and Path(f["race"]).exists() else -1
+        self._quad_labels()
+        if q["cur"] == i and self._mode == "review" and self._race_path == f["race"] and Path(f["race"]).exists():
+            self._load_race_data(f["race"])
+            if not self._review_marks:
+                self._prefill_from_race_data()
+            self._status.showMessage(f"{f['name']}: analysed — review its passes")
+
+    def _quad_labels(self):
+        q = self._quad
+        for i, b in enumerate(self._feed_btns):
+            f = q["feeds"][i]
+            pct = q["pct"].get(i)
+            state = (" ⚠ failed" if pct == -1 else f" {pct}%" if pct is not None and pct < 100
+                     else " ✓" if Path(f["gt"]).exists() else "")
+            b.setText(f"{i + 1} · {f['name']}{state}")
+            b.setChecked(i == q["cur"])
+
+    def _quad_select(self, i: int):
+        q = self._quad
+        if q is None:
+            return
+        if q["cur"] is not None and self._mode == "review":
+            self._save_gt()
+        q["cur"] = i
+        f = q["feeds"][i]
+        self.open_review(q["path"], q["mem"], f["gt"], f["race"],
+                         title=f"{q['tp'].name} / {Path(q['path']).name} · {f['pos']}: {f['name']}",
+                         crop=f["rect"], wait=True)
+        self._quad_labels()
+
+    def _quad_off(self):
+        self._quad = None
+        self._feed_bar.setVisible(False)
 
     def _enter_review_mode(self):
         if self._mode != "review":
@@ -1948,6 +2115,7 @@ class MainWindow(QMainWindow):
             w.setVisible(False)
 
     def _exit_review_mode(self):
+        self._quad_off()
         self._mode = self._mode_before_review
         for b in self._learn_btns:
             b.setEnabled(True)

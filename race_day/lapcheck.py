@@ -87,11 +87,30 @@ def _mid_lap(passes: List[dict], t: float, n_gates: int, win: float = 2.0) -> bo
     return bool(before and after)
 
 
+NO_VIDEO_SHARE = 0.8   # no picture for this share of the race → the run can't be checked ("no video");
+                       # a run with less is checked where it has a picture
+
+
+def _share(intervals, a: float, b: float) -> float:
+    if b <= a:
+        return 0.0
+    return sum(max(0.0, min(y, b) - max(x, a)) for x, y in intervals) / (b - a)
+
+
 def check_pilot(race: dict, dets: List[dict], to_clock, n_gates: int, offset: float,
-                start: float, end: float, lap_ref: Optional[float], low_quality: bool = False) -> dict:
+                start: float, end: float, lap_ref: Optional[float], low_quality: bool = False,
+                gray: Optional[List[List[float]]] = None, race_video: Optional[tuple] = None) -> dict:
     """race: the pilot's labelled race_data; dets: the timing system's valid
     detections for this channel ({"t", "holeshot", "id"}); to_clock: video
-    seconds → clock seconds. Returns laps from both sides and the findings."""
+    seconds → clock seconds. gray: video intervals with no picture (a flat
+    gray feed); race_video: the race's start and end in video seconds.
+    Returns laps from both sides and the findings. With no picture for most
+    of the race the run is "no video" and nothing is reported; otherwise
+    nothing is reported while the picture is missing."""
+    gray = gray or []
+    if race_video and _share(gray, *race_video) >= NO_VIDEO_SHARE:
+        return {"timing_laps": max(0, len(dets) - 1), "video_laps": 0, "matched": 0, "findings": [],
+                "no_video": True}
     passes = [p for p in race.get("passes", []) if p.get("gate_id", -1) >= 1]
     lo, hi = start - 2.0, end + 30.0
     bnd = []
@@ -165,9 +184,12 @@ def check_pilot(race: dict, dets: List[dict], to_clock, n_gates: int, offset: fl
                      "timing doesn't have — check it")
         findings.append(f)
 
+    blind = [f for f in findings if f.get("video_t") is not None
+             and any(a - 1.0 <= f["video_t"] <= b + 1.0 for a, b in gray)]
+    findings = [f for f in findings if f not in blind]
     findings.sort(key=lambda f: f["t"])
     return {"timing_laps": max(0, len(det) - 1), "video_laps": max(0, len(bnd) - 1),
-            "matched": len(md), "findings": findings}
+            "matched": len(md), "findings": findings, "no_video_findings": len(blind)}
 
 
 def heat_offset(per_pilot_diffs: List[float]) -> Optional[float]:

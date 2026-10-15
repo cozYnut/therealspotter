@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem, QMessageBox, QPushButton, QSplitter, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
+JUMP_FRAMES = 6         # clicking a lap jumps this many frames before its pass
 STATUS_ICON = {"new": "•", "analysing": "⏳", "analysed": "◦", "checked": "✓", "updated": "↻"}
 LANE_COLORS = {"timing": QColor(235, 235, 235), "video": QColor(80, 200, 120), "flag": QColor(255, 160, 40),
                "mark": QColor(90, 160, 255), "gate": QColor(60, 130, 90)}
@@ -166,6 +167,16 @@ class HeatPlayer(QWidget):
         self.step()
         if self.playing:
             self._t0, self._p0 = time.time(), self.t
+
+    def seek_frames_before(self, t: float, frames: int):
+        """Show the frame `frames` frames before time t (counted in real frames:
+        heat videos don't have evenly spaced frames)."""
+        if not self.cap:
+            return
+        self.cap.set(cv2.CAP_PROP_POS_MSEC, min(max(t, 0.0), self.duration) * 1000.0)
+        idx = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, idx - frames))
+        self.step()
 
     def step(self):
         if not self.cap:
@@ -388,7 +399,8 @@ class EventPage(QWidget):
         for i, r in enumerate(rows):
             it = self.heats.item(i)
             laps = ", ".join(f"{c} {r['pilots'][c]}" + (f" ({r['timing_laps'][c]})" if r["timing_laps"].get(c) is not None
-                                                          else "") for c in sorted(r["pilots"]))
+                                                          else "") + (" 📵" if c in r.get("no_video", []) else "")
+                             for c in sorted(r["pilots"]))
             flag = f"  ⚠ {r['open']}" if r["open"] else ""
             it.setText(f"{STATUS_ICON.get(r['status'], '•')} {r['number']}  {r['label']}{flag}\n    {laps}")
             it.setData(Qt.ItemDataRole.UserRole, r["id"])
@@ -466,6 +478,9 @@ class EventPage(QWidget):
             head = QTreeWidgetItem([ch, "", f"{p['pilot']}  —  {'timing' if self.day.event.has_timing else 'video'} "
                                     f"{n_t} laps" + (f" · video {n_v} laps" if self.day.event.has_timing else "")
                                     + (f" · ⚠ {open_n} to check" if open_n else "")
+                                    + (" · 📵 no video — no picture recorded for this pilot" if p.get("no_video") else "")
+                                    + (f" · {p['no_video_findings']} not checked (no picture then)"
+                                       if p.get("no_video_findings") else "")
                                     + ("" if run.get("status") in (None, "analysed") else f" · {run.get('status')}"),
                                     "", ""])
             head.setData(0, Qt.ItemDataRole.UserRole, {"channel": ch, "pilot_row": True})
@@ -491,6 +506,8 @@ class EventPage(QWidget):
                 elif f:
                     dec = d["decisions"].get(f"{ch}|{f['key']}")
                     chk = (f"⚠ {f['reason']}" if not dec else f"{dec}: {f['reason']}")
+                elif p.get("no_video"):
+                    chk = "no video"
                 elif p.get("checked"):
                     chk = "✓ seen in the video"
                 else:
@@ -541,8 +558,8 @@ class EventPage(QWidget):
     def _jump(self, item, _col=0):
         data = item.data(0, Qt.ItemDataRole.UserRole) or {}
         if data.get("video_t") is not None:
-            self.player.stop()
-            self.player.seek(max(0.0, data["video_t"] - 1.5))
+            self.player.stop()                       # 6 frames before the pass, to watch it happen
+            self.player.seek_frames_before(data["video_t"], JUMP_FRAMES)
 
     # ── actions ────────────────────────────────────────────────
 
@@ -668,14 +685,14 @@ class EventPage(QWidget):
         if not runs:
             return QMessageBox.information(self, "Learn", "Tick ☑ the pilot runs to learn the track from first — "
                                            "in the heat list (all pilots of a heat) or per pilot in the heat view.\n\n"
-                                           "About 5 clean runs with at least 3 laps each are enough.")
+                                           "About 5 runs with at least one full lap each are enough.")
         heats = {r["id"]: r for r in self.day.heat_list()}
         lines = [f"heat {heats[h]['number']} · {ch} {heats[h]['pilots'].get(ch, '?')} — "
                  f"{heats[h]['timing_laps'].get(ch, '?')} laps" for h, ch in runs if h in heats]
-        few = [l for l, (h, ch) in zip(lines, runs) if (heats.get(h, {}).get("timing_laps", {}).get(ch) or 0) < 3]
+        few = [l for l, (h, ch) in zip(lines, runs) if (heats.get(h, {}).get("timing_laps", {}).get(ch) or 0) < 1]
         n, ok = QInputDialog.getInt(self, "Learn the track",
                                     f"Learning from {len(runs)} pilot runs:\n  " + "\n  ".join(lines) +
-                                    (f"\n\n⚠ {len(few)} of them have fewer than 3 laps." if few else "") +
+                                    (f"\n\n⚠ {len(few)} of them have no full lap — they add little." if few else "") +
                                     "\n\nNumber of gates on the track:",
                                     int(self.day.state.get("n_gates") or 10), 3, 40)
         if ok:

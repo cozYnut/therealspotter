@@ -313,7 +313,7 @@ def features(v: Video, c: Cand, ratios: Dict[str, float]) -> Dict[str, float]:
     f["next_big"] = nxt
     f["det"] = float(c.det is not None)
     # camera motion
-    med_res = float(np.median(v.motion["resid"])) or 1e-3
+    med_res = _moving_median(v)
     f["exp_before"] = float(_mwin(v, "expand", c.t - 0.5, c.t).mean())
     f["exp_after"] = float(_mwin(v, "expand", c.t, c.t + 0.5).mean())
     f["exp_peak"] = float(_mwin(v, "expand", c.t - 0.2, c.t + 0.2).max())
@@ -321,6 +321,21 @@ def features(v: Video, c: Cand, ratios: Dict[str, float]) -> Dict[str, float]:
                       + abs(_mwin(v, "pan_y", c.t, c.t + 0.5).mean() - _mwin(v, "pan_y", c.t - 0.5, c.t).mean()))
     f["chaos"] = float(_mwin(v, "resid", c.t, c.t + 0.3).max() / med_res)
     return f
+
+
+STILL_RESID = 1e-4     # motion residual of a frame with no picture (gray feed) or a pilot standing still
+TYPICAL_RESID = 0.02   # a normal feed's median residual (fallback)
+
+
+def _moving_median(v: Video) -> float:
+    """The feed's usual camera-motion noise, over frames that move: a feed
+    gray or still for most of the video (a late start, an early crash) would
+    otherwise give ~0, and every real pass would look like chaos."""
+    if "_med_res" not in v.motion:
+        r = np.asarray(v.motion.get("resid") or [], dtype=float)
+        moving = r[r > STILL_RESID]
+        v.motion["_med_res"] = float(np.median(moving)) if len(moving) >= 30 else TYPICAL_RESID
+    return v.motion["_med_res"]
 
 
 TRACK_FEATS = ["dur", "n_aligned", "amax", "aend", "growth", "cmin", "cend", "yolo", "is_arch",

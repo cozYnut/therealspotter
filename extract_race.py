@@ -459,6 +459,9 @@ def main():
                              "(gate_decoder.py); greedy: GateDB one pass at a time")
     parser.add_argument("--require-same-type", action="store_true", default=False,
                         help="Only match a detected gate against memory slots of the same type")
+    parser.add_argument("--crop", default=None,
+                        help="x,y,w,h (fractions): analyse one pilot's quadrant of a 2×2 video, read in place")
+    parser.add_argument("--stem", default=None, help="Name of this run's files (default: the video's name)")
     args = parser.parse_args()
 
     tp = track_of(args.video)
@@ -468,7 +471,12 @@ def main():
         args.gate_memory = str(tp.gate_memory)
     if args.output is None:
         tp.runs_dir.mkdir(parents=True, exist_ok=True)
-        args.output = str(tp.race_data(Path(args.video).stem))
+        args.output = str(tp.race_data(args.stem or Path(args.video).stem))
+
+    reader = None
+    if args.crop:
+        from race_day.capture import QuadReader
+        reader = QuadReader(args.video, [float(x) for x in args.crop.split(",")])
 
     run_race_extraction(
         video_path=args.video,
@@ -486,6 +494,9 @@ def main():
         pass_logic=args.pass_logic,
         gate_id_logic=args.gate_id,
         det_device=args.det_device,
+        reader=reader,
+        stem=args.stem,
+        track=tp,
     )
 
 
