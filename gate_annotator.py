@@ -213,6 +213,12 @@ def auto_keypoints(det: Detection, frame_w: int, frame_h: int) -> list[Keypoint]
     return []
 
 
+def _kpt_weights_exist(p) -> bool:
+    """A keypoint model is one .pt file or a list of them (averaged)."""
+    import gate_keypoints as gk
+    return gk.weights_exist(p)
+
+
 class InferenceEngine:
     def __init__(
         self,
@@ -225,10 +231,12 @@ class InferenceEngine:
         self.device   = device
         print(f"[Inference] Loading detect model: {det_model_path}")
         self.det_model = YOLO(det_model_path)
-        self.kpt_models: dict[str, YOLO] = {}
+        import gate_keypoints as gk
+        self.kpt_models: dict = {}
         for cls_name, path in (kpt_model_paths or {}).items():
             print(f"[Inference] Loading keypoint model ({cls_name}): {path}")
-            self.kpt_models[cls_name] = YOLO(path)
+            # one model or several (points averaged); run on the padded crop like when it was trained
+            self.kpt_models[cls_name] = gk.KptPredictor(path)
 
     def predict_frame(self, frame: np.ndarray) -> list[Detection]:
         h, w = frame.shape[:2]
@@ -240,10 +248,12 @@ class InferenceEngine:
             cls_name = CLASS_NAMES.get(cls_idx, "unknown")
             conf     = float(box.conf[0])
             det = Detection(x1, y1, x2, y2, cls_idx, cls_name, conf)
+            kps = None
             if cls_name in self.kpt_models:
-                crop, (ox, oy) = self._crop_padded(frame, det)
-                kres = self.kpt_models[cls_name](crop, verbose=False, device=self.device)[0]
-                det.keypoints = self._parse_keypoints(kres, ox, oy)
+                kps = self.kpt_models[cls_name](frame, {"x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                                                        "class_name": cls_name})
+            if kps:
+                det.keypoints = [Keypoint(k["x"], k["y"], k["vis"]) for k in kps]
             else:
                 det.keypoints = auto_keypoints(det, w, h)
             detections.append(det)
@@ -448,6 +458,17 @@ class DatasetManager:
         """Return sorted list of label JSON paths for imported images."""
         d = self.root / "labels" / self._IMPORTED
         return sorted(d.glob("*.json")) if d.exists() else []
+
+    def save_label_at(self, label_path: str, dets: list[Detection]) -> None:
+        """Save a Full Dataset frame's gates to its own label file (pool or video
+        folder), keeping its approval flags."""
+        lbl = Path(label_path)
+        if not lbl.exists():
+            return
+        payload = json.loads(lbl.read_text(encoding="utf-8"))
+        payload["gates"] = [d.to_dict() for d in dets]
+        payload["bbox_approved"] = True
+        lbl.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def save_imported_label(self, pool_stem: str, dets: list[Detection]) -> None:
         lbl = self.root / "labels" / self._IMPORTED / f"{pool_stem}.json"
@@ -972,54 +993,27 @@ class Trainer:
     def finetune_keypoints(
         self,
         class_name: str,
-        epochs: int = 50,
-        batch: int = 16,
-        lr0: float = 0.002,
+        epochs: int = 40,
+        batch: int = 32,
+        lr0: float = 0.001,
         patience: int = 10,
         warmup_epochs: float = 0.5,
-        imgsz: int = 640,
+        imgsz: int = 320,
         retrain_from_base: bool = False,
     ) -> dict:
+        """Keypoints are trained on crops around each gate (as they are run),
+        from every OK frame, and scored on the held-out OK frames
+        (gate_keypoints.py). Caller decides whether to promote."""
         if class_name not in KPT_NAMES:
             raise ValueError(class_name)
-
-        val_ids = self.dm.get_kpt_val_split(class_name)
-        if not val_ids:
-            val_ids = self.dm.create_kpt_val_split(class_name)
-
-        dataset = self.dm.export_keypoint_dataset(class_name, frozen_val_ids=val_ids)
-        if not (dataset / "data.yaml").exists():
-            return {"error": f"No '{class_name}' keypoint annotations to export"}
-
-        current = self._active_kpts.get(class_name)
-        start   = str(training_dir() / "yolo11n-pose.pt") if (retrain_from_base or not current) else current
-        ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run     = self.output_root / "keypoints" / class_name / ts
-        n       = len(KPT_NAMES[class_name])
-
-        print(f"[Trainer] {class_name}  kpt_shape=[{n},3]  epochs={epochs}  lr0={lr0}")
-        model = YOLO(start)
-        if self.device == "mps":
-            import torch
-            model.add_callback("on_train_epoch_end",
-                               lambda _: torch.mps.empty_cache())
-        res = model.train(
-            data=str(dataset / "data.yaml"),
-            epochs=epochs, imgsz=imgsz, device=self.device,
-            project=str(run), name="train", exist_ok=True,
-            lr0=lr0, batch=batch, patience=patience, warmup_epochs=warmup_epochs,
-        )
-        new_map  = self._map(res)
-        weights  = run / "train" / "weights" / "best.pt"
-        data_yaml = str(dataset / "data.yaml")
-        old_map  = self.eval_on_val(current, data_yaml) if current else 0.0
-
-        print(f"[Trainer] {class_name}  new={new_map:.4f}  old={old_map:.4f}")
-        return {
-            "weights":  str(weights) if weights.exists() else None,
-            "new_map":  new_map,
-            "old_map":  old_map,
-        }
+        import gate_keypoints as gk
+        current = None if retrain_from_base else self._active_kpts.get(class_name)
+        res = gk.retrain(class_name, start=current, recipe={"epochs": epochs})
+        if res.get("error"):
+            return res
+        print(f"[Trainer] {class_name}  new={res['new_map']:.4f}  old={res['old_map']:.4f}  "
+              f"(share of points within 5% of the gate size, held-out OK frames)")
+        return res
 
     # ── promotion (called after user confirms in UI) ──────────────────────────
 
@@ -1752,6 +1746,24 @@ class _ValidationWorker(QObject):
         self.finished.emit(result)
 
 
+class _KptPredictWorker(QObject):
+    """Runs gate_keypoints.apply in a thread (keypoints for every not-OK frame)."""
+    progress = Signal(int, int)
+    finished = Signal(dict)
+
+    def __init__(self, models: dict) -> None:
+        super().__init__()
+        self._models = models
+
+    def run(self) -> None:
+        import gate_keypoints as gk
+        try:
+            res = gk.apply(self._models, progress=lambda i, n: self.progress.emit(i, n))
+        except Exception as e:
+            res = {"error": f"{type(e).__name__}: {e}"}
+        self.finished.emit(res)
+
+
 class _ThumbLoader(QObject):
     """Background worker: generates / reads cached thumbnails and emits them."""
     thumb_ready = Signal(str, object)   # (label_path, QImage) — QImage is thread-safe
@@ -1774,8 +1786,15 @@ class _ThumbLoader(QObject):
             if self._stop:
                 break
             try:
-                stem       = Path(label_path).stem
-                cache_file = self._cache_dir / f"{stem}.jpg"
+                # one cache file per image (path + modification time): label file names
+                # repeat across video folders (000073.json in several), so the stem alone
+                # showed another frame's picture
+                try:
+                    mt = Path(image_path).stat().st_mtime_ns
+                except OSError:
+                    mt = 0
+                key        = hashlib.md5(f"{image_path}|{mt}".encode("utf-8")).hexdigest()[:20]
+                cache_file = self._cache_dir / f"{key}.jpg"
                 if cache_file.exists():
                     qimg = QImage(str(cache_file))
                     if not qimg.isNull():
@@ -1931,6 +1950,7 @@ class MainWindow(QMainWindow):
         # dataset-tab state
         self._mode: str                     = "video"   # "video" | "dataset"
         self._ds_current_stem: Optional[str] = None     # pool_stem of shown dataset image
+        self._ds_current_lp: Optional[str] = None       # its label file
         self._ds_frame: Optional[np.ndarray] = None
         self._import_worker: Optional[_ImportWorker] = None
         self._import_thread: Optional[QThread]       = None
@@ -1960,6 +1980,7 @@ class MainWindow(QMainWindow):
         self.addAction(QAction(self, shortcut=Qt.Key.Key_Right,       triggered=self._global_next))
         self.addAction(QAction(self, shortcut=QKeySequence("Ctrl+S"), triggered=self._save_frame))
         self.addAction(QAction(self, shortcut=Qt.Key.Key_Delete,      triggered=self._canvas.delete_selected))
+        self.addAction(QAction(self, shortcut=Qt.Key.Key_K,           triggered=self._kpt_ok_next))
 
         self._update_controls()
 
@@ -2192,6 +2213,18 @@ class MainWindow(QMainWindow):
         btn_refresh.clicked.connect(self._refresh_dataset_list)
         top.addWidget(btn_refresh)
 
+        self._btn_predict_kpt = QPushButton("✦ Predict KPT for not-OK frames")
+        self._btn_predict_kpt.setToolTip(
+            "Run the keypoint models in use on every frame whose keypoints aren't OK (red K).\n"
+            "OK frames (green K) and boxes are never changed; all labels are backed up first.")
+        self._btn_predict_kpt.clicked.connect(self._predict_kpt_not_ok)
+        top.addWidget(self._btn_predict_kpt)
+
+        self._kpt_count_lbl = QLabel("")
+        self._kpt_count_lbl.setToolTip("Frames with keypoints marked OK. Retrain the keypoint models "
+                                       "(Fine-tune…) every ~500 new OK frames.")
+        top.addWidget(self._kpt_count_lbl)
+
         self._ds_status = QLabel("")
         self._ds_status.setStyleSheet("font-size: 11px;")
         top.addWidget(self._ds_status)
@@ -2276,6 +2309,11 @@ class MainWindow(QMainWindow):
         self._btn_mark_kpt_ok.clicked.connect(lambda: self._bulk_set_approval(kpt=True))
         self._btn_mark_kpt_ok.setEnabled(False)
         bulk_row.addWidget(self._btn_mark_kpt_ok)
+
+        self._btn_kpt_ok_next = QPushButton("KPT ✓ + next  (K)")
+        self._btn_kpt_ok_next.setToolTip("Mark the shown frame's keypoints OK (green), save, go to the next frame")
+        self._btn_kpt_ok_next.clicked.connect(self._kpt_ok_next)
+        bulk_row.addWidget(self._btn_kpt_ok_next)
 
         self._btn_mark_kpt_no = QPushButton("Mark KPT ✗")
         self._btn_mark_kpt_no.clicked.connect(lambda: self._bulk_set_approval(kpt=False))
@@ -2536,7 +2574,10 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(
                     f"Saved frame {self._frame_idx} — {len(dets)} annotation(s)")
         elif self._mode == "dataset" and self._ds_current_stem:
-            self._dm.save_imported_label(self._ds_current_stem, dets)
+            if self._ds_current_lp:
+                self._dm.save_label_at(self._ds_current_lp, dets)      # video folders too, not only the pool
+            else:
+                self._dm.save_imported_label(self._ds_current_stem, dets)
             # update bbox_approved=True in the list item
             for item in self._ds_image_list.selectedItems():
                 item.setData(Qt.ItemDataRole.UserRole + 1, True)
@@ -2810,6 +2851,7 @@ class MainWindow(QMainWindow):
         self._ds_image_list.blockSignals(False)
         n = len(all_imgs)
         self._ds_status.setText(f"{n} image(s) in pool")
+        self._update_kpt_count()
         self._apply_filter()
 
         if thumb_items:
@@ -2862,6 +2904,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Cannot read: {img_path}")
             return
         self._ds_current_stem = str(payload["frame_idx"])
+        self._ds_current_lp = str(lf_path)
         self._ds_frame = frame
         self._canvas.set_frame(frame)
         dets = [Detection.from_dict(d) for d in payload.get("gates", [])]
@@ -2922,7 +2965,74 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         self._ds_image_list.viewport().update()
+        self._update_kpt_count()
         self._apply_filter()
+
+    # ── keypoint review ───────────────────────────────────────────────────────
+
+    KPT_RETRAIN_EVERY = 500
+
+    def _update_kpt_count(self) -> None:
+        n = sum(1 for r in range(self._ds_image_list.count())
+                if self._ds_image_list.item(r).data(Qt.ItemDataRole.UserRole + 2))
+        self._kpt_count_lbl.setText(f"Keypoints OK: {n}  (retrain every {self.KPT_RETRAIN_EVERY})")
+        self._kpt_count_lbl.setStyleSheet("color: #37c837; font-size: 11px; font-weight: bold;")
+
+    def _kpt_ok_next(self) -> None:
+        """K: the shown dataset frame's keypoints are OK → save, mark green, next frame."""
+        if self._mode != "dataset" or not self._ds_current_lp:
+            return
+        self._save_frame(silent=True)
+        self._dm.set_image_approval(self._ds_current_lp, kpt_approved=True)
+        row = self._label_to_row.get(self._ds_current_lp)
+        item = self._ds_image_list.item(row) if row is not None else None
+        if item is not None:
+            item.setData(Qt.ItemDataRole.UserRole + 2, True)
+        self._ds_image_list.viewport().update()
+        self._update_kpt_count()
+        self.statusBar().showMessage("Keypoints OK ✓")
+        self._ds_step(1)
+        self._apply_filter()
+
+    def _predict_kpt_not_ok(self) -> None:
+        import gate_keypoints as gk
+        models = gk.active_models()
+        if not models:
+            QMessageBox.information(self, "Predict keypoints", "No keypoint model is set yet (🔧 Set KP Model).")
+            return
+        n_todo = sum(1 for r in range(self._ds_image_list.count())
+                     if not self._ds_image_list.item(r).data(Qt.ItemDataRole.UserRole + 2))
+        if QMessageBox.question(
+                self, "Predict keypoints",
+                f"Run the keypoint models ({', '.join(sorted(models))}) on the {n_todo} frames whose keypoints "
+                "aren't OK?\n\nTheir keypoints are replaced; OK frames and all boxes stay as they are. "
+                "A backup of every label is saved first.") != QMessageBox.StandardButton.Yes:
+            return
+        if self._unsaved:
+            self._save_frame(silent=True)
+        self._kpt_progress = QProgressDialog("Predicting keypoints…", None, 0, max(n_todo, 1), self)
+        self._kpt_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self._kpt_progress.show()
+        self._kpt_thread = QThread()
+        self._kpt_worker = _KptPredictWorker(models)
+        self._kpt_worker.moveToThread(self._kpt_thread)
+        self._kpt_thread.started.connect(self._kpt_worker.run)
+        self._kpt_worker.progress.connect(lambda i, n: (self._kpt_progress.setMaximum(n), self._kpt_progress.setValue(i)))
+        self._kpt_worker.finished.connect(self._predict_kpt_done)
+        self._kpt_worker.finished.connect(self._kpt_thread.quit)
+        self._kpt_thread.start()
+
+    def _predict_kpt_done(self, res: dict) -> None:
+        self._kpt_progress.close()
+        if res.get("error"):
+            QMessageBox.warning(self, "Predict keypoints", res["error"])
+            return
+        g = ", ".join(f"{n} {c}" for c, n in sorted(res.get("gates", {}).items()))
+        self.statusBar().showMessage(f"Keypoints predicted on {res['frames']} frames ({g}). Backup: {res['backup']}")
+        if self._ds_current_lp:                         # show the new points on the frame on screen
+            row = self._label_to_row.get(self._ds_current_lp)
+            if row is not None:
+                self._load_dataset_row(row)
 
     def _bulk_set_val(self, in_val: bool) -> None:
         entry_ids = set()
@@ -3065,7 +3175,7 @@ class MainWindow(QMainWindow):
         self._trainer._active_detect = path
         kpt_paths = {cls: self._trainer.active_kpt_weights(cls)
                      for cls in KPT_NAMES if self._trainer.active_kpt_weights(cls)}
-        kpt_paths = {cls: p for cls, p in kpt_paths.items() if Path(p).exists()}
+        kpt_paths = {cls: p for cls, p in kpt_paths.items() if _kpt_weights_exist(p)}
         self._engine = InferenceEngine(path, kpt_paths)
         name = self._model_display_name(path)
         self._det_model_lbl.setText(name)
@@ -3101,7 +3211,7 @@ class MainWindow(QMainWindow):
         if det_path and Path(det_path).exists():
             kpt_paths = {cls: self._trainer.active_kpt_weights(cls)
                          for cls in KPT_NAMES if self._trainer.active_kpt_weights(cls)}
-            kpt_paths = {cls: p for cls, p in kpt_paths.items() if Path(p).exists()}
+            kpt_paths = {cls: p for cls, p in kpt_paths.items() if _kpt_weights_exist(p)}
             self._engine = InferenceEngine(det_path, kpt_paths)
         self._update_kpt_label()
         self.statusBar().showMessage(f"KP model set for '{cls_name}': {Path(path).name}")
@@ -3278,8 +3388,12 @@ class MainWindow(QMainWindow):
                     row.addWidget(QLabel(f"✗  {key}:  no weights produced"))
                 else:
                     arrow = "▲" if new_map > old_map else ("▼" if new_map < old_map else "=")
-                    lbl = (f"{key}   new mAP={new_map:.4f}   "
-                           f"old mAP={old_map:.4f}   {arrow}")
+                    if key in KPT_NAMES:            # keypoints: share of points within 5% of the gate size
+                        lbl = (f"{key} keypoints   new {100 * new_map:.1f}%   old {100 * old_map:.1f}%   {arrow}"
+                               f"   (points within 5% of the gate size, held-out OK frames)")
+                    else:
+                        lbl = (f"{key}   new mAP={new_map:.4f}   "
+                               f"old mAP={old_map:.4f}   {arrow}")
                     chk = QCheckBox(lbl)
                     chk.setChecked(new_map >= old_map)
                     promote_checks[key] = (chk, res)
