@@ -107,12 +107,53 @@ def tune_split(labels, test: set, frac: float = 0.1) -> set:
             and int(hashlib.md5(("tune|" + entry_id(f)).encode()).hexdigest(), 16) % 100 < frac * 100}
 
 
+EDGE_PAD = 0.6       # a gate cut off by the screen edge: the crop reaches this far past that edge
+FILL = 114           # outside the picture (the gray YOLO pads with)
+
+
 def crop_box(frame_wh, box, pad: float = CROP_PAD):
-    """The padded crop around a gate box: (x1, y1, x2, y2) in frame pixels."""
+    """The padded crop around a gate box: (x1, y1, x2, y2) in frame pixels.
+    It may reach past the frame: a gate cut off by the screen edge has
+    keypoints outside the picture, so on a side where the box touches the
+    edge the crop goes EDGE_PAD of the gate's size beyond it."""
     W, H = frame_wh
     x1, y1, x2, y2 = box
-    px, py = (x2 - x1) * pad, (y2 - y1) * pad
-    return (max(0.0, x1 - px), max(0.0, y1 - py), min(float(W), x2 + px), min(float(H), y2 + py))
+    w, h = x2 - x1, y2 - y1
+    m = 3
+    l = x1 - w * (EDGE_PAD if x1 <= m else pad)
+    t = y1 - h * (EDGE_PAD if y1 <= m else pad)
+    r = x2 + w * (EDGE_PAD if x2 >= W - m else pad)
+    b = y2 + h * (EDGE_PAD if y2 >= H - m else pad)
+    return (l, t, r, b)
+
+
+LEGACY_CROP = False  # True: the old crop, cut at the frame edge (only to score models trained that way)
+
+
+def extract_crop(img: np.ndarray, box, legacy: bool = False) -> Tuple[np.ndarray, Tuple[int, int]]:
+    """The crop image for a gate box (outside the picture filled with gray)
+    and its top-left corner in frame pixels (may be negative). legacy: the
+    old crop, cut at the frame edge, for models trained on it."""
+    H, W = img.shape[:2]
+    x1, y1, x2, y2 = (int(round(v)) for v in crop_box((W, H), box))
+    if legacy or LEGACY_CROP:
+        bx1, by1, bx2, by2 = box
+        px, py = (bx2 - bx1) * CROP_PAD, (by2 - by1) * CROP_PAD
+        x1, y1 = int(max(0.0, bx1 - px)), int(max(0.0, by1 - py))
+        x2, y2 = int(min(float(W), bx2 + px)), int(min(float(H), by2 + py))
+    out = np.full((max(1, y2 - y1), max(1, x2 - x1), 3), FILL, dtype=img.dtype)
+    sx1, sy1, sx2, sy2 = max(0, x1), max(0, y1), min(W, x2), min(H, y2)
+    if sx2 > sx1 and sy2 > sy1:
+        out[sy1 - y1:sy2 - y1, sx1 - x1:sx2 - x1] = img[sy1:sy2, sx1:sx2]
+    return out, (x1, y1)
+
+
+def train_vis(k: dict, W: int, H: int) -> int:
+    """Visibility used for training: a point outside the picture that was
+    marked absent (0) still has a real position (a corner past the screen
+    edge) — train on it as "not visible" (1). Absent inside the picture stays 0."""
+    outside = k["x"] < 0 or k["y"] < 0 or k["x"] >= W or k["y"] >= H
+    return 1 if (k["vis"] == 0 and outside) else k["vis"]
 
 
 def is_placeholder(g: dict) -> bool:
@@ -281,12 +322,20 @@ def make_drafts(only_ids: Optional[set] = None, out: Path = WORK / "drafts.json"
 # Scoring against the approved (held-out) frames
 # ──────────────────────────────────────────────────────────────
 
-def score_points(pred: List[dict], gold: List[dict], box) -> Optional[List[float]]:
-    """Per visible gold point: distance / gate size (box diagonal)."""
+def score_points(pred: List[dict], gold: List[dict], box, frame_wh=None, outside=False) -> Optional[List[float]]:
+    """Per gold point: distance / gate size (box diagonal). outside=False:
+    the visible points (vis > 0) inside the picture; outside=True: the points
+    outside the picture (a gate cut off by the screen edge)."""
     diag = math.hypot(box[2] - box[0], box[3] - box[1]) or 1.0
     if not pred or len(pred) != len(gold):
         return None
-    return [math.hypot(p["x"] - g["x"], p["y"] - g["y"]) / diag for p, g in zip(pred, gold) if g["vis"] > 0]
+    W, H = frame_wh or (10 ** 9, 10 ** 9)
+    out = []
+    for p, g in zip(pred, gold):
+        is_out = g["x"] < 0 or g["y"] < 0 or g["x"] >= W or g["y"] >= H
+        if (outside and is_out) or (not outside and not is_out and g["vis"] > 0):
+            out.append(math.hypot(p["x"] - g["x"], p["y"] - g["y"]) / diag)
+    return out
 
 
 def summarize(errs: List[float], n_gates: int, n_missing: int) -> dict:
@@ -295,22 +344,46 @@ def summarize(errs: List[float], n_gates: int, n_missing: int) -> dict:
             "pck05": float((e <= 0.05).mean()), "pck10": float((e <= 0.10).mean()), "median": float(np.median(e))}
 
 
+_SIZES: Dict[str, Tuple[int, int]] = {}
+
+
+def _frame_wh(path: str) -> Tuple[int, int]:
+    if path not in _SIZES:
+        im = cv2.imread(path)
+        _SIZES[path] = (im.shape[1], im.shape[0]) if im is not None else (10 ** 9, 10 ** 9)
+    return _SIZES[path]
+
+
 def evaluate(predict, cls: str, test_ids: set, labels) -> dict:
-    """predict(entry_path, label, gate_index, gate) → keypoints or None."""
-    errs, n, miss = [], 0, 0
+    """predict(entry_path, label, gate_index, gate) → keypoints or None.
+    A gate with no prediction counts all its points as wrong. Also scores
+    the points outside the picture separately ("outside")."""
+    errs, out_errs, n, miss = [], [], 0, 0
     for f, d in labels:
         if entry_id(f) not in test_ids:
             continue
+        wh = _frame_wh(d["image_path"])
         for gi, g in enumerate(d["gates"]):
             if g["class_name"] != cls or len(g.get("keypoints") or []) != len(KPT_NAMES[cls]):
                 continue
             n += 1
-            s = score_points(predict(f, d, gi, g), g["keypoints"], (g["x1"], g["y1"], g["x2"], g["y2"]))
+            box = (g["x1"], g["y1"], g["x2"], g["y2"])
+            p = predict(f, d, gi, g)
+            s = score_points(p, g["keypoints"], box, wh)
+            so = score_points(p, g["keypoints"], box, wh, outside=True)
             if s is None:
                 miss += 1
+                fake = [{"x": 1e9, "y": 1e9, "vis": 0}] * len(g["keypoints"])
+                errs += score_points(fake, g["keypoints"], box, wh)
+                out_errs += score_points(fake, g["keypoints"], box, wh, outside=True)
             else:
                 errs += s
-    return summarize(errs, n, miss)
+                out_errs += so
+    res = summarize(errs, n, miss)
+    if out_errs:
+        o = summarize(out_errs, n, miss)
+        res["outside"] = {"points": o["points"], "pck05": o["pck05"], "pck10": o["pck10"], "median": o["median"]}
+    return res
 
 
 # ──────────────────────────────────────────────────────────────
@@ -335,9 +408,7 @@ def build_set(cls: str, items: List[Tuple[str, dict, List[dict], int]], out: Pat
             if img is None:
                 continue
             H, W = img.shape[:2]
-            cr = crop_box((W, H), (g["x1"], g["y1"], g["x2"], g["y2"]))
-            x1, y1, x2, y2 = map(int, cr)
-            c = img[y1:y2, x1:x2]
+            c, (x1, y1) = extract_crop(img, (g["x1"], g["y1"], g["x2"], g["y2"]))
             if c.size == 0 or c.shape[0] < 8 or c.shape[1] < 8:
                 continue
             ch, cw = c.shape[:2]
@@ -345,7 +416,7 @@ def build_set(cls: str, items: List[Tuple[str, dict, List[dict], int]], out: Pat
             bx1, by1, bx2, by2 = g["x1"] - x1, g["y1"] - y1, g["x2"] - x1, g["y2"] - y1
             parts = [f"0 {((bx1 + bx2) / 2) / cw:.6f} {((by1 + by2) / 2) / ch:.6f} {(bx2 - bx1) / cw:.6f} {(by2 - by1) / ch:.6f}"]
             for k in kps:
-                kx, ky, kv = k["x"] - x1, k["y"] - y1, k["vis"]
+                kx, ky, kv = k["x"] - x1, k["y"] - y1, train_vis(k, W, H)
                 if not (0 <= kx < cw and 0 <= ky < ch):
                     kx, ky, kv = 0.0, 0.0, 0
                 parts.append(f"{min(max(kx / cw, 0), 1):.6f} {min(max(ky / ch, 0), 1):.6f} {kv}")
@@ -359,19 +430,30 @@ def build_set(cls: str, items: List[Tuple[str, dict, List[dict], int]], out: Pat
     return out
 
 
-def train(data: Path, base: str, run: Path, epochs: int, lr0: float = 0.002, freeze: Optional[int] = None) -> Path:
-    from ultralytics import YOLO
-    import torch
-    m = YOLO(base)
-    m.add_callback("on_train_epoch_end", lambda _: torch.mps.empty_cache())
-    kw = dict(data=str(data), epochs=epochs, imgsz=IMGSZ, device="mps", project=str(run.parent), name=run.name,
-              exist_ok=True, lr0=lr0, batch=32, patience=max(8, epochs // 4), plots=False, verbose=False,
-              mosaic=0.0, degrees=8.0, translate=0.08, scale=0.25, fliplr=0.5, hsv_h=0.015, hsv_s=0.5, hsv_v=0.35,
-              workers=4)
+def train(data: Path, base: str, run: Path, epochs: int, lr0: float = 0.002, freeze: Optional[int] = None,
+          mem_limit_gb: float = 14.0) -> Path:
+    """Train in a separate process under a memory limit (yolo_safe_train):
+    capped GPU memory, 2 data workers, memory freed every round, stopped if
+    it goes over mem_limit_gb."""
+    from yolo_safe_train import safe_train
+    kw = dict(model=base, data=str(data), epochs=epochs, imgsz=IMGSZ, project=str(run.parent), name=run.name,
+              exist_ok=True, lr0=lr0, batch=32, patience=max(8, epochs // 4),
+              mosaic=0.0, degrees=8.0, translate=0.08, scale=0.25, fliplr=0.5, hsv_h=0.015, hsv_s=0.5, hsv_v=0.35)
     if freeze:
         kw["freeze"] = freeze
-    m.train(**kw)
+    tail: List[str] = []
+    res = safe_train(kw, mem_limit_gb=mem_limit_gb, on_line=lambda l: (tail.append(l), tail.pop(0) if len(tail) > 15 else None))
+    if not res["ok"]:
+        why = res.get("stopped") or f"error (code {res['returncode']})"
+        raise RuntimeError(f"training stopped: {why}\n" + "\n".join(tail[-8:]))
+    mark_edge_crop(run / "weights")
     return run / "weights" / "best.pt"
+
+
+def mark_edge_crop(weights_dir: Path):
+    """crop.json next to a model trained on crops that reach past the screen
+    edge; models without it were trained on the old crop and get that one."""
+    (Path(weights_dir) / "crop.json").write_text(json.dumps({"crop": "edge", "edge_pad": EDGE_PAD, "pad": CROP_PAD}))
 
 
 class KptPredictor:
@@ -381,15 +463,36 @@ class KptPredictor:
     bottom (fix_square_feet)."""
 
     def __init__(self, weights, fix_feet: bool = True):
+        self.outside = None
+        if isinstance(weights, dict):           # {"inside": [...], "outside": [...]} — see weights_list
+            self.outside = KptPredictor(weights["outside"], fix_feet=False)
+            weights = weights["inside"]
         self.members = [_OneModel(w) for w in ([weights] if isinstance(weights, (str, Path)) else weights)]
         self.fix_feet = fix_feet
 
     def __call__(self, img: np.ndarray, g: dict) -> Optional[List[dict]]:
+        kps = self._inside(img, g)
+        if self.outside is not None:
+            # models trained on crops reaching past the screen edge place the points
+            # outside the picture; where they put a point outside, theirs is used
+            out = self.outside(img, g)
+            H, W = img.shape[:2]
+            if out and kps:
+                kps = [o if not (0 <= o["x"] < W and 0 <= o["y"] < H) else k for k, o in zip(kps, out)]
+            else:
+                kps = kps or out
+        return kps
+
+    def _inside(self, img: np.ndarray, g: dict) -> Optional[List[dict]]:
         outs = [o for o in (m(img, g) for m in self.members) if o]
         if not outs:
             return None
-        kps = [{"x": float(np.mean([o[i]["x"] for o in outs])), "y": float(np.mean([o[i]["y"] for o in outs])),
-                "vis": max(o[i]["vis"] for o in outs)} for i in range(len(outs[0]))]
+        H, W = img.shape[:2]
+        kps = []
+        for i in range(len(outs[0])):
+            x, y = float(np.mean([o[i]["x"] for o in outs])), float(np.mean([o[i]["y"] for o in outs]))
+            inside = 0 <= x < W and 0 <= y < H
+            kps.append({"x": x, "y": y, "vis": max(o[i]["vis"] for o in outs) if inside else 0})
         if self.fix_feet and g["class_name"] == "square":
             kps = fix_square_feet(g, kps, img.shape[0])
         return kps
@@ -401,11 +504,11 @@ class _OneModel:
         self.m = YOLO(str(weights))
         args = getattr(self.m, "ckpt", {}) or {}
         self.imgsz = int((args.get("train_args") or {}).get("imgsz") or IMGSZ)
+        self.legacy = not (Path(weights).parent / "crop.json").exists()     # each model gets the crop it learned on
 
     def __call__(self, img: np.ndarray, g: dict) -> Optional[List[dict]]:
         H, W = img.shape[:2]
-        x1, y1, x2, y2 = map(int, crop_box((W, H), (g["x1"], g["y1"], g["x2"], g["y2"])))
-        c = img[y1:y2, x1:x2]
+        c, (x1, y1) = extract_crop(img, (g["x1"], g["y1"], g["x2"], g["y2"]), legacy=self.legacy)
         if c.size == 0:
             return None
         r = self.m(c, imgsz=self.imgsz, verbose=False, device="mps", conf=0.01)[0]
@@ -415,7 +518,12 @@ class _OneModel:
         gb = [g["x1"] - x1, g["y1"] - y1, g["x2"] - x1, g["y2"] - y1]
         j = max(range(len(r.boxes)), key=lambda i: _iou(r.boxes.xyxy[i].tolist(), gb) + 0.1 * float(r.boxes.conf[i]))
         xy, cf = r.keypoints.xy[j].tolist(), r.keypoints.conf[j].tolist()
-        return [{"x": float(p[0]) + x1, "y": float(p[1]) + y1, "vis": 2 if c_ >= 0.5 else 1} for p, c_ in zip(xy, cf)]
+        out = []
+        for p, c_ in zip(xy, cf):
+            x, y = float(p[0]) + x1, float(p[1]) + y1
+            inside = 0 <= x < W and 0 <= y < H
+            out.append({"x": x, "y": y, "vis": (2 if c_ >= 0.5 else 1) if inside else 0})    # outside: as annotated
+        return out
 
 
 # ──────────────────────────────────────────────────────────────
@@ -425,15 +533,26 @@ class _OneModel:
 MANIFEST = training_dir() / "gate_models" / "manifest.json"
 
 
+def weights_list(w) -> List[str]:
+    """Every model file of a class's entry: one path, a list (averaged), or
+    {"inside": [...], "outside": [...]} (outside: models whose points beyond
+    the screen edge are used)."""
+    if not w:
+        return []
+    if isinstance(w, dict):
+        return weights_list(w.get("inside")) + weights_list(w.get("outside"))
+    return [str(w)] if isinstance(w, (str, Path)) else [str(x) for x in w]
+
+
 def weights_exist(w) -> bool:
-    """One model path, or a list of them (averaged)."""
-    ws = [w] if isinstance(w, (str, Path)) else (w or [])
+    ws = weights_list(w)
     return bool(ws) and all(Path(x).exists() for x in ws)
 
 
 def weights_name(w) -> str:
-    ws = [w] if isinstance(w, (str, Path)) else w
-    return " + ".join(f"{Path(x).parts[-4]}/{Path(x).parts[-3]}" for x in ws)
+    if isinstance(w, dict):
+        return f"{weights_name(w['inside'])} | outside: {weights_name(w['outside'])}"
+    return " + ".join(f"{Path(x).parts[-4]}/{Path(x).parts[-3]}" for x in weights_list(w))
 
 
 def active_models() -> Dict[str, object]:
@@ -447,7 +566,8 @@ def active_models() -> Dict[str, object]:
 
 def set_active(cls: str, weights, score: float):
     d = json.loads(MANIFEST.read_text()) if MANIFEST.exists() else {}
-    d.setdefault("keypoints", {})[cls] = str(weights) if isinstance(weights, (str, Path)) else [str(w) for w in weights]
+    d.setdefault("keypoints", {})[cls] = (weights if isinstance(weights, dict) else
+                                         str(weights) if isinstance(weights, (str, Path)) else [str(w) for w in weights])
     d.setdefault("best_kpt_maps", {})[cls] = float(score)       # here: share of points within 5% of the gate size
     MANIFEST.write_text(json.dumps(d, indent=2))
 
@@ -557,7 +677,7 @@ def retrain(cls: str, start=None, recipe: Optional[dict] = None) -> dict:
     gold = _gold_items(cls, labels, approved - test - tune, rc["gold_repeat"])
     val = _gold_items(cls, labels, tune, 1) or None        # picks the best round; never trained on
     current = start if start is not None else active_models().get(cls)
-    members = ([current] if isinstance(current, (str, Path)) else list(current)) if current else []
+    members = weights_list(current)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     if not members:                                    # first model: from the drafts
         drafts = _draft_items(cls, labels)
@@ -573,7 +693,11 @@ def retrain(cls: str, start=None, recipe: Optional[dict] = None) -> dict:
         new_w = [str(train(data, str(m), MODELS / cls / f"{ts}_{k}", epochs=rc["epochs"], lr0=0.001))
                  for k, m in enumerate(members)]
         shutil.rmtree(data, ignore_errors=True)
-    new_w = new_w[0] if len(new_w) == 1 else new_w
+    if isinstance(current, dict):                      # keep the inside / outside sets
+        n_in = len(weights_list(current["inside"]))
+        new_w = {"inside": new_w[:n_in], "outside": new_w[n_in:]}
+    elif len(new_w) == 1:
+        new_w = new_w[0]
     new = evaluate(_predict_fn(new_w), cls, test, labels)
     old = evaluate(_predict_fn(current), cls, test, labels) if current else None
     return {"weights": new_w, "new_map": new["pck05"], "old_map": old["pck05"] if old else 0.0,

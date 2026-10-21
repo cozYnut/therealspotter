@@ -1402,15 +1402,29 @@ class AnnotationCanvas(QGraphicsScene):
         self._drag_start: Optional[QPointF] = None
         self._drag_rect: Optional[QGraphicsRectItem] = None
 
+    # room around the picture, so keypoints of a gate cut off by the screen edge
+    # can be seen and placed outside the frame (they are kept outside)
+    OUTSIDE_MARGIN = 0.35
+
     def set_frame(self, frame: np.ndarray) -> None:
         px = _bgr_to_qpixmap(frame)
         if self._pixmap_item is None:
             self._pixmap_item = QGraphicsPixmapItem(px)
             self._pixmap_item.setZValue(-1)
             self.addItem(self._pixmap_item)
+            self.setBackgroundBrush(QBrush(QColor(28, 28, 32)))
         else:
             self._pixmap_item.setPixmap(px)
-        self.setSceneRect(self._pixmap_item.boundingRect())
+        r = self._pixmap_item.boundingRect()
+        if getattr(self, "_frame_outline", None) is None:
+            self._frame_outline = QGraphicsRectItem(r)
+            self._frame_outline.setPen(QPen(QColor(150, 150, 160), 1, Qt.PenStyle.DashLine))
+            self._frame_outline.setZValue(-0.5)
+            self.addItem(self._frame_outline)
+        else:
+            self._frame_outline.setRect(r)
+        m = self.OUTSIDE_MARGIN
+        self.setSceneRect(r.adjusted(-r.width() * m, -r.height() * m, r.width() * m, r.height() * m))
 
     def load_detections(self, detections: list[Detection]) -> None:
         self.clear_gates()
