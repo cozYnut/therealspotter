@@ -19,7 +19,7 @@ from typing import List, Optional, Tuple
 from dataset_paths import training_dir
 
 REPO = Path(__file__).resolve().parent.parent
-DEFAULT_DET_MODEL = REPO / "cyn_current-20260715_best.pt"
+DEFAULT_DET_MODEL = REPO / "cyn_current-20261021_best.pt"     # the pass scorer is trained on its boxes
 
 
 def coreml_path(pt_path: Path) -> Path:

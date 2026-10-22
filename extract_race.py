@@ -224,7 +224,7 @@ def run_race_extraction(
 
         st_map = getattr(passdet, "states", {}) or {}
 
-        # ── Pass candidates for the scorer: big tracks that end or shrink ─
+        # ── Pass candidates for the scorer: big tracks that end, shrink or jump ─
         if pass_logic == "scorer":
             cur = {int(tr.track_id): (list(tr.bbox), _area_ratio(tr.bbox, frame_area), str(tr.locked_type))
                    for tr in tracks}
@@ -234,8 +234,9 @@ def run_race_extraction(
                 while dq and dq[0][0] < t - 0.5:
                     dq.popleft()
                 if tid in prev_tracks:
-                    pa = prev_tracks[tid][1]
-                    if pa >= pass_scorer.BIG and a <= pass_scorer.SHRINK * pa:
+                    pb, pa = prev_tracks[tid][0], prev_tracks[tid][1]
+                    if pa >= pass_scorer.BIG and (a <= pass_scorer.SHRINK * pa
+                                                  or pass_scorer._iou(pb, bb) < pass_scorer.JUMP_IOU):
                         embed_candidate(tid, prev_t, ty)
             for tid, (bb, pa, ty) in prev_tracks.items():
                 if tid not in cur:
@@ -395,8 +396,10 @@ def run_race_extraction(
     passes, laps = final, race_laps
     if gate_id_logic == "sequence":
         import gate_decoder
-        passes, laps, info = gate_decoder.label_race(final, gate_memory_path, track or track_of(output_json))
+        passes, laps, info = gate_decoder.label_race(final, gate_memory_path, track or track_of(output_json),
+                                                     exclude_stem=stem)
         output.update(info)
+        output["candidate_passes"] = final          # before the decoder: relabelling starts from these
         print(f"Gate IDs by sequence decoding (timing: {info['timing']}): "
               f"{sum(p['gate_id'] >= 1 for p in passes)} passes labelled, {len(laps)} laps")
     else:

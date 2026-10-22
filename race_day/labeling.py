@@ -77,7 +77,7 @@ def learn(tp: TrackPaths, stems: List[str], n_gates: int, verbose: bool = False,
         videos.append(gd.VideoSeq(s, [gd.Obs(p["t"], gd._norm(p.get("query_embedding")),
                                               str(p.get("gate_type", "")), p.get("p_pass")) for p in passes],
                                   g1_times=g1))
-    m, labels = lt.learn(videos, n_gates, gd.Cfg(start_g1=10.0), verbose=verbose)
+    m, labels = lt.learn(videos, n_gates, lt.learn_cfg(), verbose=verbose)
     lt.save(tp, videos, raw, labels, m, n_gates)
     shutil.copy2(tp.learned_memory, tp.gate_memory)
     laps = [len(gd.build_laps([{"gate_id": g, "t": o.t} for o, g in zip(v.obs, labels[v.stem]) if g > 0], n_gates))
