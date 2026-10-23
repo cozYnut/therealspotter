@@ -27,7 +27,7 @@ The new parts are capture, the race-day app, orchestration and the dashboard. Th
 
 **1. Live capture** — at the race (changed 2026-10-22: the operator decides, nothing is automatic)
 1. Setup:
-   - the **track folder** (chosen with a folder picker — a new, empty folder for a new track — or one of the **last 3 tracks**);
+   - the **track**: chosen from the data folder's tracks (its subfolders that aren't FPVTrackside events, `training/` or `scores/`), a **New track…** (a new folder there), or one of the **last 3 tracks**;
    - **single pilot or 2×2 feed**, and the channel of each quadrant (or of the single pilot);
    - **number of gates** (can be changed at Relearn);
    - capture device, with a preview; longest recording (default 3:00).
@@ -40,10 +40,11 @@ The new parts are capture, the race-day app, orchestration and the dashboard. Th
 7. Pilots are named when a video's description has names (typed when a video is described one by one); otherwise the channel is the name.
 
 **2. Replays** — testing and after the event (changed 2026-10-22)
-1. Choose a track folder (the last one used is offered first).
+1. Choose any track or FPVTrackside event of the data folder from a list (newest first). A track opens in the screen below; an FPVTrackside event opens in the event screen, without Auto.
 2. The same screen as Live capture without the setup, the recording and the live feed: the heat list (the videos in `<track>/videos/`, or the folder's own videos), the chosen heat, **Analyse** and **Learn / Relearn track**.
 3. Results appear in the browser dashboard. Data goes to `<track>/lazySpotter/`.
-4. FPVTrackside event folders are opened with the **FPVTrackside event** button, not Replays.
+4. The **FPVTrackside event** button lists only FPVTrackside events (folders with an `Event.json`, e.g. `<data>/events/<id>/`), by their name and date.
+5. The data folder is chosen the first time the app opens, and can be changed on the start screen.
 
 Whichever track is open is the only one the dashboard shows. Opening another track switches the dashboard to that track's data.
 

@@ -5,24 +5,34 @@ Race-day desktop app (operator) — see docs/RACE_DAY_PLAN.md.
     python race_day_app.py
 
 Start screen: FPVTrackside event, Live capture or Replays.
+Events are chosen from the data folder (race_day/picker.py), never browsed for.
+
   FPVTrackside event: an event folder of FPVTrackside — every finished heat
             is listed; learn the track from chosen heats, check each pilot's
             laps against the video, write corrections back (race_day/event_ui.py).
-  Live capture: a track folder (new, existing or one of the last 3),
+  Live capture: a track of the data folder (or a new one, or one of the last 3),
             single or 2×2 feed and its channels, the capture card → the
             operator records heats (Record / Stop, 3 min at most) into
             <track>/videos/, picks heats to analyse and to learn the track from;
             the app's data is in <track>/lazySpotter/ (race_day/live_ui.py).
-  Replays:  a track folder: its videos (<track>/videos/, single pilot or
-            2×2) listed as heats, analysed and learned from on demand, the
-            results in the browser — the live capture screen without the live
-            feed (data in <track>/lazySpotter/).
+  Replays:  any track or FPVTrackside event of the data folder: a track's
+            videos (<track>/videos/, single pilot or 2×2) listed as heats,
+            analysed and learned from on demand, the results in the browser —
+            the live capture screen without the live feed (data in
+            <track>/lazySpotter/); an FPVTrackside event opens in the event
+            screen without Auto.
 
-The browser dashboard (read-only) is served on the local network; its
-address is shown in the top bar.
+The browser dashboard (read-only) starts with the app and shows every event
+of the data folder (the open one live); its address is on the start screen
+and in the top bar.
+
+The data folder (tracks, training data — FPV_DATA_ROOT for the whole app)
+is asked for the first time, kept in ~/.race_day_app.json and can be changed
+on the start screen.
 """
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -40,6 +50,7 @@ from dataset_paths import data_root
 from race_day.capture import DeviceSource, FileSource, HeatRecorder, list_devices, open_device
 from race_day.event_ui import EventPage
 from race_day.live_ui import LivePage, feed_pixmap
+from race_day import picker
 from race_day.server import Dashboard
 from race_day.trackside import LIVE_SUBDIR
 
@@ -78,11 +89,42 @@ def _saved_setup(track_dir: Path) -> dict:
     return {}
 
 
+def _use_data_root(folder: Path):
+    """Make `folder` the data folder for the whole app — dataset_paths.data_root()
+    reads FPV_DATA_ROOT, and the analysis workers inherit it."""
+    os.environ["FPV_DATA_ROOT"] = str(folder)
+
+
+def _ask_data_root(parent, start: Path) -> Optional[Path]:
+    d = QFileDialog.getExistingDirectory(parent, "Data folder (tracks, training data — e.g. FPVdatasets)", str(start))
+    return Path(d) if d else None
+
+
+def setup_data_root() -> bool:
+    """At start: the data folder saved last time; the first time, ask for one
+    (the dialog starts at the current default). False: none chosen."""
+    saved = _app_settings().get("data_root")
+    if saved and Path(saved).is_dir():
+        _use_data_root(Path(saved))
+        return True
+    QMessageBox.information(None, "Race day", "Choose the data folder: where the tracks and training data are "
+                            "(e.g. FPVdatasets). You can change it later on the start screen.")
+    folder = _ask_data_root(None, data_root())
+    if not folder:
+        return False
+    _save_app_settings(data_root=str(folder))
+    _use_data_root(folder)
+    return True
+
+
 RECENT = 3          # past tracks offered on the setup page
 
 
 def _recent_tracks() -> List[str]:
-    return [p for p in _app_settings().get("recent_tracks", []) if Path(p).is_dir()][:RECENT]
+    """The last tracks opened that are in the current data folder."""
+    root = data_root().resolve()
+    return [p for p in _app_settings().get("recent_tracks", [])
+            if Path(p).is_dir() and Path(p).resolve().is_relative_to(root)][:RECENT]
 
 
 def _remember_track(track_dir: Path):
@@ -124,10 +166,21 @@ class StartPage(QWidget):
         t = _big("Race day", 30)
         t.setAlignment(Qt.AlignmentFlag.AlignCenter)
         v.addWidget(t)
-        sub = QLabel(f"Data folder: {data_root()}")
-        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sub.setStyleSheet("color:#888")
-        v.addWidget(sub)
+        folder_row = QHBoxLayout()
+        self.folder = QLabel(f"Data folder: {data_root()}")
+        self.folder.setStyleSheet("color:#888")
+        change = QPushButton("Change…")
+        change.setToolTip("Choose another data folder (tracks, training data)")
+        change.clicked.connect(self._change_folder)
+        folder_row.addStretch()
+        folder_row.addWidget(self.folder)
+        folder_row.addWidget(change)
+        folder_row.addStretch()
+        v.addLayout(folder_row)
+        self.dash = QLabel("")
+        self.dash.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.dash.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        v.addWidget(self.dash)
         row = QHBoxLayout()
         event = _btn("⏱  FPVTrackside event\ncheck every heat's laps in the video", True)
         live = _btn("●  Live capture\nrecord from the capture card")
@@ -144,6 +197,13 @@ class StartPage(QWidget):
         row.addStretch()
         v.addLayout(row)
         v.addStretch()
+
+    def _change_folder(self):
+        folder = _ask_data_root(self, data_root())
+        if folder:
+            _save_app_settings(data_root=str(folder))
+            _use_data_root(folder)
+            self.folder.setText(f"Data folder: {folder}")
 
 
 class LayoutEditor(QGroupBox):
@@ -197,8 +257,8 @@ class LiveSetupPage(QWidget):
         track_row = QHBoxLayout()
         self.track = QLineEdit()
         self.track.setReadOnly(True)
-        self.track.setPlaceholderText("choose the track folder (a new, empty folder for a new track)")
-        browse = _btn("Choose folder…")
+        self.track.setPlaceholderText("choose a track of the data folder, or make a new one")
+        browse = _btn("Choose track…")
         browse.clicked.connect(self._browse)
         track_row.addWidget(self.track, 1)
         track_row.addWidget(browse)
@@ -217,7 +277,7 @@ class LiveSetupPage(QWidget):
         self.max_len.setToolTip("A recording stops by itself after this long (or earlier with Stop)")
         self.device = QComboBox()
         self._fill_devices()
-        form.addRow("Track folder", track_row)
+        form.addRow("Track", track_row)
         form.addRow("Recent", self.recent_row)
         form.addRow("Feed", self.feed)
         form.addRow("Number of gates", self.gates)
@@ -287,11 +347,11 @@ class LiveSetupPage(QWidget):
         self.recent_row.addStretch()
 
     def _browse(self):
-        start = str(self.track_dir or (Path(_recent_tracks()[0]).parent if _recent_tracks() else data_root()))
-        d = QFileDialog.getExistingDirectory(self, "Track folder (its videos go in <track>/videos, "
-                                             "the app's data in <track>/lazySpotter)", start)
-        if d:
-            self._choose(Path(d))
+        root = data_root()
+        it = picker.pick(self, "Live capture — choose the track", picker.track_folders(root), root, allow_new=True,
+                         empty_text="No tracks yet — make one with New track…")
+        if it:
+            self._choose(it["path"])
 
     def _choose(self, track_dir: Path):
         self.track_dir = track_dir
@@ -386,6 +446,7 @@ class Main(QMainWindow):
         self.event_day = None
         for p in (self.start, self.live_setup, self.event_page, self.live_page, self.replays_page):
             self.stack.addWidget(p)
+        self._start_dashboard()
 
     def show_page(self, page):
         self.stack.setCurrentWidget(page)
@@ -393,13 +454,17 @@ class Main(QMainWindow):
     def _log(self, s: str):
         self.bridge.log.emit(time.strftime("%H:%M:%S  ") + s)
 
-    def _start_dashboard(self, page):
+    def _start_dashboard(self):
+        """One dashboard for the whole session: every event of the data folder
+        (it follows a change of data folder), the open one read live."""
         try:
-            self.dash = Dashboard(self.event_day).start()
-            page.dash_url = self.dash.url
+            self.dash = Dashboard(data_root, lambda: self.event_day).start()
+            url = self.dash.url
         except OSError as e:                     # port in use: the app works without it
-            self.dash = None
-            page.dash_url = f"dashboard off ({e})"
+            self.dash, url = None, f"dashboard off ({e})"
+        for page in (self.event_page, self.live_page, self.replays_page):
+            page.dash_url = url
+        self.start.dash.setText(f"Browser (every event of the data folder): <b>{url}</b>" if self.dash else url)
 
     # ── live capture ──────────────────────────────────────────
 
@@ -425,19 +490,23 @@ class Main(QMainWindow):
             self._log(f"{path.name} saved ({info['seconds']:.0f} s)")
         rec = HeatRecorder(source, day.event.dir, day.tp.dir / "recording", max_s=float(setup["max_s"]),
                            on_saved=saved).start()
-        self._start_dashboard(self.live_page)
         self.live_page.open_track(day, rec, setup)
         self.show_page(self.live_page)
 
     # ── Replays: a track folder's videos ──────────────────────
 
     def choose_replays(self):
-        recent = _recent_tracks()
-        start = str(Path(recent[0]).parent) if recent else str(data_root())
-        folder = QFileDialog.getExistingDirectory(self, "Replays: the track folder (its videos are in <track>/videos)",
-                                                  start)
-        if folder:
-            self.start_replays(Path(folder))
+        """Any track or FPVTrackside event of the data folder: a track opens in the
+        Replays screen, an FPVTrackside event in the event screen (no Auto)."""
+        root = data_root()
+        it = picker.pick(self, "Replays — choose a track or an event",
+                         picker.track_folders(root) + picker.fpvtrackside_events(root), root)
+        if not it:
+            return
+        if it["kind"] == "track":
+            self.start_replays(it["path"])
+        else:
+            self.start_event(str(it["path"]), "replays")
 
     def start_replays(self, track_dir: Path):
         from race_day.eventday import EventDay
@@ -449,22 +518,17 @@ class Main(QMainWindow):
             self.event_day = None
             return QMessageBox.critical(self, "Can't open the track", str(e))
         _remember_track(track_dir)
-        self._start_dashboard(self.replays_page)
         self.replays_page.open_track(self.event_day, setup=_saved_setup(track_dir))
         self.show_page(self.replays_page)
 
     # ── FPVTrackside event ────────────────────────────────────
 
     def choose_event(self, mode: str):
-        start = str(Path.home())
-        last = _app_settings().get("event_dir")
-        if last and Path(last).exists():
-            start = str(Path(last).parent)
-        folder = QFileDialog.getExistingDirectory(
-            self, "FPVTrackside event folder (…/FPVTrackside/events/<event>)" if mode == "live"
-            else "Replays: an FPVTrackside event folder, or a folder of videos", start)
-        if folder:
-            self.start_event(folder, mode)
+        root = data_root()
+        it = picker.pick(self, "FPVTrackside event — choose the event", picker.fpvtrackside_events(root), root,
+                         empty_text="No FPVTrackside events in the data folder (folders with an Event.json).")
+        if it:
+            self.start_event(str(it["path"]), mode)
 
     def start_event(self, folder: str, mode: str):
         from race_day.eventday import EventDay
@@ -475,7 +539,6 @@ class Main(QMainWindow):
             self.event_day = None
             return QMessageBox.critical(self, "Can't open the event", str(e))
         _save_app_settings(event_dir=folder)
-        self._start_dashboard(self.event_page)
         self.event_page.open(self.event_day)
         self.show_page(self.event_page)
 
@@ -492,22 +555,25 @@ class Main(QMainWindow):
         self.show_page(self.start)
 
     def _close(self):
+        """Close the open event (the dashboard keeps running: it shows every event)."""
         for page in (self.event_page, self.live_page, self.replays_page):
             page.close_day()
         if self.event_day:
             self.event_day.stop()
-        if self.dash:
-            self.dash.stop()
-        self.event_day = self.dash = None
+        self.event_day = None
 
     def closeEvent(self, e):
         self._close()
+        if self.dash:
+            self.dash.stop()
         super().closeEvent(e)
 
 
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    if not setup_data_root():
+        sys.exit(0)
     w = Main()
     w.show()
     sys.exit(app.exec())

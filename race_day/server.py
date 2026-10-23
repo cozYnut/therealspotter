@@ -1,20 +1,24 @@
 """
 Read-only dashboard server for race day.
 
-Serves the open track's data to any browser on the same Wi-Fi (phones via
-the QR code in the desktop app). Only GET requests: nothing can be changed
-from the dashboard. Videos are streamed with HTTP range requests, which
-phone browsers need to play and seek.
+Serves every event of the data folder — tracks and FPVTrackside events, each
+with its data in <event>/lazySpotter/ — to any browser on the same Wi-Fi.
+It starts with the app and follows the data folder. The event open in the
+app is read live (with its status); the others from their saved files. Only
+GET requests: nothing can be changed from the dashboard. Videos are streamed
+with HTTP range requests, which phone browsers need to play and seek.
 
-    /                     the dashboard (static/)
-    /api/status           mode, phase, learn progress, live channels, queue
-    /api/runs             all runs with their summary and speed index
-    /api/run/<stem>       one run: stats, passes, laps, comparison with the field
-    /api/heat/<n>         the runs of a heat, with passes for the gap chart
-    /api/pilot/<name>     a pilot's runs and section strengths
-    /api/track            learned gates (images), sections, hardest sections
-    /video/<stem>.mp4     a run's video
-    /img?p=<path>         an image inside the track folder (gate crops)
+    /                       the dashboard (static/)
+    /api/events             every event: name, kind, date, runs, learned, open in the app
+  each of these takes the event as ?e=<id> (its folder relative to the data folder):
+    /api/status             mode, phase, learn progress, live channels, queue
+    /api/runs               all runs with their summary and speed index
+    /api/run/<stem>         one run: stats, passes, laps, comparison with the field
+    /api/heat/<n>           the runs of a heat, with passes for the gap chart
+    /api/pilot/<name>       a pilot's runs and section strengths
+    /api/track              learned gates (images), sections, hardest sections
+    /video/<stem>.mp4       a run's video
+    /img?p=<path>           an image inside the event's data folder (gate crops)
 """
 
 import json
@@ -25,8 +29,9 @@ import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Dict, List, Optional
 
+from dataset_paths import TrackPaths
 from race_day import stats as rstats
 
 STATIC = Path(__file__).parent / "static"
@@ -47,8 +52,9 @@ class DataView:
     """Everything the dashboard shows, read from the track folder (plus the
     controller's live status). Stats files are cached by modification time."""
 
-    def __init__(self, day):
+    def __init__(self, day, event_id: str = ""):
         self.day = day
+        self.q = "?e=" + urllib.parse.quote(event_id) if event_id else ""
         self._cache = {}
         self._lock = threading.Lock()
 
@@ -124,7 +130,7 @@ class DataView:
         w = r.get("window") or [float("-inf"), float("inf")]
         r["lap_marks"] = [{"lap": l["lap"], "t0": l["t0"], "t1": l["t1"]} for l in race.get("laps", [])
                           if l["t0"] >= w[0] and l["t1"] <= w[1]]
-        r["video_url"] = f"/video/{stem}.mp4"
+        r["video_url"] = f"/video/{stem}.mp4{self.q}"
         return r
 
     def video_file(self, stem: str) -> Path:
@@ -146,7 +152,7 @@ class DataView:
             r["passes"] = [{"t": p["t"] - off, "gate": p["gate_id"]} for p in race.get("passes", [])
                            if p.get("gate_id", -1) >= 1 and w[0] <= p["t"] <= w[1]]
             r["stats"] = st
-            r["video_url"] = f"/video/{r['stem']}.mp4"
+            r["video_url"] = f"/video/{r['stem']}.mp4{self.q}"
             out.append(r)
         return {"heat": n, "info": heat.get("info"), "runs": out}
 
@@ -172,8 +178,9 @@ class DataView:
         if mem:
             for g in mem.get("memory", []):
                 imgs = [p for p in g.get("embed_imgs", []) if p][:4]
+                amp = "&" + self.q[1:] if self.q else ""
                 out["gates"].append({"gate": g["gate_id"], "type": g.get("gate_type"),
-                                     "images": [f"/img?p={urllib.parse.quote(str(Path(p).resolve().relative_to(root)))}"
+                                     "images": [f"/img?p={urllib.parse.quote(str(Path(p).resolve().relative_to(root)))}{amp}"
                                                 for p in imgs if str(Path(p).resolve()).startswith(str(root))]})
         tim = self._json(self.tp.learned_timing)
         if tim:
@@ -181,7 +188,101 @@ class DataView:
         return out
 
 
-def make_handler(view: DataView):
+class FileDay:
+    """An event that isn't open in the app: its saved state (lazySpotter/
+    race_day.json, re-read when it changes) in the shape DataView reads."""
+
+    def __init__(self, data_dir: Path, name: str, kind: str):
+        self.tp, self.name, self.kind = TrackPaths(Path(data_dir)), name, kind
+        self.lock = threading.RLock()
+        self._state, self._sig = {"runs": {}, "heats": {}}, None
+
+    @property
+    def state(self) -> dict:
+        p = self.tp.race_day_state
+        try:
+            sig = p.stat().st_mtime_ns
+        except OSError:
+            return {"runs": {}, "heats": {}}
+        if sig != self._sig:
+            try:
+                d = json.loads(p.read_text(encoding="utf-8"))
+                self._state = {"runs": d.get("runs") or {}, "heats": d.get("heats") or {},
+                               "n_gates": d.get("n_gates")}
+            except (OSError, ValueError):
+                pass
+            self._sig = sig
+        return self._state
+
+    def dashboard_status(self) -> dict:
+        from race_day import labeling
+        runs = self.state["runs"]
+        learned = labeling.is_learned(self.tp)
+        return {"track": self.name, "mode": self.kind, "open": False, "phase": "result" if learned else "learn",
+                "learn_progress": [len(runs), 0], "n_gates": self.state.get("n_gates"),
+                "queue": {"analysing": 0, "waiting": 0}, "live": {}, "pilot_info": {},
+                "runs_total": len(runs), "error": None}
+
+
+class Library:
+    """Every event of the data folder, by id (its folder relative to the data
+    folder). root(): the data folder now; active(): the app's open EventDay."""
+
+    def __init__(self, root: Callable[[], Path], active: Callable[[], object]):
+        self.root, self.active = root, active
+        self._views: Dict[tuple, DataView] = {}
+        self._events: List[dict] = []
+        self._events_at = (None, 0.0)
+
+    def events(self) -> List[dict]:
+        import time as _t
+        from race_day import picker
+        root = Path(self.root())
+        if self._events_at[0] != root or _t.time() - self._events_at[1] > 5:
+            evs = [dict(e, kind="track") for e in picker.track_folders(root)] + \
+                  [dict(e, kind="FPVTrackside event") for e in picker.fpvtrackside_events(root)]
+            for e in evs:
+                e["id"] = e["path"].relative_to(root).as_posix()
+                e["data"] = e["path"] / "lazySpotter"
+            self._events, self._events_at = evs, (root, _t.time())
+        return self._events
+
+    def _event(self, eid: str) -> Optional[dict]:
+        return next((e for e in self.events() if e["id"] == eid), None)
+
+    def view(self, eid: str) -> Optional[DataView]:
+        e = self._event(eid)
+        if not e:
+            return None
+        day = self.active()
+        if day is not None and Path(day.tp.dir).resolve() == e["data"].resolve():
+            key = (eid, id(day))
+        else:
+            day, key = None, (eid, "file")
+        if key not in self._views:
+            self._views = {k: v for k, v in self._views.items() if k[0] != eid}     # an event opened / closed
+            self._views[key] = DataView(day or FileDay(e["data"], e["name"], e["kind"]), eid)
+        return self._views[key]
+
+    def listing(self) -> List[dict]:
+        out = []
+        for e in sorted(self.events(), key=lambda e: -e["time"]):
+            v = self.view(e["id"])
+            st = self.status(v)
+            out.append({"id": e["id"], "name": e["name"], "kind": e["kind"], "time": e["time"],
+                        "runs": sum(1 for r in v.visible_runs() if r.get("status") == "labelled"),
+                        "learned": st["phase"] == "result", "open": bool(st.get("open"))})
+        return out
+
+    @staticmethod
+    def status(v: DataView) -> dict:
+        if isinstance(v.day, FileDay):
+            return v.day.dashboard_status()
+        st = v.day.dashboard_status() if hasattr(v.day, "dashboard_status") else v.day.status()
+        return dict(st, open=True)
+
+
+def make_handler(lib: Library):
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
@@ -241,15 +342,21 @@ def make_handler(view: DataView):
         def do_GET(self):
             u = urllib.parse.urlparse(self.path)
             p = urllib.parse.unquote(u.path)
+            qs = urllib.parse.parse_qs(u.query)
             try:
+                if p == "/api/events":
+                    return self._json({"root": str(lib.root()), "events": lib.listing()})
+                view = lib.view(qs.get("e", [""])[0]) if (p.startswith("/api/") or p.startswith("/video/")
+                                                           or p == "/img") else None
+                if view is None and (p.startswith("/api/") or p.startswith("/video/") or p == "/img"):
+                    return self._json({"error": "no such event"}, 404)
                 if p in ("/", "/index.html"):
                     return self._file(STATIC / "index.html")
                 if p.startswith("/static/"):
                     f = (STATIC / p[len("/static/"):]).resolve()
                     return self._file(f) if str(f).startswith(str(STATIC.resolve())) else self._send(403, b"", "text/plain")
                 if p == "/api/status":
-                    return self._json(view.day.dashboard_status() if hasattr(view.day, "dashboard_status")
-                                      else view.day.status())
+                    return self._json(lib.status(view))
                 if p == "/api/runs":
                     return self._json({"runs": view.runs(), "field": view.field()})
                 if p.startswith("/api/run/"):
@@ -268,7 +375,7 @@ def make_handler(view: DataView):
                         return self._send(404, b"not found", "text/plain")
                     return self._file(view.video_file(Path(name).stem))
                 if p == "/img":
-                    q = urllib.parse.parse_qs(u.query).get("p", [""])[0]
+                    q = qs.get("p", [""])[0]
                     f = (view.tp.dir / q).resolve()
                     if not str(f).startswith(str(view.tp.dir.resolve())):
                         return self._send(403, b"", "text/plain")
@@ -291,9 +398,11 @@ def make_handler(view: DataView):
 
 
 class Dashboard:
-    def __init__(self, day, port: int = 8765):
-        self.view = DataView(day)
-        self.httpd = ThreadingHTTPServer(("0.0.0.0", port), make_handler(self.view))
+    """root(): the data folder now; active(): the app's open EventDay (or None)."""
+
+    def __init__(self, root: Callable[[], Path], active: Callable[[], object], port: int = 8765):
+        self.lib = Library(root, active)
+        self.httpd = ThreadingHTTPServer(("0.0.0.0", port), make_handler(self.lib))
         self.httpd.daemon_threads = True
         self.port = self.httpd.server_address[1]
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
