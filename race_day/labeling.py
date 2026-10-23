@@ -60,17 +60,24 @@ def label_run(tp: TrackPaths, stem: str) -> dict:
     return {"passes": sum(p["gate_id"] >= 1 for p in passes), "laps": len(laps)}
 
 
-def learn(tp: TrackPaths, stems: List[str], n_gates: int, verbose: bool = False) -> dict:
+def learn(tp: TrackPaths, stems: List[str], n_gates: int, verbose: bool = False,
+          g1_times: Optional[Dict[str, List[float]]] = None) -> dict:
     """Learn the track's gates and timing from analysed runs and install it
-    as the track's gate_memory.json."""
+    as the track's gate_memory.json. g1_times: per run, the timing system's
+    start/finish crossings in video seconds (FPVTrackside's laps) — known G1
+    moments, so learning needs only one full lap per run and is much faster."""
     videos, raw = [], {}
     for s in stems:
         race = json.loads(tp.race_data(s).read_text(encoding="utf-8"))
-        passes = sorted(race.get("candidate_passes") or race.get("passes", []), key=lambda p: p["t"])
+        passes = lt.learn_passes(race.get("candidate_passes") or race.get("passes", []))
         raw[s] = passes
+        g1 = []
+        if g1_times and g1_times.get(s):
+            g1, _ = lt.align_lap_times(sorted(g1_times[s]), [p["t"] for p in passes])
         videos.append(gd.VideoSeq(s, [gd.Obs(p["t"], gd._norm(p.get("query_embedding")),
-                                              str(p.get("gate_type", "")), p.get("p_pass")) for p in passes]))
-    m, labels = lt.learn(videos, n_gates, gd.Cfg(start_g1=10.0), verbose=verbose)
+                                              str(p.get("gate_type", "")), p.get("p_pass")) for p in passes],
+                                  g1_times=g1))
+    m, labels = lt.learn(videos, n_gates, lt.learn_cfg(), verbose=verbose)
     lt.save(tp, videos, raw, labels, m, n_gates)
     shutil.copy2(tp.learned_memory, tp.gate_memory)
     laps = [len(gd.build_laps([{"gate_id": g, "t": o.t} for o, g in zip(v.obs, labels[v.stem]) if g > 0], n_gates))

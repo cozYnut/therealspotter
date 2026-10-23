@@ -1,4 +1,4 @@
-// Race-day dashboard — read-only views of the open track.
+// Race-day dashboard — read-only views of every event of the data folder.
 "use strict";
 
 const $ = (s) => document.querySelector(s);
@@ -7,7 +7,15 @@ const sec = (x, d = 2) => (x == null ? "–" : Number(x).toFixed(d));
 const delta = (x, d = 2) => (x == null ? "–" : (x > 0 ? "+" : "") + Number(x).toFixed(d));
 const cls = (x, tol = 0.005) => (x == null ? "" : x < -tol ? "good" : x > tol ? "bad" : "ok");
 const pct = (x) => (x == null ? "–" : (100 * x).toFixed(1) + "%");
-const api = (p) => fetch(p, { cache: "no-store" }).then((r) => (r.ok ? r.json() : Promise.reject(r.status)));
+// The event shown (its folder relative to the data folder); every API call is about it
+let EV = null;
+const api = (p) => {
+  if (EV && p.startsWith("/api/") && p !== "/api/events") p += (p.includes("?") ? "&" : "?") + "e=" + encodeURIComponent(EV);
+  return fetch(p, { cache: "no-store" }).then((r) => (r.ok ? r.json() : Promise.reject(r.status)));
+};
+// a link inside the event shown: B() + "run/…"
+const B = () => `#/e/${encodeURIComponent(EV)}/`;
+const MODES = { live: "FPVTRACKSIDE · OPEN", capture: "LIVE CAPTURE · OPEN", replays: "REPLAYS · OPEN" };
 const PILOT_COLORS = ["#4da3ff", "#ff9f43", "#3ecf8e", "#c56cf0", "#ff6b6b", "#f5c451", "#00d2d3", "#ff9ff3"];
 const colorFor = (() => { const m = {}; return (n) => (m[n] ??= PILOT_COLORS[Object.keys(m).length % PILOT_COLORS.length]); })();
 
@@ -31,18 +39,31 @@ function heat(v, ref) {
   return `background:rgba(${c[0]},${c[1]},${c[2]},${(0.15 + 0.55 * Math.abs(r)).toFixed(2)})`;
 }
 
+// A run's video: a whole file, or one pilot's quadrant of a 2×2 heat video
+// (FPVTrackside event) — the quadrant is cropped here, the file is streamed as is.
+function videoTag(r, attrs) {
+  if (!r.crop) return `<video ${attrs} src="${r.video_url}" controls playsinline preload="metadata"></video>`;
+  const [x, y, w, h] = r.crop;
+  return `<div class="cropbox" onclick="const v=this.querySelector('video');v.paused?v.play():v.pause()">
+    <video ${attrs} src="${r.video_url}" playsinline preload="metadata"
+      style="width:${100 / w}%;left:${-100 * x / w}%;top:${-100 * y / h}%"></video><span class="tap">tap to play / pause</span></div>`;
+}
+
 // ── header: status every 3 s ───────────────────────────────────
 let STATUS = null;
 async function refreshStatus() {
+  if (!EV) {
+    $("#track").textContent = "Race day"; $("#mode").textContent = ""; $("#phase").textContent = "";
+    $("#phase").className = "badge"; $("#live").innerHTML = "";
+    return;
+  }
   try {
     STATUS = await api("/api/status");
     $("#track").textContent = STATUS.track;
-    $("#mode").textContent = STATUS.mode === "live" ? "LIVE" : "REPLAYS";
+    $("#mode").textContent = MODES[STATUS.mode] || (STATUS.mode === "track" ? "track" : "FPVTrackside event");
     const ph = $("#phase");
-    if (STATUS.phase === "learn") {
-      ph.className = "badge learn";
-      ph.textContent = `learning the track ${STATUS.learn_progress[0]}/${STATUS.learn_progress[1]}`;
-    } else { ph.className = "badge result"; ph.textContent = "results"; }
+    if (STATUS.phase === "learn") { ph.className = "badge learn"; ph.textContent = "track not learned yet"; }
+    else { ph.className = "badge result"; ph.textContent = "results"; }
     const ch = (STATUS.live && STATUS.live.channels) || {};
     const names = (STATUS.pilot_info && STATUS.pilot_info.pilots) || {};
     $("#live").innerHTML = (STATUS.live && STATUS.live.heat ? `<span class="chip">Heat ${STATUS.live.heat}</span>` : "") +
@@ -60,19 +81,41 @@ async function refreshStatus() {
 // ── router ─────────────────────────────────────────────────────
 let current = { key: null, timer: null };
 function route() {
-  const h = decodeURIComponent(location.hash.slice(1) || "/");
-  const [, page, arg] = h.split("/");
-  const key = h;
+  // #/ = every event; #/e/<event>/[page/arg] = one event (parts decoded one by one: ids contain "/")
+  const parts = (location.hash.slice(1) || "/").split("/").map(decodeURIComponent);
+  const key = location.hash;
   if (current.timer) clearInterval(current.timer);
   current = { key, timer: null };
-  const views = { "": home, run: runPage, heat: heatPage, pilot: pilotPage, track: trackPage };
-  const view = views[page || ""] || home;
+  let view, arg;
+  if (parts[1] === "e" && parts[2]) {
+    EV = parts[2];
+    const views = { "": home, run: runPage, heat: heatPage, pilot: pilotPage, track: trackPage };
+    view = views[parts[3] || ""] || home;
+    arg = parts[4];
+  } else { EV = null; view = eventsPage; }
+  $("#nav-res").style.display = $("#nav-track").style.display = EV ? "" : "none";
+  if (EV) { $("#nav-res").href = B(); $("#nav-track").href = B() + "track"; }
+  refreshStatus();
   view(arg, true).catch(showErr);
   current.timer = setInterval(() => view(arg, false).catch(() => {}), 5000);
   window.scrollTo(0, 0);
 }
 function showErr(e) { $("#app").innerHTML = `<p class="muted">Couldn't load (${esc(e)}).</p>`; }
 window.addEventListener("hashchange", route);
+
+// ── every event of the data folder ─────────────────────────────
+async function eventsPage(_, first) {
+  const d = await api("/api/events");
+  const date = (t) => new Date(t * 1000).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+  $("#app").innerHTML = `<h1>Events</h1>
+    ${hint(`Every track and FPVTrackside event in the data folder (${esc(d.root)}), newest first. The one open in the race-day app is marked “open”.`)}
+    <div class="grid cards">${d.events.map((e) => `<a class="card" href="#/e/${encodeURIComponent(e.id)}/">
+      <div class="who">${esc(e.name)}</div>
+      <div class="meta">${e.kind === "track" ? "track" : "FPVTrackside event"} · ${date(e.time)}${e.open ? ' · <span class="good">open</span>' : ""}</div>
+      <div style="margin-top:8px">${e.runs ? `<b>${e.runs}</b> runs` : '<span class="muted">no results yet</span>'}
+        ${e.learned ? '<span class="pill good">learned</span>' : '<span class="pill">not learned</span>'}</div></a>`).join("")
+      || '<p class="muted">No events in the data folder.</p>'}</div>`;
+}
 
 // ── lap bar: the track drawn as sections ───────────────────────
 function lapBar(sections, times) {
@@ -109,7 +152,7 @@ async function home(_, first) {
     ${hint("Best lap = fastest single lap. Best 3 laps = fastest 3 laps in a row. Theoretical best = your best time in every section added up — the lap you could fly. Consistency 2.5% = your laps vary about 2.5% (smaller = steadier). Speed vs field ×1.05 = 5% faster than the typical pilot here. Tap a pilot for their page.")}
     <div class="panel scroll"><table id="board"><thead><tr>
       <th>Pilot</th><th>Best lap</th><th>Best 3 laps</th><th>Theoretical best</th><th>Consistency</th><th>Speed vs field</th><th>Runs</th></tr></thead>
-      <tbody>${board.map((p, i) => `<tr class="click" onclick="location.hash='#/pilot/${encodeURIComponent(p.pilot)}'">
+      <tbody>${board.map((p, i) => `<tr class="click" onclick="location.hash='${B()}pilot/${encodeURIComponent(p.pilot)}'">
         <td><b>${i + 1}.</b> <span style="color:${colorFor(p.pilot)}">●</span> ${esc(p.pilot)}</td><td><b>${sec(p.best_lap)}</b></td><td>${sec(p.best3)}</td>
         <td>${sec(p.tb)}</td><td>${pct(p.cv)} ${steadiness(p.cv)}</td><td class="${p.si > 1.005 ? "good" : p.si < 0.995 ? "bad" : ""}">${p.si ? "×" + sec(p.si) : "–"}</td><td>${p.runs}</td></tr>`).join("") ||
       '<tr><td colspan="7" class="muted">No runs with laps yet.</td></tr>'}</tbody></table></div>
@@ -127,7 +170,7 @@ function roundRace(r) {
 function runCard(r) {
   const ready = r.status === "labelled";
   const flags = (r.missed ? `<span class="pill bad">${r.missed} missed</span>` : "") + (r.ended_mid_lap ? '<span class="pill ok">ended mid-lap</span>' : "");
-  return `<a class="card" href="#/run/${encodeURIComponent(r.stem)}">
+  return `<a class="card" href="${B()}run/${encodeURIComponent(r.stem)}">
     <div class="who"><span style="color:${colorFor(r.pilot)}">●</span> ${esc(r.pilot)}</div>
     <div class="meta">${roundRace(r)}Heat ${r.heat} · ${esc(r.channel)} · ${sec(r.live_s, 0)}s</div>
     ${ready ? `<div class="big">${sec(r.best_lap)}</div><div class="meta">best lap · ${r.laps} laps ${steadiness(r.lap_cv)}</div>${flags}`
@@ -135,14 +178,10 @@ function runCard(r) {
 }
 
 function learnView(st, runs) {
-  const [n, need] = st.learn_progress;
   $("#app").innerHTML = `
-    <h1>Learning the track</h1>
-    ${hint("The system learns the gates and their timing from the first runs by itself. Once enough runs are recorded, results appear for every run, including these.")}
-    <div class="panel"><div class="big">${n} / ${need} runs</div>
-      <div class="progress" style="margin:10px 0"><div style="width:${Math.min(100, (100 * n) / need)}%"></div></div>
-      <div class="muted">Results for every run appear once ${need} runs are recorded and the ${st.n_gates || ""} gates are learned.</div></div>
-    <h2>Runs collected</h2>
+    <h1>The track isn't learned yet</h1>
+    ${hint("Gates and laps appear once the track is learned: in the race-day app, tick ☑ a few heats with full laps and press Learn track.")}
+    <h2>Runs analysed</h2>
     <div class="panel scroll"><table><thead><tr><th>Run</th><th>Pilot</th><th>Heat</th><th>Channel</th><th>Length</th><th>Status</th></tr></thead>
       <tbody>${runs.map((r) => `<tr><td>${esc(r.stem)}</td><td>${esc(r.pilot)}</td><td>${r.heat}</td><td>${esc(r.channel)}</td><td>${sec(r.live_s, 0)}s</td><td>${esc(r.status)}</td></tr>`).join("")}</tbody></table></div>`;
 }
@@ -153,13 +192,13 @@ async function runPage(stem, first) {
   const st = r.stats, cmp = r.compare || {}, field = r.field || {};
   if (!first) { if (st && !$("#lapTable")) return runPage(stem, true); return; }   // keep the video playing
   const head = `<h1><span style="color:${colorFor(r.pilot)}">●</span> ${esc(r.pilot)}</h1>
-    <p class="muted">${roundRace(r)}<a href="#/heat/${r.heat}">Heat ${r.heat}</a> · ${esc(r.channel)} · <a href="#/pilot/${encodeURIComponent(r.pilot)}">all runs of ${esc(r.pilot)}</a></p>`;
+    <p class="muted">${roundRace(r)}<a href="${B()}heat/${r.heat}">Heat ${r.heat}</a> · ${esc(r.channel)} · <a href="${B()}pilot/${encodeURIComponent(r.pilot)}">all runs of ${esc(r.pilot)}</a></p>`;
   if (!st) { $("#app").innerHTML = head + `<div class="panel">This run is ${esc(r.status)} — results appear when it's analysed${STATUS && STATUS.phase === "learn" ? " and the track is learned" : ""}.</div>
-    <video src="${r.video_url}" controls playsinline preload="metadata"></video>`; return; }
+    ${videoTag(r, "")}`; return; }
   const best = st.best_lap_index;
   const live0 = r.live_start_s || 0;
   $("#app").innerHTML = head + `
-    <video id="vid" src="${r.video_url}" controls playsinline preload="metadata"></video>
+    ${videoTag(r, 'id="vid"')}
     <div id="timeline" class="panel" style="padding:6px 10px"></div>
     ${hint("Timeline: thin blue lines = gates passed, yellow lines = start/finish (G1, a new lap), L1 L2 … = laps, red = where the video is now. Tap the bar to jump there.")}
     <div class="facts">
@@ -255,8 +294,8 @@ async function heatPage(n, first) {
   $("#app").innerHTML = `<h1>${rr ? `${rr.stage ? esc(rr.stage) + " · " : ""}Round ${esc(rr.round)} · Race ${esc(rr.race ?? "–")}` : `Heat ${n}`}</h1>
     <p><span class="btn" onclick="heatPlay(true)">▶ Play all</span> <span class="btn" onclick="heatPlay(false)">❚❚ Pause</span></p>
     ${hint("▶ Play all starts the pilots' videos together, as they flew. Tap a name to open that pilot's run.")}
-    <div class="quad">${runs.map((r) => `<div><div class="meta"><span style="color:${colorFor(r.pilot)}">●</span> <a href="#/run/${encodeURIComponent(r.stem)}">${esc(r.pilot)}</a> · ${esc(r.channel)}</div>
-      <video class="hv" data-off="${r.live_start_s}" src="${r.video_url}" playsinline muted preload="metadata"></video></div>`).join("")}</div>
+    <div class="quad">${runs.map((r) => `<div><div class="meta"><span style="color:${colorFor(r.pilot)}">●</span> <a href="${B()}run/${encodeURIComponent(r.stem)}">${esc(r.pilot)}</a> · ${esc(r.channel)}</div>
+      ${r.crop ? videoTag(r, `class="hv" muted data-off="${r.live_start_s}"`) : `<video class="hv" data-off="${r.live_start_s}" src="${r.video_url}" playsinline muted preload="metadata"></video>`}</div>`).join("")}</div>
     ${isFinite(L) && order.length ? `<h2>Order over the first ${L} lap${L > 1 ? "s" : ""}</h2>${hint("Total time for the laps everyone completed. Gap +1.20 = 1.2 s behind the leader.")}<div class="panel scroll"><table><thead><tr><th>Pilot</th><th>Time</th><th>Gap</th><th>Best lap</th></tr></thead><tbody>
       ${order.map((o, i) => `<tr><td><b>${i + 1}.</b> ${esc(o.r.pilot)}</td><td>${sec(o.t)}</td><td>${i ? "+" + sec(o.t - order[0].t) : "–"}</td><td>${sec(o.r.stats.best_lap)}</td></tr>`).join("")}</tbody></table></div>` : ""}
     <h2>Gap to the leader at every gate</h2>${hint("One line per pilot. The leader runs along the top. A line dropping lower = falling further behind; a line climbing = catching up. L1 L2 … mark the laps.")}<div class="panel">${gapChart(runs, h.runs[0]?.stats?.n_gates)}</div>`;
@@ -302,7 +341,7 @@ async function pilotPage(name, first) {
       ${fact("Laps", `<div class="v">${runs.reduce((a, r) => a + r.laps, 0)}</div>`, "Full laps flown, all runs together.")}
     </div>
     <h2>Runs</h2>${hint("Each of your runs — tap one to open it. The chart shows your best lap in each run through the day (R1, R2 …): going down = you got faster. Dashed line = the typical lap on this track.")}<div class="panel scroll"><table><thead><tr><th>Run</th><th>Laps</th><th>Best</th><th>Average</th><th>Consistency</th></tr></thead><tbody>
-      ${runs.map((r) => `<tr class="click" onclick="location.hash='#/run/${encodeURIComponent(r.stem)}'"><td>Heat ${r.heat} · ${esc(r.channel)}</td><td>${r.laps}</td><td>${sec(r.best_lap)}</td><td>${sec(r.mean_lap)}</td><td>${pct(r.lap_cv)} ${steadiness(r.lap_cv)}</td></tr>`).join("")}</tbody></table>
+      ${runs.map((r) => `<tr class="click" onclick="location.hash='${B()}run/${encodeURIComponent(r.stem)}'"><td>Heat ${r.heat} · ${esc(r.channel)}</td><td>${r.laps}</td><td>${sec(r.best_lap)}</td><td>${sec(r.mean_lap)}</td><td>${pct(r.lap_cv)} ${steadiness(r.lap_cv)}</td></tr>`).join("")}</tbody></table>
       ${lapChart(runs.map((r) => r.best_lap).filter((x) => x), p.field.median_lap).replaceAll(">L", ">R")}</div>
     <h2>Strengths and weaknesses</h2>${hint("Your best time in each section, from all your runs, against the typical pilot. Green bar to the left = a strength (you're faster there), red bar to the right = where you lose time.")}<div class="panel">${sectionBars(p.sections || [], p.vs_field_median)}</div>`;
 }

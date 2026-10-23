@@ -15,8 +15,8 @@ runs/<video>.race_data.json with gt/<video>.gt.json and prints:
                    was learned from them)
   Laps             completed laps found vs marked
   Missed gates     gates the pilot skipped (the system can't flag them yet)
-  Per tag          pass recall and gate-ID accuracy for crash/clipped and
-                   bad-video marks; "unsure" marks are left out of all scores
+  Per tag          pass recall and gate-ID accuracy for crash/clipped,
+                   bad-video and reverse (gate flown from the wrong side) marks; "unsure" marks are left out of all scores
 
 Real tracks and their velocidrone/ versions are totalled separately.
 Only gt files marked "complete" are scored (--include-incomplete for all).
@@ -43,7 +43,7 @@ import numpy as np
 
 from dataset_paths import SIM_DIR, TrackPaths, data_root, list_tracks
 
-TAGS = ("crash_clipped", "bad_video")
+TAGS = ("crash_clipped", "bad_video", "reverse")     # reverse: a gate flown from the wrong side
 
 
 # ──────────────────────────────────────────────────────────────

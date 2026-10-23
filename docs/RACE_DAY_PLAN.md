@@ -25,20 +25,26 @@ The new parts are capture, the race-day app, orchestration and the dashboard. Th
 
 `race_day.py` is a desktop app (PyQt6, like learn_ui), run by the operator. It owns all settings and state. The browser dashboard only displays.
 
-**1. Live track** — at the race
+**1. Live capture** — at the race (changed 2026-10-22: the operator decides, nothing is automatic)
 1. Setup:
-   - track name (a new or existing folder in `FPVdatasets/`);
-   - **number of gates**;
-   - channel layout of the 2×2 (see below);
-   - capture device, with a preview.
-2. Records every run, analyses it, and **learns the track from the first 24 runs** (the learn state).
-3. Then switches to the result state: every run, including the first 24, is labelled and shown in the dashboard. More runs keep improving the learned track: the app re-learns every K runs and relabels.
+   - the **track**: chosen from the data folder's tracks (its subfolders that aren't FPVTrackside events, `training/` or `scores/`), a **New track…** (a new folder there), or one of the **last 3 tracks**;
+   - **single pilot or 2×2 feed**, and the channel of each quadrant (or of the single pilot);
+   - **number of gates** (can be changed at Relearn);
+   - capture device, with a preview; longest recording (default 3:00).
+   - No pilot names and no fril.co.il: pilots are known by their channel.
+2. The screen is laid out like FPVTrackside: the **heat list** on the left (every video in `<track>/videos/`, newest first), the **live feed** with **Record / Stop** at the top right, the **chosen heat** (video, gate timeline, laps per pilot) below it.
+3. **Record** saves the whole feed as `<track>/videos/heat_NNN.mp4` until **Stop** or the time limit. While it records, analysis and learning wait, so the recording gets the computer.
+4. The operator **analyses** the heats they choose, ticks ☑ heats (or single pilots) and presses **Relearn track**. Analysed heats get gate IDs and laps once the track is learned, and appear in the browser dashboard.
+5. Videos in `videos/` that weren't recorded by the app are asked about once (all 2×2 / all single / one by one).
+6. Videos are in `<track>/videos/`; **all of the app's data is in `<track>/lazySpotter/`**: `videos.json` (what each video is), `runs/`, the gate memory and timing, `race_day.json` (setup and heat states). Learning data is only taken from `lazySpotter/`: a track is learned in the app at least once (tick feeds → Learn), never from data left in the track folder by older tools.
+7. Pilots are named when a video's description has names (typed when a video is described one by one); otherwise the channel is the name.
 
-**2. Replays** — testing and after the event
-1. Choose an existing track folder.
-2. Add video files: 2×2 recordings in the same format as the live feed.
-3. Each file is split into the 4 channels, cut into runs (≥ 40 s), analysed **with the track's existing learned data** and shown in the dashboard.
-4. **No learning, and no recording** in this mode. The track must already be learned, from Live mode or with `learn_track.py`.
+**2. Replays** — testing and after the event (changed 2026-10-22)
+1. Choose any track or FPVTrackside event of the data folder from a list (newest first). A track opens in the screen below; an FPVTrackside event opens in the event screen, without Auto.
+2. The same screen as Live capture without the setup, the recording and the live feed: the heat list (the videos in `<track>/videos/`, or the folder's own videos), the chosen heat, **Analyse** and **Learn / Relearn track**.
+3. Results appear in the browser dashboard. Data goes to `<track>/lazySpotter/`.
+4. The **FPVTrackside event** button lists only FPVTrackside events (folders with an `Event.json`, e.g. `<data>/events/<id>/`), by their name and date.
+5. The data folder is chosen the first time the app opens, and can be changed on the start screen.
 
 Whichever track is open is the only one the dashboard shows. Opening another track switches the dashboard to that track's data.
 
@@ -187,6 +193,48 @@ A local web server started by `race_day.py`. Anyone on the same Wi-Fi opens it o
    - consistency trend.
 7. **Track page:** the learned gates with images and typical section times, and **the hardest sections** (the largest spread between pilots).
 
+## Gate validation integration into FPVTrackside
+
+At 2027Race1 the capture-card recording went choppy from heat 19 on, because learning ran inside the app. FPVTrackside had meanwhile recorded every heat itself, steady at 60 fps, with the pilots, the channels and the LapRF laps. So the main mode is now **⏱ FPVTrackside event**: race_day_app works directly on an FPVTrackside event folder, on the same computer or shared over the network.
+
+**What it does**
+- **Heat list:** every finished heat appears by itself, newest first.
+- **Learning:** pick heats (☑), then press **Learn / Relearn track** and give the number of gates. The last number used is offered next time.
+- **Analysis:** each pilot's quadrant is read in place, with the 4 pilots in parallel worker processes.
+- **Lap check (marshal assist):** for each pilot, the start/finish gate (G1) passes in the video are compared with the timing system's laps. Only the disagreements are shown, each with a confidence:
+  - a lap the timing system missed;
+  - a timing lap that's impossible (far shorter than a lap);
+  - something to check by hand.
+
+  Clicking one jumps the video to that moment. Accept or Reject it, or mark a lap or holeshot by hand.
+- **Update laps in FPVTrackside:** writes the changes the way FPVTrackside's own marshals do:
+  - an added lap is a `Manual` detection with `ValidityType: Auto`;
+  - a removed lap keeps its detection, set to `Valid: false` with `ManualOverride`;
+  - laps are renumbered.
+
+  The original `Race.json` is backed up once, and **Restore original laps** puts it back. Nothing else in the event folder is ever written.
+- **Auto mode:** new heats are analysed and checked, and the confident corrections are written. Unsure ones wait for a person.
+
+**FPVTrackside first**
+- **While a race is running,** race_day pauses completely. It doesn't start jobs, its worker processes are stopped (SIGSTOP), and it reads nothing except the running heat's folder, to see when the race ends.
+- **The event folder:**
+  - is only listed and checked with `stat()`;
+  - a heat's files are opened only when they've been unchanged for 10 s;
+  - writes happen only between races, and are retried if `Race.json` is busy.
+- **Videos are never moved, changed or copied.**
+
+**Where things are:** all of race_day's data is in `<event>/lazySpotter/`: `race_day.json`, the learned track, `runs/`, `gt/`, `backups/` (until 2026-10-22 it was `<event>/race_day/`; only its `backups/` — the original Race.json files — are carried over, the track is learned again).
+
+**Replays** (since 2026-10-22) opens a track folder, not an event: see *Two modes* above. The timeline shows every gate pass, and **Review gates** opens learn_ui on that pilot's quadrant (`learn_ui.py --review … --crop …`). Videos nobody described yet are asked about once (all 2×2 / all single / one by one, with optional pilot names).
+
+**Code:**
+- `race_day/trackside.py`: reading the event, finished and running heats, frame times, writing laps back;
+- `race_day/lapcheck.py`: the lap check;
+- `race_day/eventday.py`: the controller;
+- `race_day/event_ui.py`: the screen;
+- `race_day/capture.py` `QuadReader`: one quadrant of a video, read in place;
+- `extract_race.run_race_extraction(reader=…)`.
+
 ## Milestones
 
 | # | Milestone | Done when |
@@ -194,34 +242,35 @@ A local web server started by `race_day.py`. Anyone on the same Wi-Fi opens it o
 | 0 | This plan in `docs/RACE_DAY_PLAN.md`, committed | in the repo, open for edits |
 | 1 | ✅ `race_day_app.py`: start screen, Live / Replays setup, track folder and `race_day.json`, channel layout | both modes can be opened and set up, and settings are saved per track |
 | 1b | Detector on the GPU + one worker process per channel | ✅ GPU gives results identical to the CPU, 3–4× faster; Core ML failed the score check and is off by default |
-| 2 | ✅ Splitter and run detector, plus a 2×2 test-video maker (from existing videos, with gray gaps and static) | from a test 2×2 file, exactly the runs ≥ 40 s are saved (video + data) under the right channels, with no gray or static |
-| 3 | ✅ Controller: queue, Live learn → result after 24 runs, relabel, re-learn; Replays with the existing learned track | a simulated Live day runs unattended and survives a restart; Replays analyses added files |
+| 2 | ✅ Splitter and run detector, plus a 2×2 test-video maker (from existing videos, with gray gaps and static) — *replaced 2026-10-22 by recording on demand* | from a test 2×2 file, exactly the runs ≥ 40 s are saved (video + data) under the right channels, with no gray or static |
+| 3 | ✅ Controller: queue, Live learn → result after 24 runs, relabel, re-learn; Replays with the existing learned track — *replaced 2026-10-22: live capture runs on `eventday.py`, the operator chooses* | a simulated Live day runs unattended and survives a restart; Replays analyses added files |
 | 4 | ✅ Stats | numbers match the reviewed videos (lap times = reviewed G1 times) |
 | 5 | ✅ Browser dashboard (read-only, open track only, phone replay) | a simulated event shows live on a laptop and a phone, and runs play on the phone |
-| 6 | ✅ Heat and pilot info from the website: `GET https://fril.co.il/api/live/state` only, polled every 2 s — round, race, and each pilot's name and channel (Raceband 1 → `R1`). Asked when a heat starts and again when each run ends, since the timing PC may load the heat late. Falls back to `H012-R3` names without internet or data. | names and heats per run, with and without internet |
+| 6 | ✅ *(removed 2026-10-22: pilots are known by channel)* Heat and pilot info from the website: `GET https://fril.co.il/api/live/state` only, polled every 2 s — round, race, and each pilot's name and channel (Raceband 1 → `R1`). Asked when a heat starts and again when each run ends, since the timing PC may load the heat late. Falls back to `H012-R3` names without internet or data. | names and heats per run, with and without internet |
 | 7 | Dry run on the M5 with the real capture card | a full simulated heat analysed within about 1 minute of ending, race-day checklist written |
 
 ## How to run (implemented)
 
 ```bash
-python race_day_app.py                       # the desktop app: Live track or Replays
+python race_day_app.py                       # the desktop app: FPVTrackside event, Live capture or Replays
 python -m race_day.simulate out.mp4 --heat "a.mp4,b.mp4,c.mp4,d.mp4" --heat "…"   # a 2×2 test video
 ```
 
-- **Live:**
-  - type a track name and the number of gates, check the channel layout, pick the capture card, then **Start**;
-  - for a test without the card, pick *Test: play a 2×2 video file as if live*.
+- **Live capture:**
+  - choose the track folder (or a recent track), single or 2×2 and the channels, the number of gates and the capture card, then **Start**;
+  - **Record / Stop** heats; select heats and **Analyse**; tick ☑ heats and **Relearn track**;
+  - for a test without the card, pick *Test: play a video file as if live*.
 - **Replays:**
-  - pick a learned track, add 2×2 files, then **Analyse**.
-- **Dashboard:** the address and QR code are on the running screen. Open it on any phone on the same Wi-Fi.
+  - choose the track folder; select heats and **Analyse**; tick ☑ heats and **Learn / Relearn track** if it isn't learned yet.
+- **Dashboard:** the address is in the top bar. Open it on any phone on the same Wi-Fi.
 - **Code:** `race_day/` holds:
-  - `capture.py` — splitter and run detector;
+  - `capture.py` — capture sources, `HeatRecorder` (Record / Stop), `QuadReader`;
+  - `live_ui.py` — the live-capture screen; `event_ui.py` — the event / Replays screen it builds on;
+  - `eventday.py` — the controller (events, Replays, live capture); `trackside.py` — heats from an event, a video folder or a track's recordings;
   - `analysis.py` — GPU workers;
   - `labeling.py` — gates, laps, learning;
   - `stats.py`;
-  - `controller.py`;
   - `server.py` and `static/` — the dashboard;
-  - `pilots.py` — heat and pilot names;
   - `models.py`;
   - `simulate.py`.
 
@@ -230,11 +279,11 @@ python -m race_day.simulate out.mp4 --heat "a.mp4,b.mp4,c.mp4,d.mp4" --heat "…
 - **Laptop:** M5, 24 GB.
 - **Gate count:** entered in the desktop app's setup when opening a track for Live (or chosen with the track in Replays).
 - **Start gate:** the first gate passed is always G1.
-- **Internet:** available; without it, pilots are named by heat and channel.
+- **Internet:** not needed; pilots are known by their channel.
 - **Viewing:** phones on the same Wi-Fi, through the dashboard. The dashboard is read-only and shows only the open track.
 - **Run end:** about 10 s of gray, not 3 s.
 - **Saving:** both video and data.
-- **Learning:** only in Live mode.
+- **Learning:** when the operator presses Relearn track, from the heats they ticked.
 - **Laptop speed:** the M5 Pro analyses 4 feeds at about 2× real time with Core ML + GPU workers (measured).
 
 ## Open questions

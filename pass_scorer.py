@@ -6,8 +6,10 @@ The live PassDetector decides at one instant.  Here every pass is decided
 with hindsight from its candidate's approach, exit and what happens after:
 
   candidates   every pass the live detector fired, every track that ends
-               while big (area ≥ 0.08 over its last 0.5 s), and every
-               one-frame shrink of ≥35% while big; merged within 0.1 s
+               while big (area ≥ 0.08 over its last 0.5 s), every
+               one-frame shrink of ≥35% while big, and every big box that
+               jumps (the tracker moved on to the gate right behind);
+               merged within 0.1 s
   features     approach of the GATE, stitched across track IDs (duration,
                alignment, growth, centring, angle of attack from the box's
                width/height), exit (borders touched,
@@ -17,17 +19,26 @@ with hindsight from its candidate's approach, exit and what happens after:
   logics       several decision logics, compared on the reviewed videos with
                leave-one-video-out (LOGICS below)
 
+Two stages (saved model): the scorer keeps every candidate above a LOW
+threshold (almost every real pass, with false ones), and the gate-sequence
+decoder (gate_decoder.label_race) drops the ones that don't fit the track —
+gate order, gate-to-gate timing, look of each gate and the scorer's p_pass
+together. On 52 reviewed videos of 3 tracks: errors (missed + false) 331 →
+147 against a single threshold.
+
 Input per video: runs/<video>.race_data.json and runs/<video>.motion.json
 (computed if missing).  No YOLO.
 
     python pass_scorer.py track1                 # compare all logics
     python pass_scorer.py track1 --logic tracks_motion --list
-    python pass_scorer.py track1 --save          # train on all videos → pass_scorer.json (repo)
+    python pass_scorer.py --save                 # train on every track's reviewed videos → pass_scorer.json (repo)
+    python pass_scorer.py --save --root DIR      # … reading the analyses from DIR/<track>/runs (another detector)
 """
 
 import argparse
 import bisect
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -40,12 +51,17 @@ from dataset_paths import TrackPaths, list_tracks
 TOL = 0.15          # on-time window, same as score.py
 MERGE = 0.10        # candidates closer than this are one event
 MERGE_PICK = "biggest"   # event time: "latest" exit among its big pieces, or the "biggest" piece
-NMS = 0.25          # at most one pass per this window
+NMS = 0.15          # at most one pass per this window (gates can be 0.2 s apart:
+                    # 2027Race1 G7→G8, track1 G10→G11)
 BIG = 0.08          # area_ratio a track must reach to be a candidate
 SHRINK = 0.65       # one-frame area drop to this fraction counts as an exit
+JUMP_IOU = 0.7      # a big box overlapping its previous box less than this: the tracker
+                    # slid on to the gate right behind (the track goes on) — an exit
 TYPES = ("square", "arch", "circle", "flagpole")
 STITCH = True       # judge the approach per gate: link overlapping boxes across track IDs
 BEST_LOGIC = "tracks_motion"       # best on track1 leave-one-video-out, 11 videos (see README)
+TWO_STAGE_THRESHOLD = 0.03         # stage 1 keeps almost everything; the decoder filters
+DECODER = {"pass_weight": 2.0, "pass_bias": 0.0, "window": 10, "drop_false": True}   # see gate_decoder.Cfg
 
 
 # ──────────────────────────────────────────────────────────────
@@ -139,7 +155,7 @@ class Cand:
     t: float
     tid: int
     det: Optional[dict] = None       # the live detector's pass, if it fired here
-    kind: str = "end"                # end | shrink | det
+    kind: str = "end"                # end | shrink | jump | det
     gtype: str = ""
     feats: Dict[str, float] = field(default_factory=dict)
     p: float = 0.0
@@ -147,6 +163,7 @@ class Cand:
 
 def candidates(v: Video) -> List[Cand]:
     out: List[Cand] = []
+    jumps: List[Cand] = []
     for tid, s in v.tracks.items():
         tE = s[-1][0]
         if max(a for t, _, a, *_ in s if t >= tE - 0.5) >= BIG:
@@ -154,6 +171,8 @@ def candidates(v: Video) -> List[Cand]:
         for x0, x1 in zip(s, s[1:]):
             if x0[2] >= BIG and x1[2] <= SHRINK * x0[2]:
                 out.append(Cand(x0[0], tid, kind="shrink"))
+            elif x0[2] >= BIG and _iou(x0[1], x1[1]) < JUMP_IOU and x1[0] - x0[0] < 0.1:
+                jumps.append(Cand(x0[0], tid, kind="jump"))
     for p in live_passes(v.race):
         out.append(Cand(p["t"], int(p.get("track_id", -1)), det=p, kind="det"))
     # merge within MERGE: pieces of one gate end at different moments — the pass is
@@ -178,7 +197,9 @@ def candidates(v: Video) -> List[Cand]:
         else:
             best = grp[0]
         res.append(Cand(best.t, best.tid, det=det, kind=best.kind if own else "det"))
-    return res
+    # a jump right where another candidate already is adds nothing
+    res += [c for c in jumps if not any(abs(o.t - c.t) <= MERGE for o in res)]
+    return sorted(res, key=lambda c: c.t)
 
 
 def _area_near(v: Video, tid: int, t: float) -> float:
@@ -296,6 +317,7 @@ def features(v: Video, c: Cand, ratios: Dict[str, float]) -> Dict[str, float]:
     f["border_side"] = float(bl or br)
     f["border_top"] = float(bt)
     f["shrink_exit"] = float(c.kind == "shrink")
+    f["jump_exit"] = float(c.kind == "jump")
     # after: does the same gate go on?
     cont, nxt = 0.0, 1.0
     end_cx, end_cy = (end_b[0] + end_b[2]) / 2 / v.W, (end_b[1] + end_b[3]) / 2 / v.H
@@ -313,7 +335,7 @@ def features(v: Video, c: Cand, ratios: Dict[str, float]) -> Dict[str, float]:
     f["next_big"] = nxt
     f["det"] = float(c.det is not None)
     # camera motion
-    med_res = float(np.median(v.motion["resid"])) or 1e-3
+    med_res = _moving_median(v)
     f["exp_before"] = float(_mwin(v, "expand", c.t - 0.5, c.t).mean())
     f["exp_after"] = float(_mwin(v, "expand", c.t, c.t + 0.5).mean())
     f["exp_peak"] = float(_mwin(v, "expand", c.t - 0.2, c.t + 0.2).max())
@@ -323,9 +345,24 @@ def features(v: Video, c: Cand, ratios: Dict[str, float]) -> Dict[str, float]:
     return f
 
 
+STILL_RESID = 1e-4     # motion residual of a frame with no picture (gray feed) or a pilot standing still
+TYPICAL_RESID = 0.02   # a normal feed's median residual (fallback)
+
+
+def _moving_median(v: Video) -> float:
+    """The feed's usual camera-motion noise, over frames that move: a feed
+    gray or still for most of the video (a late start, an early crash) would
+    otherwise give ~0, and every real pass would look like chaos."""
+    if "_med_res" not in v.motion:
+        r = np.asarray(v.motion.get("resid") or [], dtype=float)
+        moving = r[r > STILL_RESID]
+        v.motion["_med_res"] = float(np.median(moving)) if len(moving) >= 30 else TYPICAL_RESID
+    return v.motion["_med_res"]
+
+
 TRACK_FEATS = ["dur", "n_aligned", "amax", "aend", "growth", "cmin", "cend", "yolo", "is_arch",
                "is_flagpole", "aspect", "has_aspect", "borders", "border_side", "border_top",
-               "shrink_exit", "continues", "next_big"]
+               "shrink_exit", "jump_exit", "continues", "next_big"]
 MOTION_FEATS = ["exp_before", "exp_after", "exp_peak", "turn", "chaos"]
 
 
@@ -358,7 +395,8 @@ class Logistic:
         self.names, self.l2 = names, l2
 
     def _X(self, F: List[Dict[str, float]]) -> np.ndarray:
-        return np.array([[f[n] for n in self.names] for f in F], dtype=float)
+        # (0, n) when there are no candidates (a pilot who never flew) — not (0,)
+        return np.array([[f[n] for n in self.names] for f in F], dtype=float).reshape(len(F), len(self.names))
 
     def fit(self, F: List[Dict[str, float]], y: np.ndarray) -> "Logistic":
         with np.errstate(all="ignore"):          # macOS Accelerate matmul raises spurious FP warnings
@@ -407,7 +445,8 @@ class Stumps:
         self.names, self.rounds, self.lr = names, rounds, lr
 
     def _X(self, F):
-        return np.array([[f[n] for n in self.names] for f in F], dtype=float)
+        # (0, n) when there are no candidates (a pilot who never flew) — not (0,)
+        return np.array([[f[n] for n in self.names] for f in F], dtype=float).reshape(len(F), len(self.names))
 
     def fit(self, F, y) -> "Stumps":
         X = self._X(F)
@@ -512,7 +551,7 @@ def to_pass(c: Cand, fps: float = 30.0) -> dict:
     from a track end is reported one frame later — like the live detector."""
     p = dict(c.det) if c.det else {"gate_id": -1, "gate_type": c.gtype, "sim": 0.0, "source": "NEW",
                                    "reason": f"scorer_{c.kind}", "track_id": c.tid}
-    p["t"] = round(c.det["t"] if c.det else c.t + (1.0 / fps if c.kind in ("end", "shrink") else 0.0), 4)
+    p["t"] = round(c.det["t"] if c.det else c.t + (1.0 / fps if c.kind in ("end", "shrink", "jump") else 0.0), 4)
     p["p_pass"] = round(float(c.p), 4)
     return p
 
@@ -620,8 +659,46 @@ def train_all(videos, cands_by, logic: str, l2: float = 1.0):
 
 def model_path() -> Path:
     """The saved model lives in the repo (next to the YOLO model), so it comes
-    with the code to any laptop."""
+    with the code to any laptop. PASS_SCORER_MODEL points to another one
+    (tests: a model trained without the video being analysed)."""
+    if os.environ.get("PASS_SCORER_MODEL"):
+        return Path(os.environ["PASS_SCORER_MODEL"])
     return Path(__file__).resolve().parent / "pass_scorer.json"
+
+
+def time_offsets(videos: List[Video], cands_by: Dict[str, List[Cand]], model, thr: float) -> dict:
+    """How late the scorer's passes are against the reviews: per track and
+    gate (≥5 passes), and over everything ("_all") for other tracks. The
+    decoder shifts each pass by its gate's offset once it knows the gate."""
+    per: Dict[str, Dict[int, List[float]]] = {}
+    for v in videos:
+        passes = [p for p in decide("model", v, cands_by[v.stem], model, thr) if p["p_pass"] >= 0.5]
+        track = v.tp.dir.name if v.tp else "?"
+        for m in real_passes(v):
+            near = min(passes, key=lambda p: abs(p["t"] - m["t"]), default=None)
+            if near is not None and abs(near["t"] - m["t"]) <= 0.5 and m.get("gate_id", -1) >= 1:
+                per.setdefault(track, {}).setdefault(int(m["gate_id"]), []).append(m["t"] - near["t"])
+    out: dict = {"_all": round(float(np.median([x for g in per.values() for xs in g.values() for x in xs] or [0.0])), 4)}
+    for track, g in per.items():
+        out[track] = {str(k): round(float(np.median(xs)), 4) for k, xs in sorted(g.items()) if len(xs) >= 5}
+    return out
+
+
+def save_model(videos: List[Video], cands_by: Dict[str, List[Cand]], logic: str, out: Path,
+               l2: float = 1.0, threshold: Optional[float] = TWO_STAGE_THRESHOLD) -> dict:
+    """Train on these videos and write the model. threshold None: the single
+    threshold with the fewest errors (no decoder filter, the old way)."""
+    model, best_thr = train_all(videos, cands_by, logic, l2)
+    thr = best_thr if threshold is None else threshold
+    det_models = sorted({v.race.get("det_model") or (v.gt or {}).get("det_model") or "?" for v in videos})
+    d = {"logic": logic, "threshold": thr, "model": model.to_json(), "type_ratios": type_ratios(videos),
+         "det_models": det_models, "trained_on": [v.stem for v in videos]}
+    if threshold is not None:
+        d["decoder"] = dict(DECODER)
+        d["time_offsets"] = time_offsets(videos, cands_by, model, thr)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(d, indent=2), encoding="utf-8")
+    return d
 
 
 def load_model(path: Optional[Path] = None) -> Optional[dict]:
@@ -659,13 +736,31 @@ def main():
     ap.add_argument("--l2", type=float, default=1.0, help="L2 regularisation of the learned logics")
     ap.add_argument("--list", action="store_true", help="List remaining misses / false / off-time passes")
     ap.add_argument("--save", action="store_true",
-                    help="Train --logic (default BEST_LOGIC) on all videos → pass_scorer.json (repo)")
+                    help="Train --logic (default BEST_LOGIC) on all tracks' reviewed videos → pass_scorer.json (repo)")
+    ap.add_argument("--root", help="Read the tracks' analyses from ROOT/<track> (e.g. analyses with another detector)")
+    ap.add_argument("--single-threshold", action="store_true",
+                    help="With --save: one threshold, no decoder filter (the old way)")
     args = ap.parse_args()
 
     tracks = [tp for tp in list_tracks() if not args.tracks or tp.dir.name in args.tracks]
+    if args.root:                       # the same tracks' analyses from another folder (e.g. another detector)
+        tracks = [TrackPaths(Path(args.root) / tp.dir.name) for tp in tracks if (Path(args.root) / tp.dir.name).is_dir()]
     sargs = argparse.Namespace(tol=TOL, off_tol=0.5, rematch=False, include_incomplete=True, list=args.list,
                                sim_thresh=0.88, min_margin=0.03, g1_sim_thresh=None, g1_margin=None,
                                require_same_type=False)
+    if args.save:                       # one model from every track's reviewed videos
+        videos, cands_by = [], {}
+        for tp in tracks:
+            if tp.gt_dir.exists():
+                vs, cs = prepare(tp, include_incomplete=False)
+                videos += vs
+                cands_by.update(cs)
+        logic = args.logic or BEST_LOGIC
+        d = save_model(videos, cands_by, logic, model_path(), args.l2,
+                       None if args.single_threshold else TWO_STAGE_THRESHOLD)
+        print(f"Saved {logic} (threshold {d['threshold']:.2f}"
+              f"{', decoder filter' if 'decoder' in d else ''}) from {len(videos)} videos → {model_path()}")
+        return
     for tp in tracks:
         if not tp.gt_dir.exists():
             continue
@@ -678,21 +773,6 @@ def main():
             covered += sum(y == 1 for y in label(v, cands_by[v.stem]))
         print(f"\n{tp.name}: {len(videos)} videos, {n_real} real passes, "
               f"{sum(len(c) for c in cands_by.values())} candidates, candidate recall {covered}/{n_real}")
-        if args.save:
-            logic = args.logic or BEST_LOGIC
-            model, thr = train_all(videos, cands_by, logic, args.l2)
-            out = model_path()
-            out.parent.mkdir(parents=True, exist_ok=True)
-            det_models = sorted({(v.gt or {}).get("det_model") or v.race.get("det_model") or "?" for v in videos})
-            out.write_text(json.dumps({"logic": logic, "threshold": thr, "model": model.to_json(),
-                                       "type_ratios": type_ratios(videos), "det_models": det_models,
-                                       "trained_on": [v.stem for v in videos]}, indent=2), encoding="utf-8")
-            print(f"Saved {logic} (threshold {thr:.2f}) → {out}")
-            weights = (model.importance() if isinstance(model, Stumps)
-                       else dict(zip(model.names, model.w[1:])))
-            for n, w in sorted(weights.items(), key=lambda x: -abs(x[1])):
-                print(f"    {n:<12} {w:+.2f}")
-            continue
         rows = []
         for logic in ([args.logic] if args.logic else LOGICS):
             per = lovo_passes(videos, cands_by, logic, args.l2)

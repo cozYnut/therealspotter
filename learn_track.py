@@ -23,9 +23,20 @@ re-estimated from those labels, and again until the labels stop changing
   3. relabel every video with the pooled timing + appearance; repeat.
 
 Passes: a learn video's normal runs/<video>.race_data.json is used if it
-exists (its gate labels are ignored). Otherwise learn_track runs the pass
-analysis itself with a blank memory and saves runs/<video>.learn_passes.json
-— never race_data.json, so Review and race_ui don't load a run without gates.
+exists (its gate labels are ignored; its candidate passes if it has them).
+Otherwise — or when that analysis was made with another detector than
+--det-model — learn_track runs the pass analysis itself with a blank memory
+and saves runs/<video>.learn_passes.json — never race_data.json, so Review
+and race_ui don't load a run without gates.
+
+With the pass scorer's two stages the passes include likely-false ones:
+only those with p_pass ≥ LEARN_MIN_P are learned from (a false candidate
+that repeats every lap — a gate detected twice — otherwise becomes a gate of
+its own, and every gate after it is numbered one off), and decoding uses each
+pass's p_pass (the settings saved with the scorer).
+
+Lap times: <video>.laps.txt next to a learn video (G1 times in seconds) pins
+the start/finish gate.
 
 Outputs (track level):
   <track>/gate_memory.learned.json   gates in order with type and images
@@ -50,6 +61,14 @@ import gate_decoder as gd
 from dataset_paths import TrackPaths, list_tracks
 
 MAX_IMAGES = 24         # varied images kept per gate (6 was too few to cover other pilots and light)
+LEARN_MIN_P = 0.3       # learn from passes the scorer is fairly sure of (0.2–0.6 all learn the same
+                        # track1 / USGQ2025; 0.03 learned a phantom gate)
+
+
+def learn_passes(passes: List[dict]) -> List[dict]:
+    """The passes to learn from, in time order: low-p_pass candidates left out."""
+    return sorted((p for p in passes if p.get("p_pass") is None or p["p_pass"] >= LEARN_MIN_P),
+                  key=lambda p: p["t"])
 
 
 # ──────────────────────────────────────────────────────────────
@@ -71,14 +90,16 @@ def read_lap_times(path: Path) -> List[float]:
 def align_lap_times(g1: List[float], pass_times: List[float], tol: float = 0.35) -> Tuple[List[float], float]:
     """Lap timers count from the race start, not the video start: find the
     shift that puts the most G1 times on a detected pass (then refine it to the
-    median offset of those matches)."""
+    median offset of those matches). On a tie the smallest shift wins: the
+    gate before G1 is often ~1 s earlier, so a whole-lap shift onto it fits
+    as well (lap times from a review are already in video time)."""
     if not g1 or not pass_times:
         return g1, 0.0
     pt = np.array(pass_times)
     best = (-1, 0.0)
     for shift in np.unique(np.round(pt[:, None] - np.array(g1)[None, :], 2)):
         hits = sum(np.min(np.abs(pt - (a + shift))) <= tol for a in g1)
-        if hits > best[0]:
+        if hits > best[0] or (hits == best[0] and abs(shift) < abs(best[1])):
             best = (hits, float(shift))
     shift = best[1]
     offs = [pt[np.argmin(np.abs(pt - (a + shift)))] - a for a in g1
@@ -99,18 +120,27 @@ def learn_video_files(tp: TrackPaths) -> List[Path]:
     return sorted(p for p in tp.learn_videos.glob("*") if p.suffix.lower() in VIDEO_EXT)
 
 
-def passes_file(tp: TrackPaths, stem: str) -> Optional[Path]:
-    """A normal run if there is one (gate labels are ignored), else the learn run."""
+def passes_file(tp: TrackPaths, stem: str, det_model: Optional[str] = None) -> Optional[Path]:
+    """A normal run if there is one (gate labels are ignored), else the learn
+    run — only one made with det_model (by file name) when it's given."""
     for p in (tp.race_data(stem), tp.learn_passes(stem)):
-        if p.exists():
+        if p.exists() and (det_model is None or _det_name(p) == Path(det_model).name):
             return p
     return None
 
 
+def _det_name(path: Path) -> str:
+    try:
+        return json.loads(path.read_text(encoding="utf-8")).get("det_model", "")
+    except (OSError, ValueError):
+        return ""
+
+
 def analyse_learn_videos(tp: TrackPaths, n: int, det_model: str, clip_device: str):
-    """Find the passes of every learn video that has none yet. A blank
-    n-gate memory and greedy matching keep any taught track data out."""
-    todo = [f for f in learn_video_files(tp) if passes_file(tp, f.stem) is None]
+    """Find the passes of every learn video that has none yet (or only from
+    another detector). A blank n-gate memory and greedy matching keep any
+    taught track data out."""
+    todo = [f for f in learn_video_files(tp) if passes_file(tp, f.stem, det_model) is None]
     if not todo:
         return
     import tempfile
@@ -130,15 +160,15 @@ def analyse_learn_videos(tp: TrackPaths, n: int, det_model: str, clip_device: st
         Path(tmp.name).unlink(missing_ok=True)
 
 
-def load_learn_videos(tp: TrackPaths) -> Tuple[List[gd.VideoSeq], Dict[str, List[dict]]]:
+def load_learn_videos(tp: TrackPaths, det_model: Optional[str] = None) -> Tuple[List[gd.VideoSeq], Dict[str, List[dict]]]:
     vids, raw = [], {}
     for f in learn_video_files(tp):
-        rd = passes_file(tp, f.stem)
+        rd = passes_file(tp, f.stem, det_model)
         if rd is None:
             print(f"  {f.name}: no passes found (skipped)")
             continue
         race = json.loads(rd.read_text(encoding="utf-8"))
-        passes = sorted(race.get("passes", []), key=lambda p: p["t"])
+        passes = learn_passes(race.get("candidate_passes") or race.get("passes", []))
         raw[f.stem] = passes
         lf = lap_file(f)
         g1 = []
@@ -258,6 +288,12 @@ def lap_template(videos: List[gd.VideoSeq], n: int) -> Optional[np.ndarray]:
     mu = np.zeros(n + 1)
     mu[1:] = np.log(np.median(L, 0))
     return mu
+
+
+def learn_cfg() -> gd.Cfg:
+    """Decoder settings for learning: the pass scorer's (p_pass, window), the
+    first pass pinned to G1 strongly, nothing dropped (labels only)."""
+    return replace(gd.scorer_cfg(), start_g1=10.0, drop_false=False)
 
 
 def learn(videos: List[gd.VideoSeq], n: int, cfg: gd.Cfg, iters: int = 8, verbose: bool = True):
@@ -382,7 +418,7 @@ def main():
     ap.add_argument("track")
     ap.add_argument("--gates", type=int, required=True, help="Number of gates on the track")
     ap.add_argument("--iters", type=int, default=8)
-    ap.add_argument("--det-model", default=str(Path(__file__).parent / "cyn_current-20260715_best.pt"),
+    ap.add_argument("--det-model", default=str(Path(__file__).parent / "cyn_current-20261021_best.pt"),
                     help="YOLO model for analysing new learn videos (use the one the pass scorer was trained on)")
     ap.add_argument("--clip-device", default=None, help="cpu / mps / cuda (default: auto)")
     ap.add_argument("--evaluate", action="store_true", help="Score the learned track on the reviewed videos")
@@ -395,13 +431,12 @@ def main():
         args.clip_device = "mps" if torch.backends.mps.is_available() else (
             "cuda" if torch.cuda.is_available() else "cpu")
     analyse_learn_videos(tp, args.gates, args.det_model, args.clip_device)
-    videos, raw = load_learn_videos(tp)
+    videos, raw = load_learn_videos(tp, args.det_model)
     if not videos:
         ap.error(f"no analysed videos in {tp.learn_videos}")
     print(f"{tp.name}: learning {args.gates} gates from {len(videos)} videos "
           f"({sum(len(v.obs) for v in videos)} passes)")
-    cfg = gd.Cfg(start_g1=10.0)
-    m, labels = learn(videos, args.gates, cfg, args.iters)
+    m, labels = learn(videos, args.gates, learn_cfg(), args.iters)
     save(tp, videos, raw, labels, m, args.gates)
     for v in videos:
         seq = [g for g in labels[v.stem] if g > 0]
