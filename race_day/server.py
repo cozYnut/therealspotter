@@ -185,15 +185,17 @@ class DataView:
 
     def track(self):
         out = {"gates": [], "legs_s": None, "field": self.field()}
+        from race_day.trackside import relocate
         mem = self._json(self.tp.gate_memory)
         root = self.tp.dir.resolve()
         if mem:
+            amp = "&" + self.q[1:] if self.q else ""
             for g in mem.get("memory", []):
-                imgs = [p for p in g.get("embed_imgs", []) if p][:4]
-                amp = "&" + self.q[1:] if self.q else ""
+                # saved by full path: found again in this folder if the event was moved
+                found = [relocate(p, self.tp.dir) for p in g.get("embed_imgs", []) if p]
+                imgs = [f.resolve() for f in found if f is not None and str(f.resolve()).startswith(str(root))][:4]
                 out["gates"].append({"gate": g["gate_id"], "type": g.get("gate_type"),
-                                     "images": [f"/img?p={urllib.parse.quote(str(Path(p).resolve().relative_to(root)))}{amp}"
-                                                for p in imgs if str(Path(p).resolve()).startswith(str(root))]})
+                                     "images": [f"/img?p={urllib.parse.quote(str(f.relative_to(root)))}{amp}" for f in imgs]})
         tim = self._json(self.tp.learned_timing)
         if tim:
             out["legs_s"] = list(tim.get("leg_seconds", {}).values())

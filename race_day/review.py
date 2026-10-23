@@ -171,16 +171,20 @@ class Review:
 
     def gate_image(self, gate_id: int) -> str:
         """A picture of the gate from the learned memory."""
+        from race_day.trackside import relocate
         g = self.gates[gate_id - 1] if 1 <= gate_id <= len(self.gates) else {}
         for p in [g.get("last_img")] + list(reversed(g.get("embed_imgs") or [])):
-            if p and os.path.exists(p):
-                return p
+            f = relocate(p, self.tp.dir)              # also after the event folder was moved
+            if f is not None:
+                return str(f)
         return ""
 
     def query_image(self, m: Mark) -> str:
         """The system's crop of the gate at this pass."""
+        from race_day.trackside import relocate
         q = (m.pred or {}).get("query_img")
-        return str(abs_path(q)) if q else ""
+        f = relocate(abs_path(q), self.tp.dir) if q else None
+        return str(f) if f is not None else ""
 
     # ── actions (each saves) ───────────────────────────────────
 

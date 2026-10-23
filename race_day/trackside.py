@@ -127,6 +127,23 @@ class _Folder:
     files: Dict[str, tuple] = field(default_factory=dict)
 
 
+def relocate(path, data_dir) -> Optional[Path]:
+    """A file the app saved by its full path (gate pictures, run crops), found
+    again after the event or track folder was moved or renamed: the part
+    after lazySpotter/ in the folder's data_dir now. None if it's nowhere."""
+    if not path:
+        return None
+    p = Path(path)
+    if p.exists():
+        return p
+    parts = p.parts
+    for i in range(len(parts) - 1, -1, -1):
+        if parts[i] in (SUBDIR, OLD_SUBDIR):
+            q = Path(data_dir).joinpath(*parts[i + 1:])
+            return q if q.exists() else None
+    return None
+
+
 def _carry_backups(old: Path, new: Path):
     """The original Race.json of every heat the app changed, from the old data
     folder: Restore keeps working, and a later change doesn't back up an
