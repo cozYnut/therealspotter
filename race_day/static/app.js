@@ -13,6 +13,9 @@ const api = (p) => {
   if (EV && p.startsWith("/api/") && p !== "/api/events") p += (p.includes("?") ? "&" : "?") + "e=" + encodeURIComponent(EV);
   return fetch(p, { cache: "no-store" }).then((r) => (r.ok ? r.json() : Promise.reject(r.status)));
 };
+// a run checked by hand in the app (its laps and gates are the reviewed ones)
+const reviewPill = (r) => r.reviewed === "complete" ? '<span class="pill good" title="Checked by hand in the app: laps and gates are the reviewed ones">reviewed</span>'
+  : r.reviewed ? '<span class="pill ok" title="Partly checked by hand in the app">review in progress</span>' : "";
 // a link inside the event shown: B() + "run/…"
 const B = () => `#/e/${encodeURIComponent(EV)}/`;
 const MODES = { live: "FPVTRACKSIDE · OPEN", capture: "LIVE CAPTURE · OPEN", replays: "REPLAYS · OPEN" };
@@ -169,7 +172,7 @@ function roundRace(r) {
 
 function runCard(r) {
   const ready = r.status === "labelled";
-  const flags = (r.missed ? `<span class="pill bad">${r.missed} missed</span>` : "") + (r.ended_mid_lap ? '<span class="pill ok">ended mid-lap</span>' : "");
+  const flags = reviewPill(r) + (r.missed ? `<span class="pill bad">${r.missed} missed</span>` : "") + (r.ended_mid_lap ? '<span class="pill ok">ended mid-lap</span>' : "");
   return `<a class="card" href="${B()}run/${encodeURIComponent(r.stem)}">
     <div class="who"><span style="color:${colorFor(r.pilot)}">●</span> ${esc(r.pilot)}</div>
     <div class="meta">${roundRace(r)}Heat ${r.heat} · ${esc(r.channel)} · ${sec(r.live_s, 0)}s</div>
@@ -191,7 +194,7 @@ async function runPage(stem, first) {
   const r = await api("/api/run/" + encodeURIComponent(stem));
   const st = r.stats, cmp = r.compare || {}, field = r.field || {};
   if (!first) { if (st && !$("#lapTable")) return runPage(stem, true); return; }   // keep the video playing
-  const head = `<h1><span style="color:${colorFor(r.pilot)}">●</span> ${esc(r.pilot)}</h1>
+  const head = `<h1><span style="color:${colorFor(r.pilot)}">●</span> ${esc(r.pilot)} ${reviewPill(r)}</h1>
     <p class="muted">${roundRace(r)}<a href="${B()}heat/${r.heat}">Heat ${r.heat}</a> · ${esc(r.channel)} · <a href="${B()}pilot/${encodeURIComponent(r.pilot)}">all runs of ${esc(r.pilot)}</a></p>`;
   if (!st) { $("#app").innerHTML = head + `<div class="panel">This run is ${esc(r.status)} — results appear when it's analysed${STATUS && STATUS.phase === "learn" ? " and the track is learned" : ""}.</div>
     ${videoTag(r, "")}`; return; }

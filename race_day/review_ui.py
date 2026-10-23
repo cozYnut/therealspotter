@@ -32,6 +32,7 @@ WORDS = {"pending": "to check", "accepted": "accepted", "fixed_id": "gate fixed"
 
 class ReviewPanel(QWidget):
     finished = pyqtSignal()              # the user closed the review
+    changed = pyqtSignal()               # a mark changed (saved): the run's results can be updated
 
     def __init__(self, page: QWidget, player):
         super().__init__()
@@ -162,12 +163,14 @@ class ReviewPanel(QWidget):
         why = r.accept(self.player.t)
         if why:
             return self.say(why)
+        self.changed.emit()
         self._refresh()
         self.step(+1)
 
     def reject(self):
         if self.review and self.review.sel is not None:
             self.review.reject()
+            self.changed.emit()
             self._refresh()
             self.step(+1)
 
@@ -175,6 +178,7 @@ class ReviewPanel(QWidget):
         if self.review is None:
             return
         m = self.review.add(kind, self.player.t)
+        self.changed.emit()
         self.say(f"{'Missed pass' if kind == 'pass' else 'Skipped gate'} added at {m.t:.2f} s as G{m.gate_id} — "
                  "type a gate number to change it, Enter to confirm.")
         self._refresh()
@@ -182,6 +186,7 @@ class ReviewPanel(QWidget):
     def tag(self):
         if self.review and self.review.sel is not None:
             self.review.cycle_tag()
+            self.changed.emit()
             self.say(f"Tag: {TAG_LABELS[self.review.sel.tag] or 'none'}")
             self._refresh()
 
@@ -189,6 +194,7 @@ class ReviewPanel(QWidget):
         if self.review and self.review.sel is not None:
             m = self.review.sel
             self.review.undo()
+            self.changed.emit()
             if self.review.sel is m:
                 self.player.seek(m.t)
             self._refresh()
@@ -207,6 +213,7 @@ class ReviewPanel(QWidget):
             return self.say(f"No gate G{buf} — this track has G1…G{r.n_gates}.")
         self._digits = buf
         r.set_gate(int(buf))
+        self.changed.emit()
         self._refresh()
 
     def _frame(self, k: int):

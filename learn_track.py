@@ -168,7 +168,7 @@ def load_learn_videos(tp: TrackPaths, det_model: Optional[str] = None) -> Tuple[
             print(f"  {f.name}: no passes found (skipped)")
             continue
         race = json.loads(rd.read_text(encoding="utf-8"))
-        passes = learn_passes(race.get("candidate_passes") or race.get("passes", []))
+        passes = learn_passes(race.get("candidate_passes") or race.get("system_passes") or race.get("passes", []))
         raw[f.stem] = passes
         lf = lap_file(f)
         g1 = []

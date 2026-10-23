@@ -33,31 +33,56 @@ def is_learned(tp: TrackPaths) -> bool:
 
 def label_run(tp: TrackPaths, stem: str) -> dict:
     """Write gate IDs and laps into runs/<stem>.race_data.json (the per-frame
-    overlays too, for Review) and return a short summary."""
+    overlays too) and return a short summary. The decoder's result is the
+    system's (system_passes / system_laps); a review of the run, if there is
+    one, is put on top (race_day/review.apply)."""
+    from race_day import review
     path = tp.race_data(stem)
     race = json.loads(path.read_text(encoding="utf-8"))
-    source = race.get("candidate_passes") or race.get("passes", [])
+    source = race.get("candidate_passes") or race.get("system_passes") or race.get("passes", [])
     race["candidate_passes"] = source                    # the analysis output, kept for relabelling
     passes, laps, info = gd.label_race(source, tp.gate_memory, tp)
+    race.update(passes=passes, laps=laps, system_passes=passes, system_laps=laps,
+                gate_memory=str(tp.gate_memory), **info)
+    review.apply(tp, stem, race)
+    _overlays(race)
+    _write_json(path, race)
+    return {"passes": sum(p["gate_id"] >= 1 for p in race["passes"]), "laps": len(race["laps"])}
+
+
+def apply_review(tp: TrackPaths, stem: str) -> Optional[dict]:
+    """The run's review changed: its passes and laps become the reviewed ones
+    (None: no analysis of this run)."""
+    from race_day import review
+    path = tp.race_data(stem)
+    if not path.exists():
+        return None
+    race = json.loads(path.read_text(encoding="utf-8"))
+    if review.apply(tp, stem, race):
+        _overlays(race)
+        _write_json(path, race)
+    return {"passes": len(race.get("passes", [])), "laps": len(race.get("laps", [])), "review": race.get("review")}
+
+
+def _overlays(race: dict):
+    """Each frame's passes and laps (shown on the video), from race["passes"] / ["laps"]."""
     frames = race.get("frames", [])
     ts = [e["t"] for e in frames]
     for e in frames:
         e.pop("passes", None)
         e.pop("laps", None)
+    if not frames:
+        return
 
     def at(t):
         i = min(max(bisect.bisect_left(ts, t), 0), len(ts) - 1)
         if i > 0 and abs(ts[i - 1] - t) < abs(ts[i] - t):
             i -= 1
         return frames[i]
-    if frames:
-        for p in passes:
-            at(p["t"]).setdefault("passes", []).append(p)
-        for lp in laps:
-            at(lp["t1"]).setdefault("laps", []).append({"lap": lp["lap"], "t": lp["t1"]})
-    race.update(passes=passes, laps=laps, gate_memory=str(tp.gate_memory), **info)
-    _write_json(path, race)
-    return {"passes": sum(p["gate_id"] >= 1 for p in passes), "laps": len(laps)}
+    for p in race.get("passes", []):
+        at(p["t"]).setdefault("passes", []).append(p)
+    for lp in race.get("laps", []):
+        at(lp["t1"]).setdefault("laps", []).append({"lap": lp["lap"], "t": lp["t1"]})
 
 
 def learn(tp: TrackPaths, stems: List[str], n_gates: int, verbose: bool = False,
@@ -69,7 +94,7 @@ def learn(tp: TrackPaths, stems: List[str], n_gates: int, verbose: bool = False,
     videos, raw = [], {}
     for s in stems:
         race = json.loads(tp.race_data(s).read_text(encoding="utf-8"))
-        passes = lt.learn_passes(race.get("candidate_passes") or race.get("passes", []))
+        passes = lt.learn_passes(race.get("candidate_passes") or race.get("system_passes") or race.get("passes", []))
         raw[s] = passes
         g1 = []
         if g1_times and g1_times.get(s):

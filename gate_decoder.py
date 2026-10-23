@@ -87,7 +87,7 @@ def match_labels(obs: List[Obs], real: List[dict], tol: float = 0.5):
             obs[i].label = int(real[j]["gate_id"])
 
 
-def load_videos(tp: TrackPaths, source: str = "passes") -> List[VideoSeq]:
+def load_videos(tp: TrackPaths, source: str = "system_passes") -> List[VideoSeq]:
     vids = []
     mem_stems = {f.stem for f in tp.memory_videos.glob("*")} if tp.memory_videos.exists() else set()
     for g in sorted(tp.gt_dir.glob("*.gt.json")):
@@ -96,7 +96,7 @@ def load_videos(tp: TrackPaths, source: str = "passes") -> List[VideoSeq]:
             continue
         gt = json.loads(g.read_text(encoding="utf-8"))
         race = json.loads(tp.race_data(stem).read_text(encoding="utf-8"))
-        passes = race.get(source) or race.get("passes", [])
+        passes = race.get(source) or race.get("system_passes") or race.get("passes", [])
         obs = [Obs(p["t"], _norm(p.get("query_embedding")), str(p.get("gate_type", "")), p.get("p_pass"))
                for p in sorted(passes, key=lambda p: p["t"])]
         real = sorted([m for m in gt.get("marks", []) if m["kind"] == "pass" and m.get("tag") != "unsure"

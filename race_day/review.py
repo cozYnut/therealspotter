@@ -7,6 +7,11 @@ read (the same format learn_ui's REVIEW mode wrote).
 A review starts from the run's analysis (race_data passes, each a pending
 mark with the system's gate ID) or from an earlier review of it.
 
+apply(tp, stem, race) puts a review into the run's race_data: its passes and
+laps become the reviewed ones (what the app, the lap check and the dashboard
+show), the system's own stay in system_passes / system_laps (what score.py
+and the pass scorer measure).
+
     r = Review(tp, stem, video, crop)      # loads the gt.json, or prefills from race_data
     r.select(r.next_pending()); r.set_gate(3); r.accept(playhead)
     r.reject(); r.add("pass", t); r.cycle_tag(); r.undo()
@@ -78,7 +83,7 @@ class Review:
         """Every pass the system found becomes a pending mark (marks added by hand are kept)."""
         marks = [m for m in self.marks if m.origin == "added"]
         prev = 0
-        for i, p in enumerate(self.race.get("passes", [])):
+        for i, p in enumerate(self.race.get("system_passes") or self.race.get("passes", [])):
             pred = {"idx": i, "t": round(float(p.get("t", 0.0)), 4), "gate_id": int(p.get("gate_id", -1)),
                     "gate_type": p.get("gate_type"), "source": p.get("source"), "sim": p.get("sim"),
                     "reason": p.get("reason"), "track_id": p.get("track_id"),
@@ -297,3 +302,56 @@ class Review:
         tmp = self.gt_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(out, indent=2), encoding="utf-8")
         os.replace(tmp, self.gt_path)
+
+
+# ──────────────────────────────────────────────────────────────
+# The review's result in the run's race_data
+# ──────────────────────────────────────────────────────────────
+
+def reviewed_passes(gt: dict) -> List[dict]:
+    """The run's passes as reviewed: accepted / fixed / added marks as the
+    reviewer left them; false passes left out; passes not checked yet as the
+    system had them. Gates the pilot skipped aren't passes."""
+    out = []
+    for m in gt.get("marks", []):
+        if m.get("kind") != "pass":
+            continue
+        pred = m.get("pred") or {}
+        if m.get("verdict") == "pending" and pred:            # not checked yet: the system's pass
+            t, gid, gtype = pred.get("t", m["t"]), pred.get("gate_id", -1), pred.get("gate_type")
+        else:
+            t, gid, gtype = m["t"], m.get("gate_id", -1), m.get("gate_type") or pred.get("gate_type")
+        if gid is None or gid < 1:
+            continue
+        out.append({"t": round(float(t), 4), "gate_id": int(gid), "gate_type": gtype, "source": "REVIEW",
+                    "verdict": m.get("verdict"), "tag": m.get("tag"), "track_id": pred.get("track_id"),
+                    "query_img": pred.get("query_img")})
+    return sorted(out, key=lambda p: p["t"])
+
+
+def apply(tp: TrackPaths, stem: str, race: dict) -> bool:
+    """Put the run's review (if any) into race (in memory). The system's
+    passes and laps are kept in system_passes / system_laps the first time.
+    Without a review, a run reviewed before goes back to the system's.
+    Returns True when race was changed."""
+    import gate_decoder as gd
+    if "system_passes" not in race:
+        race["system_passes"], race["system_laps"] = race.get("passes", []), race.get("laps", [])
+    gp = tp.gt(stem)
+    if not gp.exists():
+        if "review" not in race:
+            return False
+        race["passes"], race["laps"] = race["system_passes"], race["system_laps"]
+        race.pop("review", None)
+        return True
+    gt = json.loads(gp.read_text(encoding="utf-8"))
+    n = int(gt.get("n_gates") or 0)
+    if not n and tp.gate_memory.exists():
+        n = len(json.loads(tp.gate_memory.read_text(encoding="utf-8")).get("memory", []))
+    passes = reviewed_passes(gt)
+    race["passes"], race["laps"] = passes, gd.build_laps(passes, max(1, n))
+    race["review"] = {"status": gt.get("status", "in_progress"), "updated": gt.get("updated"),
+                      "checked": sum(1 for m in gt.get("marks", []) if m.get("verdict") != "pending")
+                      + len(gt.get("false_passes", [])),
+                      "marks": len(gt.get("marks", [])) + len(gt.get("false_passes", []))}
+    return True

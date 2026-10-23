@@ -108,9 +108,10 @@ def score_video(tp: TrackPaths, gt_path: Path, args, passes: Optional[List[dict]
     if not race_path.exists():
         return {"video": stem, "skipped": "no race_data"}
     race = json.loads(race_path.read_text(encoding="utf-8"))
-    sys_laps = race.get("laps", []) if passes is None else []
+    # the system's own result (a reviewed run's "passes" are the review's)
+    sys_laps = race.get("system_laps", race.get("laps", [])) if passes is None else []
     if passes is None:
-        passes = race.get("passes", [])
+        passes = race.get("system_passes", race.get("passes", []))
     if args.rematch:
         passes, sys_laps = rematch(passes, tp.gate_memory, args)
     top1 = clip_top1(passes, tp.gate_memory) if args.rematch else {}

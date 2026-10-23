@@ -352,6 +352,13 @@ class EventPage(QWidget):
         from race_day.review_ui import ReviewPanel
         self.review_panel = ReviewPanel(self, self.player)
         self.review_panel.finished.connect(self._review_end)
+        # a review updates the run's results (tabs, lap check, dashboard) 2 s after the last change
+        self._review_heat: Optional[str] = None
+        self._review_timer = QTimer(self)
+        self._review_timer.setSingleShot(True)
+        self._review_timer.setInterval(2000)
+        self._review_timer.timeout.connect(self._review_apply)
+        self.review_panel.changed.connect(self._review_timer.start)
         self.review_panel.hide()
         vsplit.addWidget(self.review_panel)
         vsplit.setSizes([520, 300, 300])
@@ -463,7 +470,8 @@ class EventPage(QWidget):
                 self.heats.addItem(it)
         for i, r in enumerate(rows):
             it = self.heats.item(i)
-            laps = ", ".join(_who(c, r["pilots"][c]) + (f" ({r['timing_laps'][c]})" if r["timing_laps"].get(c) is not None
+            laps = ", ".join(_who(c, r["pilots"][c]) + (" ✔" if c in r.get("reviewed", []) else "")
+                             + (f" ({r['timing_laps'][c]})" if r["timing_laps"].get(c) is not None
                                                           else "") + (" 📵" if c in r.get("no_video", []) else "")
                              for c in sorted(r["pilots"]))
             flag = f"  ⚠ {r['open']}" if r["open"] else ""
@@ -499,7 +507,8 @@ class EventPage(QWidget):
             return
         self.detail = d
         sig = (d["status"], len(d["marks"]), len(d["written"]), str(d["decisions"]), str(d["learn_pilots"]),
-               sum(len(p["findings"]) for p in d["pilots"].values()), sum(len(p["timing"]) for p in d["pilots"].values()))
+               sum(len(p["findings"]) for p in d["pilots"].values()), sum(len(p["timing"]) for p in d["pilots"].values()),
+               tuple((len(p["passes"]), len(p["laps"]), str(p.get("review"))) for p in d["pilots"].values()))
         if load_video:
             quads = {}
             for ch, p in d["pilots"].items():
@@ -544,6 +553,9 @@ class EventPage(QWidget):
             head = QTreeWidgetItem([ch, "", f"{_who(ch, p['pilot'])}  —  {'timing' if self.day.event.has_timing else 'video'} "
                                     f"{n_t} laps" + (f" · video {n_v} laps" if self.day.event.has_timing else "")
                                     + (f" · ⚠ {open_n} to check" if open_n else "")
+                                    + ((" · reviewed ✔" if p["review"].get("status") == "complete"
+                                        else f" · review {p['review'].get('checked', 0)}/{p['review'].get('marks', 0)}")
+                                       if p.get("review") else "")
                                     + (" · 📵 no video — no picture recorded for this pilot" if p.get("no_video") else "")
                                     + (f" · {p['no_video_findings']} not checked (no picture then)"
                                        if p.get("no_video_findings") else "")
@@ -706,12 +718,21 @@ class EventPage(QWidget):
                 self.player.which.setCurrentIndex(idx)
         self.tree.hide()
         self.review_panel.show()
+        self._review_heat = self.heat_id
         self.review_panel.start(r, ch, p["pilot"], None if full else rect)
         self.review_panel.setFocus()
+
+    def _review_apply(self):
+        self._review_timer.stop()
+        if self.day and self._review_heat:
+            self.day.review_changed(self._review_heat)
+            self._detail_sig = None
 
     def _review_end(self):
         if getattr(self, "review_panel", None) is None or self.review_panel.review is None:
             return
+        if self._review_timer.isActive():            # changes not applied yet
+            self._review_apply()
         self.review_panel.stop()
         self.review_panel.hide()
         self.tree.show()

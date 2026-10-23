@@ -128,8 +128,12 @@ and the learned picture of that gate. Go through them:
 | `Backspace` | undo |
 
 Every change is saved (`lazySpotter/gt/<run>.gt.json`); **Done reviewing** goes
-back. Reviews make gate numbers better on that track and are what the system is
-measured and retrained on. A clipped gate counts as a pass if the drone went
+back. A reviewed run then shows **the reviewed passes and laps everywhere** — the
+heat view (✔ in the heat list), the FPVTrackside lap check (so corrections can be
+written back) and the browser (a "reviewed" badge) — updated 2 s after the last
+change. Passes not checked yet stay as the system had them; the system's own
+result is kept (`system_passes`) and is what `score.py` measures. Reviews also
+make gate numbers better on that track and are what the system is retrained on. A clipped gate counts as a pass if the drone went
 through it; a crash in the gate only if the drone flies on.
 
 ### The browser dashboard
@@ -148,7 +152,7 @@ Read-only: nothing can be changed from the browser.
 ```
 <data folder>/
   <track>/                       a track (Live capture, Replays)
-    videos/                      its heat videos (recordings go here)
+    videos/                      its heat videos (video recordings go here)
     lazySpotter/                 everything the app keeps:
       race_day.json                setup and heat states
       videos.json                  what each video is (single / 2×2, channels, pilots)
@@ -180,8 +184,7 @@ Learning data is only ever taken from `lazySpotter/`.
    learned from a few runs, given only the number of gates.
 
 On 52 reviewed runs of three tracks: 96.2% of passes found on time, 55 false
-passes, gate number right 98.7% (against 93.2%, 162 and 97.1% before the
-two-stage pass detection).
+passes, gate number right 98.7%.
 
 ## Project structure
 
@@ -202,15 +205,3 @@ therealspotter/
 ├── dataset_paths.py         # where the data is
 └── cyn_current-20261021_best.pt   # the gate detector
 ```
-
-**Tools without the app**
-
-- `python score.py` — score the system against every reviewed run.
-- `python pass_scorer.py --save` — retrain the pass scorer on the reviewed runs.
-- `python learn_track.py <track> --gates N` — learn a track from the command line.
-- Labelling gates and training detectors: the **FPV_YOLO_tool** repo
-  (`gate_annotator.py` and the dataset tools). Older detectors are in
-  `<data folder>/training/models/`.
-
-More detail and history: `docs/RACE_DAY_PLAN.md` (the app) and `docs/PLAN.md`
-(the pass detection and gate numbering work).

@@ -177,6 +177,12 @@ class EventDay:
             (self.pool.pause if on else self.pool.resume)()
         self.paused = bool(on)
 
+    def review_changed(self, heat_id: str):
+        """A pilot of this heat was reviewed: its passes and laps become the
+        reviewed ones, and the heat is checked again (stats for the dashboard,
+        the lap check) — on the loop thread."""
+        self.cmds.put(("review", heat_id))
+
     def configure_video(self, name: str, info: dict):
         """Replays: what a loose video is (single / 2×2, heat, pilots)."""
         self.event.set_info(name, info)
@@ -225,6 +231,7 @@ class EventDay:
                             "learn": "all" if sel and sel >= set(h.pilots) else ("some" if sel else "none"),
                             "learn_pilots": sorted(sel),
                             "timing_laps": {c: max(0, len(v) - 1) for c, v in timing.items()},
+                            "reviewed": [c for c in h.pilots if self.tp.gt(h.stem(c)).exists()],
                             "no_video": [c for c, v in hs.get("check", {}).items() if v.get("no_video")],
                             "open": self._open_findings(h.id), "written": bool(hs.get("written"))})
         return out
@@ -253,6 +260,7 @@ class EventDay:
                 "laps": [{"lap": l.get("lap"), "t0": l["t0"], "t1": l["t1"]} for l in (race or {}).get("laps", [])],
                 "stem": h.stem(ch), "race_data": str(self.tp.race_data(h.stem(ch))),
                 "gt": str(self.tp.gt(h.stem(ch))), "reviewed": self.tp.gt(h.stem(ch)).exists(),
+                "review": (race or {}).get("review"),
                 "findings": check.get("findings", []), "run": hs.get("runs", {}).get(ch, {}),
                 "checked": bool(check), "no_video": bool(check.get("no_video")),
                 "no_video_findings": check.get("no_video_findings", 0),
@@ -303,7 +311,15 @@ class EventDay:
                    if f"{ch}|{lapcheck_key(f)}" not in dec)
 
     def _n_gates(self) -> int:
-        return int(self.state["n_gates"] or DEFAULT_GATES)
+        """The track's gate count: as set (setup / learning), else the learned
+        gates' (a track learned before it was opened here), else a default."""
+        if self.state["n_gates"]:
+            return int(self.state["n_gates"])
+        try:
+            n = len(json.loads(self.tp.gate_memory.read_text(encoding="utf-8")).get("memory", []))
+        except (OSError, ValueError):
+            n = 0
+        return n or DEFAULT_GATES
 
     # ── the loop ───────────────────────────────────────────────
 
@@ -375,6 +391,13 @@ class EventDay:
                 self._write(cmd[1], cmd[2])
             elif kind == "restore":
                 self._restore(cmd[1])
+            elif kind == "review":
+                h = self.event.heats.get(cmd[1])
+                if h:
+                    for c in h.pilots:
+                        if self.tp.race_data(h.stem(c)).exists():
+                            labeling.apply_review(self.tp, h.stem(c))
+                    self._check(cmd[1])
             self._save()
 
     # analysis ------------------------------------------------------
@@ -583,7 +606,7 @@ class EventDay:
         meta = {"live_start_s": live0}
         st = rstats.run_stats(race, meta, self._n_gates())
         st.update(stem=stem, pilot=h.pilots.get(q.channel, "?"), heat=h.number, channel=q.channel,
-                  stage=h.stage, round=h.round, race=h.race)
+                  stage=h.stage, round=h.round, race=h.race, reviewed=(race.get("review") or {}).get("status"))
         labeling._write_json(self.tp.runs_dir / f"{stem}.stats.json", st)
         with self.lock:
             self.state["runs"][stem] = {
@@ -591,8 +614,8 @@ class EventDay:
                 "quad": [x.channel for x in h.quads].index(q.channel), "pilot": h.pilots.get(q.channel, "?"),
                 "recorded_at": h.start, "live_start_s": live0, "window": None, "void": False,
                 "stage": h.stage, "round": h.round, "race": h.race, "video_path": str(q.video),
-                "crop": list(q.rect), "summary": {"laps": st["laps"], "best_lap": st["best_lap"],
-                                                   "passes": st["passes"]}}
+                "crop": list(q.rect), "reviewed": (race.get("review") or {}).get("status"),
+                "summary": {"laps": st["laps"], "best_lap": st["best_lap"], "passes": st["passes"]}}
 
     def _auto_write(self, hid: str):
         if not self.state["auto"]:
