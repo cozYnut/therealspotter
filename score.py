@@ -282,7 +282,7 @@ def main():
     ap.add_argument("--require-same-type", action="store_true")
     ap.add_argument("--include-incomplete", action="store_true", help="Also score gt files still in progress")
     ap.add_argument("--passes", choices=["runs", "live", "scorer"], default="runs",
-                    help="runs: the passes saved in race_data (what race_ui / Review show); "
+                    help="runs: the passes saved in race_data (what Review shows); "
                          "live: the live PassDetector's passes kept in race_data; "
                          "scorer: pass_scorer.py decisions, each video by a model trained on the other videos")
     ap.add_argument("--scorer-logic", default=None, help="pass_scorer logic (default: its BEST_LOGIC)")
@@ -342,7 +342,7 @@ def main():
         if results[kind]:
             print_total(label, total(results[kind]), args)
     if not results["real"] and not results["sim"]:
-        print("\nNothing scored — review some test videos first (learn_ui → 🔍 Review Video).")
+        print("\nNothing scored — review some runs first (lazy_spotter_v2 → a pilot → Review).")
 
     if args.save:
         out_dir = data_root() / "scores"

@@ -33,7 +33,7 @@ def is_learned(tp: TrackPaths) -> bool:
 
 def label_run(tp: TrackPaths, stem: str) -> dict:
     """Write gate IDs and laps into runs/<stem>.race_data.json (the per-frame
-    overlays too, for race_ui) and return a short summary."""
+    overlays too, for Review) and return a short summary."""
     path = tp.race_data(stem)
     race = json.loads(path.read_text(encoding="utf-8"))
     source = race.get("candidate_passes") or race.get("passes", [])

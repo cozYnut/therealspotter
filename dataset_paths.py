@@ -14,15 +14,14 @@ data sorts together:
         learn_videos/                unreviewed videos the track is learned from (learn_track.py)
         videos/                      race_day: runs recorded live or cut from 2×2 replays
         race_day.json                race_day: setup + state of the race day
-        candidates/<video>.candidates.json   learn_ui candidate extraction
         candidates/<video>.crops/            candidate / Force Clip crops (memory images)
         runs/<video>.race_data.json          extract_race.py output
         runs/<video>.race_query/             its query crops
         runs/<video>.motion.json             per-frame camera motion (extract_motion.py)
         runs/<video>.learn_passes.json       passes of a learn video (learn_track.py, never shown in UIs)
-        gt/<video>.gt.json                   reviewed marks (learn_ui REVIEW mode)
+        gt/<video>.gt.json                   reviewed marks (Review in lazy_spotter_v2)
         velocidrone/                 same layout, for the sim version of the track
-      training/                      shared YOLO data (gate_annotator)
+      training/                      shared YOLO data (FPV_YOLO_tool's gate_annotator)
         gate_annotations/  gate_models/  runs/
 
 Data root: $FPV_DATA_ROOT, else "data_root" in local_config.json next to this
@@ -153,7 +152,7 @@ class TrackPaths:
 
     def learn_passes(self, stem: str) -> Path:
         # learn_track.py: passes of a learn video, found with no track knowledge.
-        # Kept apart from race_data.json so Review / race_ui never load them.
+        # Kept apart from race_data.json so Review never loads them.
         return self.runs_dir / f"{stem}.learn_passes.json"
 
     def motion(self, stem: str) -> Path:

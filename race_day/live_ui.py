@@ -1,5 +1,5 @@
 """
-The live-capture screen of race_day_app: a track's heats, recorded from the
+The live-capture screen of lazy_spotter_v2: a track's heats, recorded from the
 capture card when the operator presses Record.
 
     ┌ top bar: track · Learn / Relearn track · status · dashboard ─────────────┐
@@ -175,7 +175,7 @@ class LivePage(EventPage):
         name = f"heat_{n:03d}"
         chans = self.setup.get("channels") or ["R1"]
         info = {"kind": "2x2" if len(chans) == 4 else "single", "heat": n, "channels": chans,
-                "pilots": {c: c for c in chans}, "recorded_by": "race_day_app"}
+                "pilots": {c: c for c in chans}, "recorded_by": "lazy_spotter_v2"}
         self.day.configure_video(f"{name}.mp4", info)       # described before the file appears
         self.day.set_recording(True)
         self._was_recording = True

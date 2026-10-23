@@ -1,10 +1,10 @@
 """
 Shared pipeline configuration.
 
-Reads debug_ui_defaults.json so that extract_candidates.py, extract_race.py,
-and lazy_spotter.py all run with identical PassDetector / TimeTracker parameters.
+Reads debug_ui_defaults.json: the PassDetector / TimeTracker parameters
+extract_race.py runs with.
 
-Press P in the debug UI (lazy_spotter.py) to save the current values.
+(The old debug UI that edited them is gone; edit the file by hand.)
 """
 
 import json

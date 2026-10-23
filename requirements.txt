@@ -11,15 +11,10 @@ Pillow
 torch
 torchvision
 
-# CLIP embeddings (used by learn_ui / race_ui)
+# CLIP embeddings (gate pictures: tracking.ClipEmbedder)
 open-clip-torch
 
-# Gate annotation tool (gate_annotator.py)
-PySide6
-PyYAML
-
-# Learning UI — legacy (learn_ui.py still imports PyQt6)
+# The desktop app (lazy_spotter_v2.py)
 PyQt6
 
-# Race day (race_day_app.py): QR code for the dashboard
-segno
+# The dataset / YOLO tools (gate_annotator …) moved to the FPV_YOLO_tool repo

@@ -595,7 +595,7 @@ LIVE_SUBDIR = SUBDIR            # a track's data, next to its videos/ folder
 
 
 class TrackVideos(VideoFolder):
-    """A track's videos — recorded by race_day_app's live capture, or opened
+    """A track's videos — recorded by lazy_spotter_v2's live capture, or opened
     in Replays: <track>/videos/ (a folder without one: its own videos), with
     all of the app's data in <track>/lazySpotter/ (videos.json — what each
     video is —, runs/, the learned gates and timing, race_day.json). Learning

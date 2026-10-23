@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Learn a track from unreviewed videos — no teaching in learn_ui.
+Learn a track from unreviewed videos — no teaching by hand.
 
 Given only the number of gates and that the first gate passed in every video
 is G1 (start/finish), this learns everything gate_decoder.py needs to label
@@ -27,7 +27,7 @@ exists (its gate labels are ignored; its candidate passes if it has them).
 Otherwise — or when that analysis was made with another detector than
 --det-model — learn_track runs the pass analysis itself with a blank memory
 and saves runs/<video>.learn_passes.json — never race_data.json, so Review
-and race_ui don't load a run without gates.
+and the app don't load a run without gates.
 
 With the pass scorer's two stages the passes include likely-false ones:
 only those with p_pass ≥ LEARN_MIN_P are learned from (a false candidate
