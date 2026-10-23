@@ -9,7 +9,7 @@ FPVTrackside keeps one folder per heat inside the event folder:
                       3.mp4 + .xml        a second grid (DJI feeds) when the heat had DJI pilots
                       Race.json           pilots, channels, timing detections and laps
 
-race_day's own data lives in <event>/race_day/ — nothing else in the event
+race_day's own data lives in <event>/lazySpotter/ — nothing else in the event
 folder is ever written, except lap data in a heat's Race.json (write_laps).
 
 Being gentle with FPVTrackside (it may run on the same computer):
@@ -24,6 +24,7 @@ Being gentle with FPVTrackside (it may run on the same computer):
 
 import json
 import os
+import shutil
 import re
 import time
 from dataclasses import dataclass, field
@@ -33,7 +34,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-SUBDIR = "race_day"
+SUBDIR = "lazySpotter"     # all of the app's data, in the event / track folder
+OLD_SUBDIR = "race_day"    # where it was before 2026-10-22 (only the Race.json backups are carried over)
 STABLE_S = 10.0          # a file must be unchanged this long before it's opened
 NEVER = "0001/01/01"     # FPVTrackside's "no time" (a heat that wasn't flown)
 
@@ -125,12 +127,25 @@ class _Folder:
     files: Dict[str, tuple] = field(default_factory=dict)
 
 
+def _carry_backups(old: Path, new: Path):
+    """The original Race.json of every heat the app changed, from the old data
+    folder: Restore keeps working, and a later change doesn't back up an
+    already-changed Race.json as the original. Nothing else is carried over."""
+    if not old.is_dir():
+        return
+    new.mkdir(parents=True, exist_ok=True)
+    for f in old.iterdir():
+        if f.is_file() and not (new / f.name).exists():
+            shutil.copy2(f, new / f.name)
+
+
 class Event:
     def __init__(self, folder):
         self.dir = Path(folder)
         if not (self.dir / "Event.json").exists():
             raise FileNotFoundError(f"not an FPVTrackside event folder (no Event.json): {self.dir}")
         self.data_dir = self.dir / SUBDIR
+        _carry_backups(self.dir / OLD_SUBDIR / "backups", self.data_dir / "backups")
         self.name = ""
         self.heats: Dict[str, Heat] = {}
         self.running: Optional[str] = None       # heat id of a race being recorded now
@@ -217,7 +232,7 @@ class Event:
             names = [self.running]
         else:
             try:
-                names = [e.name for e in os.scandir(self.dir) if e.is_dir() and e.name != SUBDIR]
+                names = [e.name for e in os.scandir(self.dir) if e.is_dir() and e.name not in (SUBDIR, OLD_SUBDIR)]
             except OSError:
                 return {"running": self.running, "new": [], "changed": []}
         running = None
@@ -525,7 +540,7 @@ class VideoFolder:
         self.unconfigured = []
         for e in sorted(files, key=lambda e: e.name):
             st = e.stat()
-            if now - st.st_mtime < STABLE_S:           # still being copied in
+            if now - st.st_mtime < STABLE_S and not self._complete(e.name, info):   # still being copied in
                 continue
             seen.add(e.name)
             if e.name not in info:
@@ -541,6 +556,10 @@ class VideoFolder:
         for h in self.heats.values():
             h.number = int(info.get(h.id, {}).get("heat") or 0)
         return {"running": None, "new": new, "changed": []}
+
+    def _complete(self, name: str, info: Dict[str, dict]) -> bool:
+        """A file known to be complete (no need to wait for it to settle)."""
+        return False
 
     @staticmethod
     def _heat(name: str, path: Path, info: dict, mtime: float) -> Heat:
@@ -570,6 +589,58 @@ class VideoFolder:
 
     def frame_times(self, video):
         raise NotImplementedError
+
+
+LIVE_SUBDIR = SUBDIR            # a track's data, next to its videos/ folder
+
+
+class TrackVideos(VideoFolder):
+    """A track's videos — recorded by race_day_app's live capture, or opened
+    in Replays: <track>/videos/ (a folder without one: its own videos), with
+    all of the app's data in <track>/lazySpotter/ (videos.json — what each
+    video is —, runs/, the learned gates and timing, race_day.json). Learning
+    data is only ever taken from there: a track is learned once in the app.
+    Recordings are described as they're made; other videos are asked about
+    once. `running` is set while the app records, so race_day pauses."""
+
+    def __init__(self, track_dir):
+        track_dir = Path(track_dir)
+        vids = track_dir / "videos"
+        if not vids.is_dir() and any(p.suffix.lower() in VIDEO_EXT for p in track_dir.glob("*")):
+            vids = track_dir                     # a plain folder of videos
+        super().__init__(vids)
+        self.track_dir = track_dir
+        self.data_dir = track_dir / LIVE_SUBDIR
+        self.name = track_dir.name
+
+    def refresh(self) -> dict:
+        self.dir.mkdir(parents=True, exist_ok=True)
+        r = super().refresh()
+        r["running"] = self.running
+        return r
+
+    def _complete(self, name: str, info: Dict[str, dict]) -> bool:
+        return bool(info.get(name, {}).get("seconds"))     # the app's own recording, moved in when done
+
+    @staticmethod
+    def _heat(name: str, path: Path, info: dict, mtime: float) -> Heat:
+        h = VideoFolder._heat(name, path, info, mtime)
+        if info.get("seconds"):
+            s = float(info["seconds"])
+            h.stage = f"{path.stem}  {int(s // 60)}:{int(s % 60):02d}"
+        if info.get("recorded_at"):
+            h.start, h.end = float(info["recorded_at"]), float(info["recorded_at"]) + float(info.get("seconds") or 0)
+        return h
+
+    def next_heat(self) -> int:
+        """The number for the next recording: after every heat known so far."""
+        nums = [int(i.get("heat") or 0) for i in self.info().values()]
+        for f in self.dir.glob("heat_*.*"):
+            try:
+                nums.append(int(f.stem.split("_")[1]))
+            except (IndexError, ValueError):
+                pass
+        return max(nums, default=0) + 1
 
 
 Event.has_timing = True

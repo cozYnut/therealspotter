@@ -29,8 +29,11 @@ Otherwise — or when that analysis was made with another detector than
 and saves runs/<video>.learn_passes.json — never race_data.json, so Review
 and race_ui don't load a run without gates.
 
-With the pass scorer's two stages the passes include likely-false ones;
-decoding then uses each pass's p_pass (the settings saved with the scorer).
+With the pass scorer's two stages the passes include likely-false ones:
+only those with p_pass ≥ LEARN_MIN_P are learned from (a false candidate
+that repeats every lap — a gate detected twice — otherwise becomes a gate of
+its own, and every gate after it is numbered one off), and decoding uses each
+pass's p_pass (the settings saved with the scorer).
 
 Lap times: <video>.laps.txt next to a learn video (G1 times in seconds) pins
 the start/finish gate.
@@ -58,6 +61,14 @@ import gate_decoder as gd
 from dataset_paths import TrackPaths, list_tracks
 
 MAX_IMAGES = 24         # varied images kept per gate (6 was too few to cover other pilots and light)
+LEARN_MIN_P = 0.3       # learn from passes the scorer is fairly sure of (0.2–0.6 all learn the same
+                        # track1 / USGQ2025; 0.03 learned a phantom gate)
+
+
+def learn_passes(passes: List[dict]) -> List[dict]:
+    """The passes to learn from, in time order: low-p_pass candidates left out."""
+    return sorted((p for p in passes if p.get("p_pass") is None or p["p_pass"] >= LEARN_MIN_P),
+                  key=lambda p: p["t"])
 
 
 # ──────────────────────────────────────────────────────────────
@@ -79,14 +90,16 @@ def read_lap_times(path: Path) -> List[float]:
 def align_lap_times(g1: List[float], pass_times: List[float], tol: float = 0.35) -> Tuple[List[float], float]:
     """Lap timers count from the race start, not the video start: find the
     shift that puts the most G1 times on a detected pass (then refine it to the
-    median offset of those matches)."""
+    median offset of those matches). On a tie the smallest shift wins: the
+    gate before G1 is often ~1 s earlier, so a whole-lap shift onto it fits
+    as well (lap times from a review are already in video time)."""
     if not g1 or not pass_times:
         return g1, 0.0
     pt = np.array(pass_times)
     best = (-1, 0.0)
     for shift in np.unique(np.round(pt[:, None] - np.array(g1)[None, :], 2)):
         hits = sum(np.min(np.abs(pt - (a + shift))) <= tol for a in g1)
-        if hits > best[0]:
+        if hits > best[0] or (hits == best[0] and abs(shift) < abs(best[1])):
             best = (hits, float(shift))
     shift = best[1]
     offs = [pt[np.argmin(np.abs(pt - (a + shift)))] - a for a in g1
@@ -155,7 +168,7 @@ def load_learn_videos(tp: TrackPaths, det_model: Optional[str] = None) -> Tuple[
             print(f"  {f.name}: no passes found (skipped)")
             continue
         race = json.loads(rd.read_text(encoding="utf-8"))
-        passes = sorted(race.get("candidate_passes") or race.get("passes", []), key=lambda p: p["t"])
+        passes = learn_passes(race.get("candidate_passes") or race.get("passes", []))
         raw[f.stem] = passes
         lf = lap_file(f)
         g1 = []

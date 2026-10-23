@@ -69,7 +69,7 @@ def learn(tp: TrackPaths, stems: List[str], n_gates: int, verbose: bool = False,
     videos, raw = [], {}
     for s in stems:
         race = json.loads(tp.race_data(s).read_text(encoding="utf-8"))
-        passes = sorted(race.get("candidate_passes") or race.get("passes", []), key=lambda p: p["t"])
+        passes = lt.learn_passes(race.get("candidate_passes") or race.get("passes", []))
         raw[s] = passes
         g1 = []
         if g1_times and g1_times.get(s):

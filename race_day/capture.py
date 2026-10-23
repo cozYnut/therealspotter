@@ -1,53 +1,26 @@
 """
-Split a 2×2 feed into its 4 channels and cut each channel into runs.
+Capture for race day: the capture card (or a video file played as if live),
+recording heats on demand, and reading one pilot's quadrant of a heat video.
 
-The same code runs on the live HDMI capture and on 2×2 video files (Replays).
-
-Per channel, a small state machine:
-
-  idle  ── feed becomes live ──►  live  ── gray for end_gray_s ──►  saved / discarded
-            (pre-roll is kept)        ◄── live again (dropout) ──
-
-A feed is live while its image has texture, changes between frames and is
-not static noise (noise has no frame-to-frame correlation). A run ends after
-end_gray_s of gray — or, while other pilots of the heat are still flying,
-after heat_gray_s (a crash or blackout mid-heat doesn't cut the run). A run is kept
-only if it was live for at least min_run_s: its video (H.264 .mp4, playable
-in phone browsers) and its <run>.meta.json.  Runs that are live at the same
-time belong to one heat; files are named h<heat>_<channel>.
+  HeatRecorder   shows the feed; Record → <track>/videos/heat_NNN.mp4 (the
+                 whole feed: one pilot or a 2×2), until Stop or the time limit
+  QuadReader     one pilot's picture from a heat video, read in place
 """
 
-import json
 import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
-from collections import deque
-from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Iterator, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
-# Order of the 4 quadrants in `layout`: top-left, top-right, bottom-left, bottom-right
+# Order of the 4 quadrants of a 2×2 feed: top-left, top-right, bottom-left, bottom-right
 QUADS = ("TL", "TR", "BL", "BR")
-
-
-@dataclass
-class CaptureConfig:
-    layout: List[str] = field(default_factory=lambda: ["R1", "R3", "R6", "R8"])
-    min_run_s: float = 40.0        # shorter runs are discarded
-    end_gray_s: float = 10.0       # gray this long ends a run (shorter = dropout)
-    heat_gray_s: float = 45.0      # …but while others in the heat still fly, wait this long
-                                   # (a crash or video blackout mid-heat, then the pilot goes on)
-    preroll_s: float = 2.0         # kept from before the feed was detected live
-    live_on_s: float = 0.5         # live this long (mostly) to start a run
-    # live detector (on a 96×54 grayscale thumbnail of the quadrant)
-    min_texture: float = 8.0       # pixel std: flat gray / black screens are below
-    min_corr: float = 0.25         # frame-to-frame correlation: static noise is ~0
-    min_change: float = 0.15       # mean abs difference: a frozen frame is ~0
 
 
 # ──────────────────────────────────────────────────────────────
@@ -229,43 +202,17 @@ class QuadReader:
 
 
 # ──────────────────────────────────────────────────────────────
-# Live detection
+# Recording heats
 # ──────────────────────────────────────────────────────────────
 
-class LiveDetector:
-    def __init__(self, cfg: CaptureConfig):
-        self.cfg = cfg
-        self.prev: Optional[np.ndarray] = None
-
-    def __call__(self, quad: np.ndarray) -> bool:
-        g = cv2.cvtColor(cv2.resize(quad, (96, 54), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
-        g = cv2.GaussianBlur(g, (3, 3), 0).astype(np.float32)
-        prev, self.prev = self.prev, g
-        if prev is None or g.std() < self.cfg.min_texture:
-            return False
-        a, b = g - g.mean(), prev - prev.mean()
-        corr = float((a * b).sum() / (np.sqrt((a * a).sum() * (b * b).sum()) + 1e-6))
-        change = float(np.abs(g - prev).mean())
-        return corr >= self.cfg.min_corr and change >= self.cfg.min_change
-
-
-# ──────────────────────────────────────────────────────────────
-# Per-channel recorder
-# ──────────────────────────────────────────────────────────────
-
-def _jpeg(img: np.ndarray) -> bytes:
-    return cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 92])[1].tobytes()
-
-
-def _unjpeg(b: bytes) -> np.ndarray:
-    return cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_COLOR)
-
-
-def finalize_mp4(tmp: Path, out: Path):
-    """Move the moov atom to the front so phone browsers can stream it."""
+def finalize_mp4(tmp: Path, out: Path, time_scale: float = 1.0):
+    """Move the moov atom to the front so phone browsers can stream it.
+    time_scale ≠ 1 stretches the timestamps (a card that delivered fewer
+    frames a second than it said: the video would play too fast)."""
     ff = shutil.which("ffmpeg")
     if ff:
-        r = subprocess.run([ff, "-y", "-loglevel", "error", "-i", str(tmp), "-c", "copy",
+        scale = ["-itsscale", f"{time_scale:.6f}"] if abs(time_scale - 1.0) > 0.01 else []
+        r = subprocess.run([ff, "-y", "-loglevel", "error", *scale, "-i", str(tmp), "-c", "copy",
                             "-movflags", "+faststart", str(out)], capture_output=True)
         if r.returncode == 0:
             tmp.unlink(missing_ok=True)
@@ -273,182 +220,110 @@ def finalize_mp4(tmp: Path, out: Path):
     tmp.replace(out)
 
 
-@dataclass
-class RunInfo:
-    stem: str
-    heat: int
-    channel: str
-    quad: str
-    video: str                 # path of the .mp4
-    wall_start: float          # first frame in the file (incl. pre-roll)
-    live_start_s: float        # seconds into the file when the feed went live
-    live_s: float              # seconds the feed was live (first to last live frame)
-    fps: float
-    source: str                # "live" or the replayed file
+class HeatRecorder:
+    """Reads the feed on its own thread: the latest frame for the screen, and
+    after record(name) every frame goes to <out_dir>/<name>.mp4 until
+    stop_recording() or max_s. on_saved(path, info) is called (on a helper
+    thread) once the file is complete."""
 
+    def __init__(self, source, out_dir: Path, tmp_dir: Path, max_s: float = 180.0,
+                 on_saved: Optional[Callable[[Path, dict], None]] = None):
+        self.source, self.out_dir, self.tmp_dir = source, Path(out_dir), Path(tmp_dir)
+        self.max_s, self.on_saved = max_s, on_saved
+        self.lock = threading.Lock()
+        self.frame: Optional[np.ndarray] = None
+        self.ended = False                       # the source stopped (file played out, card unplugged)
+        self.error: Optional[str] = None
+        self._want: Optional[str] = None         # start recording this at the next frame
+        self._stop_rec = False
+        self._rec: Optional[dict] = None         # the recording in progress
+        self._saving = 0                         # files being finished
+        self._thread = threading.Thread(target=self._run, daemon=True)
 
-class ChannelRecorder:
-    def __init__(self, quad: str, channel: str, cfg: CaptureConfig, fps: float):
-        self.quad, self.channel, self.cfg, self.fps = quad, channel, cfg, fps
-        self.detect = LiveDetector(cfg)
-        self.state = "idle"                          # idle | live | ending
-        self.recent: deque = deque(maxlen=max(1, int(cfg.live_on_s * fps)))
-        self.preroll: deque = deque(maxlen=max(1, int(cfg.preroll_s * fps)))
-        self.held: List[Tuple[float, bytes]] = []    # gray frames during a possible dropout
-        self.writer = None
-        self.tmp: Optional[Path] = None
-        self.info: Optional[RunInfo] = None
-        self.n_written = 0
-        self.last_live = 0.0
-        self.gray_since = 0.0
+    def start(self) -> "HeatRecorder":
+        self._thread.start()
+        return self
 
-    @property
-    def live_now(self) -> bool:
-        return self.state in ("live", "ending")
+    def latest(self) -> Optional[np.ndarray]:
+        with self.lock:
+            return self.frame
 
-    def status(self, t: float) -> dict:
-        if self.state == "idle":
-            return {"state": "waiting"}
-        return {"state": "live" if self.state == "live" else "dropout",
-                "seconds": round(self.last_live - self.info.wall_start - self.info.live_start_s, 1)}
+    def record(self, name: str):
+        with self.lock:
+            if self._rec is None and not self.ended:
+                self._want, self._stop_rec = name, False
 
-    def _write(self, img: np.ndarray):
-        self.writer.write(img)
-        self.n_written += 1
+    def stop_recording(self):
+        with self.lock:
+            self._stop_rec = True
 
-    def feed(self, wall: float, quad: np.ndarray, out_dir: Path, start_run: Callable[[], Tuple[int, str]],
-             source: str, others_live: bool = False) -> Optional[Tuple[RunInfo, bool]]:
-        """Returns (run, kept) when a run ends."""
-        live = self.detect(quad)
-        self.recent.append(live)
-        if self.state == "idle":
-            self.preroll.append((wall, _jpeg(quad)))
-            if len(self.recent) == self.recent.maxlen and sum(self.recent) >= 0.8 * len(self.recent):
-                heat, stem = start_run()
-                h, w = quad.shape[:2]
-                self.tmp = out_dir / f"{stem}.tmp.mp4"
-                self.writer = cv2.VideoWriter(str(self.tmp), cv2.VideoWriter_fourcc(*"avc1"), self.fps, (w, h))
-                self.n_written = 0
-                first = self.preroll[0][0]
-                for _, b in self.preroll:
-                    self._write(_unjpeg(b))
-                self.preroll.clear()
-                live_start = wall - first - self.cfg.live_on_s
-                self.info = RunInfo(stem, heat, self.channel, self.quad, str(out_dir / f"{stem}.mp4"), first,
-                                    max(0.0, live_start), 0.0, self.fps, source)
-                self.state, self.last_live = "live", wall
-            return None
-        # recording
-        if live:
-            if self.state == "ending":                # dropout over: keep the held frames
-                for _, b in self.held:
-                    self._write(_unjpeg(b))
-                self.held = []
-            self.state, self.last_live = "live", wall
-            self._write(quad)
-            return None
-        if self.state == "live":
-            self.state, self.gray_since = "ending", wall
-        self.held.append((wall, _jpeg(quad)))
-        gray = wall - self.gray_since
-        if gray < self.cfg.end_gray_s or (others_live and gray < self.cfg.heat_gray_s):
-            return None
-        return self.finish(out_dir)
+    def status(self) -> dict:
+        with self.lock:
+            r = self._rec
+            return {"recording": r is not None or self._want is not None,
+                    "name": r["name"] if r else self._want,
+                    "seconds": round(time.time() - r["wall0"], 1) if r else 0.0,
+                    "max_s": self.max_s, "saving": self._saving, "ended": self.ended, "error": self.error}
 
-    def finish(self, out_dir: Path) -> Optional[Tuple[RunInfo, bool]]:
-        """End the current run (gray long enough, or the source ended)."""
-        if self.state == "idle":
-            return None
-        self.writer.release()
-        info = self.info
-        info.live_s = round(self.last_live - info.wall_start - info.live_start_s, 2)
-        kept = info.live_s >= self.cfg.min_run_s
-        if kept:
-            finalize_mp4(self.tmp, Path(info.video))
-            meta = asdict(info)
-            meta.update(frames=self.n_written, video=Path(info.video).name)
-            (out_dir / f"{info.stem}.meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-        else:
-            self.tmp.unlink(missing_ok=True)
-        self.state, self.writer, self.tmp, self.held = "idle", None, None, []
-        self.recent.clear()
-        self.preroll.clear()
-        return info, kept
+    def close(self):
+        self.stop_recording()
+        self.source.stop()
+        self._thread.join(timeout=5)
 
+    def _run(self):
+        try:
+            for wall, _t, frame in self.source:
+                with self.lock:
+                    self.frame = frame
+                    want, stop = self._want, self._stop_rec
+                if want and self._rec is None:
+                    self._begin(want, wall, frame)
+                if self._rec is not None:
+                    self._rec["writer"].write(frame)
+                    self._rec["n"] += 1
+                    self._rec["last"] = wall
+                    if stop or wall - self._rec["wall0"] >= self.max_s:
+                        self._end()
+        except Exception as e:                      # the card went away: keep what was recorded
+            self.error = f"{type(e).__name__}: {e}"
+        if self._rec is not None:
+            self._end()
+        with self.lock:
+            self.ended = True
 
-# ──────────────────────────────────────────────────────────────
-# Session: all 4 channels + heats
-# ──────────────────────────────────────────────────────────────
+    def _begin(self, name: str, wall: float, frame: np.ndarray):
+        self.tmp_dir.mkdir(parents=True, exist_ok=True)
+        tmp = self.tmp_dir / f"{name}.recording.mp4"
+        h, w = frame.shape[:2]
+        fps = float(getattr(self.source, "fps", 30.0) or 30.0)
+        writer = cv2.VideoWriter(str(tmp), cv2.VideoWriter_fourcc(*"avc1"), fps, (w, h))
+        with self.lock:
+            self._rec = {"name": name, "tmp": tmp, "writer": writer, "fps": fps, "wall0": wall, "last": wall, "n": 0}
+            self._want = None
 
-class CaptureSession:
-    """Feeds frames from a source into the 4 channel recorders.
+    def _end(self):
+        with self.lock:
+            rec, self._rec, self._stop_rec = self._rec, None, False
+            self._saving += 1
+        rec["writer"].release()
+        # the frames' real rate: n frames over the time they came in (plus one frame's time)
+        secs = (rec["last"] - rec["wall0"]) + 1.0 / rec["fps"]
+        real_fps = rec["n"] / secs if rec["n"] > 1 else rec["fps"]
+        out = self.out_dir / f"{rec['name']}.mp4"
+        info = {"recorded_at": round(rec["wall0"], 3), "seconds": round(secs, 2), "frames": rec["n"],
+                "fps": round(real_fps, 2)}
 
-    on_run(info, kept)      a run ended (kept = saved, ≥ min_run_s)
-    on_status(dict)         ~5×/s: per channel state, current heat
-    on_preview(frame)       ~10×/s: the full 2×2 frame for the UI
-    """
-
-    def __init__(self, out_dir: Path, cfg: CaptureConfig, next_heat: int = 1,
-                 on_run=None, on_status=None, on_preview=None, on_heat=None):
-        self.out_dir = Path(out_dir)
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        self.cfg = cfg
-        self.next_heat = next_heat
-        self.heat: Optional[int] = None
-        self.on_run, self.on_status, self.on_preview, self.on_heat = on_run, on_status, on_preview, on_heat
-        self.recorders: List[ChannelRecorder] = []
-        self.source = None
-        self.used = set()
-
-    def _start_run(self, rec: ChannelRecorder, wall: float):
-        if self.heat is None:                        # first channel to go live opens a heat
-            self.heat = self.next_heat
-            self.next_heat += 1
-            if self.on_heat:
-                self.on_heat(self.heat, wall)
-        stem = f"h{self.heat:03d}_{rec.channel}"
-        k = 0
-        while stem in self.used or (self.out_dir / f"{stem}.mp4").exists():   # never overwrite a run
-            k += 1
-            stem = f"h{self.heat:03d}_{rec.channel}{chr(ord('a') + k)}"
-        self.used.add(stem)
-        return self.heat, stem
-
-    def run(self, source, source_name: str = "live"):
-        self.source = source
-        self.recorders = [ChannelRecorder(q, ch, self.cfg, source.fps) for q, ch in zip(QUADS, self.cfg.layout)]
-        last_status = last_preview = 0.0
-        wall = 0.0
-        for wall, t, frame in source:
-            flying = [r.state == "live" for r in self.recorders]
-            for i, (rec, quad) in enumerate(zip(self.recorders, split_quads(frame))):
-                others = any(f for j, f in enumerate(flying) if j != i)
-                done = rec.feed(wall, quad, self.out_dir, lambda r=rec, w=wall: self._start_run(r, w), source_name, others)
-                if done:
-                    self._ended(*done)
-            if self.heat is not None and not any(r.live_now for r in self.recorders):
-                self.heat = None                     # everyone is back on the ground
-            if self.on_status and wall - last_status >= 0.2:
-                last_status = wall
-                self.on_status(self.status(wall))
-            if self.on_preview and wall - last_preview >= 0.1:
-                last_preview = wall
-                self.on_preview(frame)
-        for rec in self.recorders:                   # source ended mid-run
-            done = rec.finish(self.out_dir)
-            if done:
-                self._ended(*done)
-        if self.on_status:
-            self.on_status(self.status(wall))
-
-    def _ended(self, info: RunInfo, kept: bool):
-        if self.on_run:
-            self.on_run(info, kept)
-
-    def status(self, wall: float) -> dict:
-        return {"heat": self.heat,
-                "channels": {r.channel: {"quad": r.quad, **r.status(wall)} for r in self.recorders}}
-
-    def stop(self):
-        if self.source:
-            self.source.stop()
+        def finish():                               # off the capture thread: the feed keeps flowing
+            try:
+                self.out_dir.mkdir(parents=True, exist_ok=True)
+                done = rec["tmp"].with_name(f"{rec['name']}.mp4")
+                finalize_mp4(rec["tmp"], done, rec["fps"] / real_fps)
+                os.replace(done, out)                     # appears in out_dir only when complete
+                if self.on_saved:
+                    self.on_saved(out, info)
+            except Exception as e:
+                self.error = f"saving {out.name} failed: {e}"
+            finally:
+                with self.lock:
+                    self._saving -= 1
+        threading.Thread(target=finish, daemon=True).start()

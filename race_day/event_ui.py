@@ -34,6 +34,11 @@ def _mmss(t: Optional[float]) -> str:
     return f"{int(t // 60)}:{t % 60:05.2f}"
 
 
+def _who(channel: str, pilot: str) -> str:
+    """A pilot's label: the channel, and the name when there is one."""
+    return channel if pilot in (None, "", "?", channel) else f"{channel} {pilot}"
+
+
 def _clock(t: float) -> str:
     return time.strftime("%H:%M:%S", time.localtime(t)) + f".{int((t % 1) * 10)}"
 
@@ -223,7 +228,7 @@ class HeatPlayer(QWidget):
         for q in self.quads.get(self.path, []):
             x, y = int(q["rect"][0] * w1), int(q["rect"][1] * h1)
             laps = sum(1 for t in self.laps_at.get(q["channel"], []) if t <= self.t)
-            text = f"{q['channel']}  {q['pilot']}" + (f"   lap {laps - 1}" if laps > 1 else (" HS" if laps == 1 else ""))
+            text = _who(q["channel"], q["pilot"]).replace(" ", "  ", 1) + (f"   lap {laps - 1}" if laps > 1 else (" HS" if laps == 1 else ""))
             (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
             cv2.rectangle(img, (x + 4, y + 4), (x + 12 + tw, y + 12 + th), (0, 0, 0), -1)
             cv2.putText(img, text, (x + 8, y + 8 + th), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
@@ -274,14 +279,14 @@ class EventPage(QWidget):
         self.banner.setVisible(False)
         v.addWidget(self.banner)
 
-        split = QSplitter(Qt.Orientation.Horizontal)
+        split = self.split = QSplitter(Qt.Orientation.Horizontal)
         self.heats = QListWidget()
         self.heats.setMinimumWidth(180)
         self.heats.currentItemChanged.connect(self._select)
         self.heats.itemChanged.connect(self._checked)
         split.addWidget(self.heats)
 
-        right = QWidget()
+        right = self.right = QWidget()
         rv = QVBoxLayout(right)
         rv.setContentsMargins(0, 0, 0, 0)
         self.heat_title = QLabel("")
@@ -345,7 +350,7 @@ class EventPage(QWidget):
         timing = day.event.has_timing
         for b in (self.b_accept, self.b_reject, self.b_add, self.b_remove, self.b_write, self.b_restore):
             b.setVisible(timing)
-        self.b_review.setVisible(day.mode == "replays")
+        self.b_review.setVisible(day.mode in ("replays", "capture"))
         self._asked = set()
         self.timer.start(1000)
         self.tick()
@@ -360,7 +365,7 @@ class EventPage(QWidget):
         if not self.day:
             return
         st = self.day.status()
-        self.title.setText(f"{'LIVE' if st['mode'] == 'live' else 'REPLAYS'} — {st['event']}")
+        self.title.setText(f"{ {'live': 'LIVE', 'capture': 'TRACK'}.get(st['mode'], 'REPLAYS')} — {st['event']}")
         self.learn_btn.setText("Relearn track" if st["learned"] else "Learn track")
         bits = [f"learned · {st['n_gates']} gates" if st["learned"] else "not learned yet"]
         if st["learning"] or st["learn_waiting"]:
@@ -375,12 +380,18 @@ class EventPage(QWidget):
         self.status.setText("   ·   ".join(bits))
         self.banner.setVisible(st["paused"])
         if st["paused"]:
-            self.banner.setText("⏸  Race running in FPVTrackside — race_day is paused until it ends")
-            self.player.stop()
+            self.banner.setText("● Recording — analysis and learning wait until it stops" if st["mode"] == "capture"
+                                else "⏸  Race running in FPVTrackside — race_day is paused until it ends")
+            if st["mode"] != "capture":
+                self.player.stop()
         self._fill_heats()
         if self.heat_id:
             self._show_heat()
-        for name in st.get("unconfigured", []):
+        self._ask_videos(st.get("unconfigured", []))
+
+    def _ask_videos(self, names: List[str]):
+        """Videos nobody has described yet: ask about one (the next tick asks the next)."""
+        for name in names:
             if name not in self._asked:
                 self._asked.add(name)
                 self._configure_video(name)
@@ -398,7 +409,7 @@ class EventPage(QWidget):
                 self.heats.addItem(it)
         for i, r in enumerate(rows):
             it = self.heats.item(i)
-            laps = ", ".join(f"{c} {r['pilots'][c]}" + (f" ({r['timing_laps'][c]})" if r["timing_laps"].get(c) is not None
+            laps = ", ".join(_who(c, r["pilots"][c]) + (f" ({r['timing_laps'][c]})" if r["timing_laps"].get(c) is not None
                                                           else "") + (" 📵" if c in r.get("no_video", []) else "")
                              for c in sorted(r["pilots"]))
             flag = f"  ⚠ {r['open']}" if r["open"] else ""
@@ -451,7 +462,7 @@ class EventPage(QWidget):
             lanes.append({"name": ch, "marks": {
                 "timing": [x["video_t"] for x in p["timing"]],
                 "video": p["video_g1"],
-                "gate": [x["t"] for x in p["passes"] if x["gate"] != 1] if self.day.mode == "replays" else [],
+                "gate": [x["t"] for x in p["passes"] if x["gate"] != 1] if self.day.mode in ("replays", "capture") else [],
                 "flag": [f.get("video_t") for f in p["findings"]
                          if f"{ch}|{f['key']}" not in d["decisions"]],
                 "mark": [m.get("video_t") for m in d["marks"] if m["channel"] == ch and m["op"] == "add"]}})
@@ -475,7 +486,7 @@ class EventPage(QWidget):
             open_n = sum(1 for f in p["findings"] if f"{ch}|{f['key']}" not in d["decisions"])
             if not self.day.event.has_timing:
                 n_t = len(p.get("laps", []))
-            head = QTreeWidgetItem([ch, "", f"{p['pilot']}  —  {'timing' if self.day.event.has_timing else 'video'} "
+            head = QTreeWidgetItem([ch, "", f"{_who(ch, p['pilot'])}  —  {'timing' if self.day.event.has_timing else 'video'} "
                                     f"{n_t} laps" + (f" · video {n_v} laps" if self.day.event.has_timing else "")
                                     + (f" · ⚠ {open_n} to check" if open_n else "")
                                     + (" · 📵 no video — no picture recorded for this pilot" if p.get("no_video") else "")
@@ -648,7 +659,7 @@ class EventPage(QWidget):
         f.addRow("Kind", kind)
         f.addRow("Heat number", heat)
         single = QLineEdit()
-        f.addRow("Pilot", single)
+        f.addRow("Pilot (optional)", single)
         quads = []
         for pos, ch in zip(["top left", "top right", "bottom left", "bottom right"], ["R1", "R3", "R6", "R8"]):
             c, n = QLineEdit(ch), QLineEdit()
@@ -656,7 +667,7 @@ class EventPage(QWidget):
             row = QHBoxLayout()
             row.addWidget(c)
             row.addWidget(n)
-            f.addRow(f"{pos}: channel, pilot", row)
+            f.addRow(f"{pos}: channel, pilot (optional)", row)
             quads.append((c, n, row))
 
         def show(i):
@@ -673,11 +684,11 @@ class EventPage(QWidget):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         if kind.currentIndex() == 0:
-            info = {"kind": "single", "heat": heat.value(), "pilots": {"P1": single.text().strip() or "?"}}
+            info = {"kind": "single", "heat": heat.value(), "pilots": {"P1": single.text().strip() or "P1"}}
         else:
             chans = [c.text().strip() or f"Q{i + 1}" for i, (c, _, _) in enumerate(quads)]
-            info = {"kind": "2x2", "heat": heat.value(), "channels": chans,
-                    "pilots": {ch: n.text().strip() for ch, (_, n, _) in zip(chans, quads) if n.text().strip()}}
+            info = {"kind": "2x2", "heat": heat.value(), "channels": chans,       # no name: the channel is the name
+                    "pilots": {ch: n.text().strip() or ch for ch, (_, n, _) in zip(chans, quads)}}
         self.day.configure_video(name, info)
 
     def _learn(self):
@@ -687,9 +698,11 @@ class EventPage(QWidget):
                                            "in the heat list (all pilots of a heat) or per pilot in the heat view.\n\n"
                                            "About 5 runs with at least one full lap each are enough.")
         heats = {r["id"]: r for r in self.day.heat_list()}
-        lines = [f"heat {heats[h]['number']} · {ch} {heats[h]['pilots'].get(ch, '?')} — "
-                 f"{heats[h]['timing_laps'].get(ch, '?')} laps" for h, ch in runs if h in heats]
-        few = [l for l, (h, ch) in zip(lines, runs) if (heats.get(h, {}).get("timing_laps", {}).get(ch) or 0) < 1]
+        timing = self.day.event.has_timing
+        lines = [f"heat {heats[h]['number']} · {_who(ch, heats[h]['pilots'].get(ch, '?'))}"
+                 + (f" — {heats[h]['timing_laps'].get(ch, '?')} laps" if timing else "") for h, ch in runs if h in heats]
+        few = [l for l, (h, ch) in zip(lines, runs)
+               if timing and (heats.get(h, {}).get("timing_laps", {}).get(ch) or 0) < 1]
         n, ok = QInputDialog.getInt(self, "Learn the track",
                                     f"Learning from {len(runs)} pilot runs:\n  " + "\n  ".join(lines) +
                                     (f"\n\n⚠ {len(few)} of them have no full lap — they add little." if few else "") +

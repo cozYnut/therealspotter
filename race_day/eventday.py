@@ -12,7 +12,12 @@ When FPVTrackside starts a race, race_day pauses completely: the event folder
 isn't read (except to see the race end) and the worker processes are
 stopped (SIGSTOP), so FPVTrackside has the computer to itself.
 
-State: <event>/race_day/race_day.json — a restart loses nothing.
+State: <event>/lazySpotter/race_day.json — a restart loses nothing.
+
+Live capture (mode "capture"): the same, on a track's own recordings
+(trackside.TrackVideos — <track>/videos/, data in <track>/lazySpotter/). Nothing runs by
+itself: the user picks the heats to analyse and to learn from. While the app
+records a heat, everything pauses (set_recording).
 """
 
 import json
@@ -38,14 +43,16 @@ def _now():
 
 
 class EventDay:
-    def __init__(self, event_dir, mode: str = "live", workers: int = 4, det_model: str = str(DEFAULT_DET_MODEL),
-                 clip_device: str = "mps", log: Callable[[str], None] = print):
-        if (Path(event_dir) / "Event.json").exists():
+    def __init__(self, event_dir=None, mode: str = "live", workers: int = 4, det_model: str = str(DEFAULT_DET_MODEL),
+                 clip_device: str = "mps", log: Callable[[str], None] = print, event=None):
+        if event is not None:                             # live capture: trackside.TrackVideos
+            self.event = event
+        elif (Path(event_dir) / "Event.json").exists():
             self.event = trackside.Event(event_dir)
         else:                                             # Replays: a folder of loose videos
             self.event = trackside.VideoFolder(event_dir)
             mode = "replays"
-        self.mode = mode                                  # live | replays
+        self.mode = mode                                  # live | replays | capture
         self.tp = TrackPaths(self.event.data_dir)
         self.tp.dir.mkdir(exist_ok=True)
         self.tp.runs_dir.mkdir(exist_ok=True)
@@ -57,9 +64,12 @@ class EventDay:
         if self.tp.race_day_state.exists():
             try:
                 saved = json.loads(self.tp.race_day_state.read_text(encoding="utf-8"))
-                self.state.update({k: v for k, v in saved.items() if k in self.state})
             except ValueError:
-                pass
+                saved = {}
+            if "config" in saved and "event" not in saved:   # the old automatic live mode's state: kept aside
+                os.replace(self.tp.race_day_state, self.tp.race_day_state.with_suffix(".old_live.json"))
+                saved = {}
+            self.state.update({k: v for k, v in saved.items() if k in self.state})
         if mode != "live":
             self.state["auto"] = False
         self.pool = None
@@ -158,6 +168,14 @@ class EventDay:
             elif 0 <= mark_index < len(marks):
                 marks.pop(mark_index)
         self.cmds.put(("save",))
+
+    def set_recording(self, on: bool):
+        """Live capture: a heat is being recorded — pause the workers right
+        away (the loop sees it too and stays paused until it ends)."""
+        self.event.running = True if on else None
+        if self.pool:
+            (self.pool.pause if on else self.pool.resume)()
+        self.paused = bool(on)
 
     def configure_video(self, name: str, info: dict):
         """Replays: what a loose video is (single / 2×2, heat, pilots)."""
@@ -307,16 +325,17 @@ class EventDay:
 
     def _refresh(self):
         r = self.event.refresh()
+        what = "Recording" if self.mode == "capture" else "Race running in FPVTrackside"
         if r["running"] and not self.paused:
             self.paused = True
             if self.pool:
                 self.pool.pause()
-            self.log("Race running in FPVTrackside — paused")
+            self.log(f"{what} — paused")
         elif not r["running"] and self.paused:
             self.paused = False
             if self.pool:
                 self.pool.resume()
-            self.log("Race over — continuing")
+            self.log(f"{what} over — continuing")
         if self.paused:
             return
         for hid in r["new"] + r["changed"]:
@@ -515,7 +534,7 @@ class EventDay:
 
     def _check(self, hid: str):
         h = self.event.heats.get(hid)
-        if not h or self.event.running:
+        if not h or (self.event.running and self.event.has_timing):   # don't open Race.json during a race
             return
         timing = self.event.timing(h)
         races = {c: self._race(h.stem(c)) for c in h.pilots}
