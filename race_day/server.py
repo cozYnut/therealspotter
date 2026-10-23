@@ -134,10 +134,22 @@ class DataView:
         return r
 
     def video_file(self, stem: str) -> Path:
-        """A run's video: its own file, or (FPVTrackside event) the heat video, read in place."""
+        """A run's video: the heat video it was analysed from, read in place.
+        The path saved then may be stale (the event or track folder was moved
+        or renamed since): then the same file is looked for in the event's
+        folder now — <event>/<heat folder>/<file>, <event>/videos/<file>, <event>/<file>."""
         with self.day.lock:
             r = self.day.state["runs"].get(stem) or {}
-        return Path(r["video_path"]) if r.get("video_path") else self.tp.videos / f"{stem}.mp4"
+        if not r.get("video_path"):
+            return self.tp.videos / f"{stem}.mp4"
+        saved = Path(r["video_path"])
+        if saved.exists():
+            return saved
+        event = self.tp.dir.parent                   # the data folder is <event>/lazySpotter
+        for cand in (event / saved.parent.name / saved.name, event / "videos" / saved.name, event / saved.name):
+            if cand.exists():
+                return cand
+        return saved
 
     def heat(self, n: int):
         runs = [r for r in self.visible_runs() if r["heat"] == n]

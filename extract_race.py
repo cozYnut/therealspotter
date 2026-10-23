@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Headless race extraction for race_ui.py.
+Headless race analysis (the race-day app's workers, learn_track).
 
 Runs the full pipeline (YOLO + tracker + PassDetector + CLIP + GateDB race matching)
 on a video and saves per-frame data + race results to JSON.
@@ -20,7 +20,7 @@ detector (--pass-logic live).
 Usage (video inside a track folder — memory and output come from the track):
     python extract_race.py \
         --video  "<data_root>/track1/test_videos/myvideo.mp4" \
-        --det-model  current_best_non_vocab.pt \
+        --det-model  cyn_current-20261021_best.pt \
         --clip-device  mps
     → <data_root>/track1/runs/myvideo.race_data.json  (see dataset_paths.py)
 
@@ -43,7 +43,7 @@ from pass_detector import PassDetector, detect_camera_edges
 from gate_db import GateDB
 from collections import deque
 import pipeline_cfg
-from lazy_spotter import (
+from tracking import (
     TimeTracker,
     ClipEmbedder,
     clamp_bbox,
@@ -406,7 +406,7 @@ def run_race_extraction(
         output["gate_id_logic"] = "greedy"
 
     if passes is not all_passes:
-        # per-frame overlays (race_ui) follow the final passes and laps
+        # per-frame overlays follow the final passes and laps
         frame_ts = [e["t"] for e in frames_data]
         for e in frames_data:
             if "passes" in e:
@@ -435,7 +435,7 @@ def run_race_extraction(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Headless race extraction for race_ui.py")
+    parser = argparse.ArgumentParser(description="Headless race analysis of one video")
     parser.add_argument("--video",             required=True,              help="Path to video file")
     parser.add_argument("--det-model",         required=True,              help="Path to YOLO .pt model")
     parser.add_argument("--gate-memory",       default=None,  help="gate_memory.json (default: the video's track)")

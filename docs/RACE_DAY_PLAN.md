@@ -23,7 +23,7 @@ The new parts are capture, the race-day app, orchestration and the dashboard. Th
 
 ## Two modes (chosen when the app starts)
 
-`race_day.py` is a desktop app (PyQt6, like learn_ui), run by the operator. It owns all settings and state. The browser dashboard only displays.
+`race_day.py` is a desktop app (PyQt6), run by the operator. It owns all settings and state. The browser dashboard only displays.
 
 **1. Live capture** — at the race (changed 2026-10-22: the operator decides, nothing is automatic)
 1. Setup:
@@ -139,9 +139,9 @@ The Core ML model is the same detector converted once for Apple's Neural Engine.
 - **Replays:** each 2×2 file is decoded once and split, and its 4 channels are analysed in parallel. That's about 2× faster than real time.
 - **The desktop app** shows each worker's progress, and warns if analysis falls behind the capture.
 
-## Desktop app — `race_day_app.py` (operator)
+## Desktop app — `lazy_spotter_v2.py` (operator)
 
-(Named `race_day_app.py`, because a `race_day.py` next to the `race_day/` package confuses Python imports.)
+(First named `race_day_app.py`, because a `race_day.py` next to the `race_day/` package confuses Python imports; renamed `lazy_spotter_v2.py` on 2026-10-23.)
 
 - **Start screen:** two big buttons, **Live track** and **Replays**.
 - **Live setup:**
@@ -225,7 +225,7 @@ At 2027Race1 the capture-card recording went choppy from heat 19 on, because lea
 
 **Where things are:** all of race_day's data is in `<event>/lazySpotter/`: `race_day.json`, the learned track, `runs/`, `gt/`, `backups/` (until 2026-10-22 it was `<event>/race_day/`; only its `backups/` — the original Race.json files — are carried over, the track is learned again).
 
-**Replays** (since 2026-10-22) opens a track folder, not an event: see *Two modes* above. The timeline shows every gate pass, and **Review gates** opens learn_ui on that pilot's quadrant (`learn_ui.py --review … --crop …`). Videos nobody described yet are asked about once (all 2×2 / all single / one by one, with optional pilot names).
+**Replays** (since 2026-10-22) opens a track folder, not an event: see *Two modes* above. The timeline shows every gate pass. **Review** (since 2026-10-23 inside the app, in all three screens; before that it opened learn_ui) checks one pilot's run: their quadrant enlarged, every pass accepted, fixed or added with the keyboard, saved as `gt/<run>.gt.json`. Videos nobody described yet are asked about once (all 2×2 / all single / one by one, with optional pilot names).
 
 **Code:**
 - `race_day/trackside.py`: reading the event, finished and running heats, frame times, writing laps back;
@@ -252,8 +252,7 @@ At 2027Race1 the capture-card recording went choppy from heat 19 on, because lea
 ## How to run (implemented)
 
 ```bash
-python race_day_app.py                       # the desktop app: FPVTrackside event, Live capture or Replays
-python -m race_day.simulate out.mp4 --heat "a.mp4,b.mp4,c.mp4,d.mp4" --heat "…"   # a 2×2 test video
+python lazy_spotter_v2.py                    # the desktop app: FPVTrackside event, Live capture or Replays
 ```
 
 - **Live capture:**
@@ -271,8 +270,7 @@ python -m race_day.simulate out.mp4 --heat "a.mp4,b.mp4,c.mp4,d.mp4" --heat "…
   - `labeling.py` — gates, laps, learning;
   - `stats.py`;
   - `server.py` and `static/` — the dashboard;
-  - `models.py`;
-  - `simulate.py`.
+  - `models.py`.
 
 ## Decided
 - **Capture:** 1080p, no borders, no overlays.

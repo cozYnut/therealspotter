@@ -292,7 +292,7 @@ class GateDB:
 
     def memory_window_preview(self, max_items: int = 3) -> str:
         """
-        Small UI helper used by vocab_spotter overlays.
+        Small text helper for overlays.
         Shows gate_ids in expected window (race) or from expected forward (learn).
         """
         n = self._track_len()

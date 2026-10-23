@@ -1,5 +1,5 @@
 """
-Choosing an event in race_day_app: everything is found in the data folder.
+Choosing an event in lazy_spotter_v2: everything is found in the data folder.
 
   fpvtrackside_events(root)   FPVTrackside event folders (with an Event.json),
                               anywhere a few levels down (e.g. <root>/events/<id>)

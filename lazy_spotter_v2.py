@@ -2,7 +2,7 @@
 """
 Race-day desktop app (operator) — see docs/RACE_DAY_PLAN.md.
 
-    python race_day_app.py
+    python lazy_spotter_v2.py
 
 Start screen: FPVTrackside event, Live capture or Replays.
 Events are chosen from the data folder (race_day/picker.py), never browsed for.
@@ -27,7 +27,7 @@ of the data folder (the open one live); its address is on the start screen
 and in the top bar.
 
 The data folder (tracks, training data — FPV_DATA_ROOT for the whole app)
-is asked for the first time, kept in ~/.race_day_app.json and can be changed
+is asked for the first time, kept in ~/.lazy_spotter_v2.json and can be changed
 on the start screen.
 """
 
@@ -132,19 +132,24 @@ def _remember_track(track_dir: Path):
     _save_app_settings(recent_tracks=[str(track_dir)] + rest[:9])
 
 
+SETTINGS = ".lazy_spotter_v2.json"
+OLD_SETTINGS = ".race_day_app.json"       # before the app was renamed: read until the new file exists
+
+
 def _app_settings() -> dict:
-    p = Path.home() / ".race_day_app.json"
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    for name in (SETTINGS, OLD_SETTINGS):
+        try:
+            return json.loads((Path.home() / name).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+    return {}
 
 
 def _save_app_settings(**kw):
     d = _app_settings()
     d.update(kw)
     try:
-        (Path.home() / ".race_day_app.json").write_text(json.dumps(d), encoding="utf-8")
+        (Path.home() / SETTINGS).write_text(json.dumps(d), encoding="utf-8")
     except OSError:
         pass
 
@@ -184,7 +189,7 @@ class StartPage(QWidget):
         row = QHBoxLayout()
         event = _btn("⏱  FPVTrackside event\ncheck every heat's laps in the video", True)
         live = _btn("●  Live capture\nrecord from the capture card")
-        rep = _btn("▶  Replays\na track folder's videos")
+        rep = _btn("▶  Replays\nany track or event of the data folder")
         for b in (event, live, rep):
             b.setMinimumSize(300, 120)
         event.clicked.connect(lambda: win.choose_event("live"))

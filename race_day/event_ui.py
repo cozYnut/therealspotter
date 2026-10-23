@@ -1,5 +1,5 @@
 """
-The FPVTrackside event screen of race_day_app (gate validation for FPVTrackside).
+The FPVTrackside event screen of lazy_spotter_v2 (gate validation for FPVTrackside).
 
     ┌ top bar: event · Learn / Relearn track · Auto · status ──────────────┐
     │ heats (newest first, ☑ = learn) │ heat: 2×2 video with pilot names  │
@@ -11,6 +11,7 @@ The FPVTrackside event screen of race_day_app (gate validation for FPVTrackside)
 """
 
 import time
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import cv2
@@ -43,20 +44,36 @@ def _clock(t: float) -> str:
     return time.strftime("%H:%M:%S", time.localtime(t)) + f".{int((t % 1) * 10)}"
 
 
+REVIEW_COLORS = {"pending": QColor(150, 150, 150), "accepted": QColor(60, 220, 120), "fixed_id": QColor(255, 160, 40),
+                 "added": QColor(80, 160, 255), "skipped": QColor(180, 100, 255), "rejected": QColor(230, 60, 60)}
+
+
 class Timeline(QWidget):
     """One lane per pilot: timing laps (white), G1 passes in the video (green),
-    things to check (orange), the marshal's marks (blue); click to seek."""
+    things to check (orange), the marshal's marks (blue); click to seek.
+    While reviewing, a row on top with the review marks (click one to select it)."""
     seek = pyqtSignal(float)
+    mark_clicked = pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
         self.setMinimumHeight(70)
         self.duration, self.pos = 1.0, 0.0
         self.lanes: List[dict] = []
+        self.review: list = []                   # race_day.review.Mark
+        self.review_sel = None
+
+    def set_review(self, marks: list, sel=None):
+        self.review, self.review_sel = marks, sel
+        self.setMinimumHeight(14 + 16 * max(1, len(self.lanes)) + (18 if marks else 0))
+        self.update()
+
+    def _top(self) -> int:
+        return 20 if self.review else 0
 
     def set_data(self, duration: float, lanes: List[dict]):
         self.duration, self.lanes = max(duration, 1.0), lanes
-        self.setMinimumHeight(14 + 16 * max(1, len(lanes)))
+        self.setMinimumHeight(14 + 16 * max(1, len(lanes)) + (18 if self.review else 0))
         self.update()
 
     def set_pos(self, t: float):
@@ -67,15 +84,29 @@ class Timeline(QWidget):
         return 40 + (self.width() - 50) * t / self.duration
 
     def mousePressEvent(self, e):
-        t = (e.position().x() - 40) / max(1, self.width() - 50) * self.duration
+        x = e.position().x()
+        if self.review and e.position().y() < self._top():
+            near = [m for m in self.review if abs(self._x(m.t) - x) <= 5]
+            if near:
+                return self.mark_clicked.emit(min(near, key=lambda m: abs(self._x(m.t) - x)))
+        t = (x - 40) / max(1, self.width() - 50) * self.duration
         self.seek.emit(float(min(max(t, 0.0), self.duration)))
 
     def paintEvent(self, _):
         p = QPainter(self)
         p.fillRect(self.rect(), QColor(20, 20, 20))
         p.setFont(QFont("Helvetica", 9))
+        if self.review:
+            p.setPen(QColor(150, 150, 150))
+            p.drawText(QRectF(2, 3, 36, 14), Qt.AlignmentFlag.AlignVCenter, "review")
+            for m in self.review:
+                x = int(self._x(m.t))
+                pen = QPen(REVIEW_COLORS.get(m.state, REVIEW_COLORS["pending"]))
+                pen.setWidthF(3.0 if m is self.review_sel else 1.5)
+                p.setPen(pen)
+                p.drawLine(x, 3, x, 17)
         for i, lane in enumerate(self.lanes):
-            y = 6 + 16 * i
+            y = self._top() + 6 + 16 * i
             p.setPen(QColor(150, 150, 150))
             p.drawText(QRectF(2, y, 36, 14), Qt.AlignmentFlag.AlignVCenter, lane["name"])
             for kind, ts in lane["marks"].items():
@@ -133,6 +164,7 @@ class HeatPlayer(QWidget):
         self.t, self.fps, self.duration = 0.0, 30.0, 1.0
         self.playing, self._t0, self._p0 = False, 0.0, 0.0
         self.frame = None
+        self.focus = None                        # (rect, channel): show only this quadrant, enlarged
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
 
@@ -218,15 +250,30 @@ class HeatPlayer(QWidget):
         if self.t < target:
             self.step()
 
+    def set_focus(self, rect=None, channel: str = ""):
+        """Show only this quadrant of the video, enlarged (reviewing one pilot)."""
+        self.focus = (tuple(rect), channel) if rect else None
+        if self.frame is not None:
+            self._show()
+
     def _show(self):
         img = self.frame
+        if self.focus:
+            (x, y, w, h), ch = self.focus
+            H0, W0 = img.shape[:2]
+            img = img[int(round(y * H0)):int(round((y + h) * H0)), int(round(x * W0)):int(round((x + w) * W0))]
         W, H = self.view.width(), self.view.height()
         h0, w0 = img.shape[:2]
         s = min(W / w0, H / h0)
         img = cv2.resize(img, (max(1, int(w0 * s)), max(1, int(h0 * s))), interpolation=cv2.INTER_AREA)
         h1, w1 = img.shape[:2]
         for q in self.quads.get(self.path, []):
-            x, y = int(q["rect"][0] * w1), int(q["rect"][1] * h1)
+            if self.focus:
+                if q["channel"] != self.focus[1]:
+                    continue
+                x, y = 0, 0
+            else:
+                x, y = int(q["rect"][0] * w1), int(q["rect"][1] * h1)
             laps = sum(1 for t in self.laps_at.get(q["channel"], []) if t <= self.t)
             text = _who(q["channel"], q["pilot"]).replace(" ", "  ", 1) + (f"   lap {laps - 1}" if laps > 1 else (" HS" if laps == 1 else ""))
             (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
@@ -302,7 +349,12 @@ class EventPage(QWidget):
         self.tree.itemClicked.connect(self._jump)
         self.tree.itemChanged.connect(self._pilot_checked)
         vsplit.addWidget(self.tree)
-        vsplit.setSizes([520, 300])
+        from race_day.review_ui import ReviewPanel
+        self.review_panel = ReviewPanel(self, self.player)
+        self.review_panel.finished.connect(self._review_end)
+        self.review_panel.hide()
+        vsplit.addWidget(self.review_panel)
+        vsplit.setSizes([520, 300, 300])
         rv.addWidget(vsplit, 1)
         btns = QHBoxLayout()
         self.b_analyse = QPushButton("Analyse")
@@ -314,8 +366,9 @@ class EventPage(QWidget):
         self.b_write.setStyleSheet("QPushButton{background:#2b6cb0;color:white;font-weight:bold;padding:6px 12px}"
                                    "QPushButton:disabled{background:#444;color:#888}")
         self.b_restore = QPushButton("Restore original laps")
-        self.b_review = QPushButton("Review gates")
-        self.b_review.setToolTip("Check every gate pass of the selected pilot in learn_ui (opens a new window)")
+        self.b_review = QPushButton("Review")
+        self.b_review.setToolTip("Check every gate pass of the selected pilot: accept, fix or add passes "
+                                 "(saved as the run's review, used to measure and retrain the system)")
         self.b_review.clicked.connect(self._review)
         self.b_analyse.clicked.connect(lambda: self.heat_id and self.day.analyse([self.heat_id]))
         self.b_accept.clicked.connect(lambda: self._decide("accepted"))
@@ -350,12 +403,13 @@ class EventPage(QWidget):
         timing = day.event.has_timing
         for b in (self.b_accept, self.b_reject, self.b_add, self.b_remove, self.b_write, self.b_restore):
             b.setVisible(timing)
-        self.b_review.setVisible(day.mode in ("replays", "capture"))
+        self.b_review.setVisible(True)
         self._asked = set()
         self.timer.start(1000)
         self.tick()
 
     def close_day(self):
+        self._review_end()
         self.timer.stop()
         self.player.close_video()
 
@@ -433,6 +487,7 @@ class EventPage(QWidget):
         hid = item.data(Qt.ItemDataRole.UserRole)
         if hid == self.heat_id:
             return
+        self._review_end()                       # another heat: the review is saved as it is
         self.heat_id, self._detail_sig = hid, None
         self._show_heat(load_video=True)
 
@@ -625,25 +680,42 @@ class EventPage(QWidget):
             self._detail_sig = None
 
     def _review(self):
-        import subprocess
-        import sys
-        from pathlib import Path
+        """Review the selected pilot's run here: their quadrant enlarged, the
+        marks on the timeline, the review panel in place of the table."""
+        from race_day.review import Review
         s = self._selected()
         d = self.day.heat_detail(self.heat_id) if self.heat_id else None
-        if not s or not d:
-            return QMessageBox.information(self, "Review gates", "Select a pilot first.")
-        p = d["pilots"][s["channel"]]
+        if not s or not d or s.get("channel") not in d["pilots"]:
+            return QMessageBox.information(self, "Review", "Select a pilot (or one of their laps) first.")
+        ch = s["channel"]
+        p = d["pilots"][ch]
         if not Path(p["race_data"]).exists():
-            return QMessageBox.information(self, "Review gates", "Analyse this heat first.")
+            return QMessageBox.information(self, "Review", "Analyse this heat first.")
         if not self.day.tp.gate_memory.exists():
-            return QMessageBox.information(self, "Review gates", "Learn the track first.")
+            return QMessageBox.information(self, "Review", "Learn the track first.")
         q = p["quad"]
-        self.player.stop()
-        subprocess.Popen([sys.executable, str(Path(__file__).resolve().parent.parent / "learn_ui.py"),
-                          "--review", q["video"], "--crop", ",".join(str(x) for x in q["rect"]),
-                          "--race-data", p["race_data"], "--gt", p["gt"],
-                          "--gate-memory", str(self.day.tp.gate_memory),
-                          "--title", f"heat {d['number']} · {s['channel']} {p['pilot']}"])
+        rect = tuple(q["rect"])
+        full = rect == (0.0, 0.0, 1.0, 1.0)
+        try:
+            r = Review(self.day.tp, p["stem"], q["video"], None if full else rect, track_name=self.day.event.name)
+        except Exception as e:
+            return QMessageBox.critical(self, "Review", f"Can't open the review: {e}")
+        if self.player.path != q["video"]:
+            idx = self.player.which.findData(q["video"])
+            if idx >= 0:
+                self.player.which.setCurrentIndex(idx)
+        self.tree.hide()
+        self.review_panel.show()
+        self.review_panel.start(r, ch, p["pilot"], None if full else rect)
+        self.review_panel.setFocus()
+
+    def _review_end(self):
+        if getattr(self, "review_panel", None) is None or self.review_panel.review is None:
+            return
+        self.review_panel.stop()
+        self.review_panel.hide()
+        self.tree.show()
+        self._detail_sig = None
 
     def _configure_video(self, name: str):
         from PyQt6.QtWidgets import QDialog, QDialogButtonBox, QFormLayout, QLineEdit, QSpinBox
