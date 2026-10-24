@@ -370,7 +370,7 @@ class Event:
 
     def timing(self, heat: Heat, race: Optional[dict] = None) -> Dict[str, List[dict]]:
         """Per channel: the timing system's valid detections, in time order —
-        [{"t": clock s, "holeshot": bool, "id", "type": LapRF/Manual}]."""
+        [{"t": clock s, "holeshot": bool, "id", "type": LapRF/Manual, "lap": FPVTrackside's lap number}]."""
         if race is None:
             hit = self._timing.get(heat.id)
             if hit and hit[0] == heat.sig:
@@ -385,7 +385,7 @@ class Event:
                 continue
             out.setdefault(self.channel_name(det.get("Channel", "")), []).append(
                 {"t": t, "holeshot": bool(det.get("IsHoleshot")), "id": det.get("ID"),
-                 "type": det.get("TimingSystemType")})
+                 "type": det.get("TimingSystemType"), "lap": det.get("LapNumber")})
         for v in out.values():
             v.sort(key=lambda d: d["t"])
         self._timing[heat.id] = (heat.sig, out)

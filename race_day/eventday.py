@@ -254,14 +254,16 @@ class EventDay:
             pilots[ch] = {
                 "pilot": h.pilots[ch], "quad": {"video": str(q.video), "rect": q.rect, "kind": q.kind},
                 "timing": [{"t": d["t"], "video_t": float(self.event.to_video(q.video, d["t"] - (self.state["offset"] or 0))),
-                            "id": d["id"], "holeshot": d["holeshot"], "type": d["type"]} for d in dets],
+                            "id": d["id"], "holeshot": d["holeshot"], "type": d["type"], "lap": d.get("lap"),
+                            "race_t": d["t"] - h.start} for d in dets],
                 "video_g1": [p["t"] for p in lapcheck.g1_passes(race)] if race else [],
                 "passes": [{"t": p["t"], "gate": p.get("gate_id", -1)} for p in (race or {}).get("passes", [])],
                 "laps": [{"lap": l.get("lap"), "t0": l["t0"], "t1": l["t1"]} for l in (race or {}).get("laps", [])],
                 "stem": h.stem(ch), "race_data": str(self.tp.race_data(h.stem(ch))),
                 "gt": str(self.tp.gt(h.stem(ch))), "reviewed": self.tp.gt(h.stem(ch)).exists(),
                 "review": (race or {}).get("review"),
-                "findings": check.get("findings", []), "run": hs.get("runs", {}).get(ch, {}),
+                "findings": [dict(f, race_t=f["t"] - h.start) for f in check.get("findings", [])],
+                "run": hs.get("runs", {}).get(ch, {}),
                 "checked": bool(check), "no_video": bool(check.get("no_video")),
                 "no_video_findings": check.get("no_video_findings", 0),
             }
@@ -269,7 +271,9 @@ class EventDay:
                 "status": hs.get("status", "new"), "pilots": pilots, "decisions": hs.get("decisions", {}),
                 "marks": hs.get("marks", []), "written": hs.get("written", []),
                 "learn_pilots": hs.get("learn_pilots", []),
-                "changes": self.changes(heat_id), "videos": sorted({str(q.video) for q in h.quads})}
+                "changes": self.changes(heat_id), "todo": self.marshal_todo(heat_id),
+                "done_in_fpvtrackside": hs.get("done_in_fpvtrackside", 0), "overwritten": hs.get("overwritten"),
+                "videos": sorted({str(q.video) for q in h.quads})}
 
     def changes(self, heat_id: str) -> List[dict]:
         """The lap changes that 'Update laps in FPVTrackside' would write:
@@ -290,6 +294,48 @@ class EventDay:
                         out.append({"op": "add", "channel": ch, "t": f["t"], "by": "check"})
             out += [dict(m) for m in hs.get("marks", [])]
             return out
+
+    def marshal_todo(self, heat_id: str) -> List[dict]:
+        """The same changes as steps for a marshal in FPVTrackside itself (a
+        stock FPVTrackside takes no changes from outside while the event is
+        open: it shows a written Race.json only after the event is reopened).
+        Each step: op (add / remove), channel, pilot, t (clock s), race_t
+        (s from the race start: the time FPVTrackside's replay shows), lap
+        (remove: the lap number FPVTrackside shows now; add: the lap it
+        becomes, 0 = holeshot), lap_time, last (an added lap after the
+        pilot's last one). In race-time order: a lap is found by its time,
+        which doesn't change when FPVTrackside renumbers the laps."""
+        h = self.event.heats.get(heat_id)
+        changes = self.changes(heat_id)
+        if not h or not changes:
+            return []
+        timing = self.event.timing(h)
+        out = []
+        for ch in sorted({c["channel"] for c in changes}):
+            dets = timing.get(ch, [])
+            removed = {c["detection_id"] for c in changes if c["channel"] == ch and c["op"] == "remove"}
+            added = [c["t"] for c in changes if c["channel"] == ch and c["op"] == "add"]
+            first = 0 if (dets[0]["holeshot"] if dets else True) else 1      # FPVTrackside's first lap number
+            after = sorted([(d["t"], d) for d in dets if d["id"] not in removed] + [(t, None) for t in added],
+                           key=lambda x: x[0])
+            last_kept = max((d["t"] for d in dets if d["id"] not in removed), default=None)
+            for i, (t, d) in enumerate(after):
+                if d is None:
+                    out.append({"op": "add", "channel": ch, "pilot": h.pilots.get(ch, "?"), "t": t,
+                                "race_t": t - h.start, "lap": first + i,
+                                "lap_time": t - after[i - 1][0] if i else None,
+                                "last": last_kept is None or t > last_kept})
+            for k, d in enumerate(dets):
+                if d["id"] in removed:
+                    out.append({"op": "remove", "channel": ch, "pilot": h.pilots.get(ch, "?"), "t": d["t"],
+                                "race_t": d["t"] - h.start,
+                                "lap": d.get("lap") if d.get("lap") is not None else first + k,
+                                "lap_time": d["t"] - dets[k - 1]["t"] if k else None, "detection_id": d["id"]})
+        off = self.state.get("offset") or 0.0
+        for st in out:
+            q = self._quad(h, st["channel"])
+            st["video_t"] = float(self.event.to_video(q.video, st["t"] - off)) if q else None
+        return sorted(out, key=lambda x: x["t"])
 
     # ── helpers ────────────────────────────────────────────────
 
@@ -361,7 +407,7 @@ class EventDay:
             with self.lock:
                 hs = self._heat(hid)
             if hid in r["changed"] and hs.get("status") in ("checked", "updated"):
-                self._check(hid)                      # Race.json changed (a marshal edit): check again
+                self._check(hid, external=True)       # Race.json changed (a marshal edit): check again
             elif self.state["auto"] and hs.get("status") == "new":
                 self._submit_heat(hid)
         if r["new"]:
@@ -558,11 +604,20 @@ class EventDay:
         except (OSError, ValueError):
             return None
 
-    def _check(self, hid: str):
+    def _check(self, hid: str, external: bool = False):
+        """The lap check of a heat. external: FPVTrackside saved the heat (a
+        marshal's edit there) — the changes it now has are counted as done
+        in FPVTrackside, and laps the app wrote earlier are checked to still
+        be there (FPVTrackside saves a race from memory, over our write, when
+        the event wasn't reopened in between)."""
         h = self.event.heats.get(hid)
         if not h or (self.event.running and self.event.has_timing):   # don't open Race.json during a race
             return
         timing = self.event.timing(h)
+        before = {_change_id(c) for c in self.changes(hid)} if external else set()
+        if external:
+            self._marks_done(hid, timing)
+            self._overwritten(hid, timing)
         races = {c: self._race(h.stem(c)) for c in h.pilots}
         q_of = {q.channel: q for q in h.quads}
         if self.state["offset"] is None:                      # the timing antenna vs the visual gate
@@ -602,6 +657,62 @@ class EventDay:
             hs["check"] = out
             if hs.get("status") != "updated":
                 hs["status"] = "checked"
+        if external:
+            done = before - {_change_id(c) for c in self.changes(hid)}
+            if done:
+                with self.lock:
+                    hs["done_in_fpvtrackside"] = hs.get("done_in_fpvtrackside", 0) + len(done)
+                self.log(f"heat {h.number}: {len(done)} change(s) done in FPVTrackside")
+
+    def _marks_done(self, hid: str, timing: Dict[str, List[dict]]):
+        """The marshal's own marks that FPVTrackside now has are dropped: a lap
+        added there near the mark, a removed lap no longer valid there."""
+        with self.lock:
+            hs = self._heat(hid)
+            keep = []
+            for m in hs.get("marks", []):
+                dets = timing.get(m["channel"], [])
+                if m["op"] == "add" and any(abs(d["t"] - m["t"]) <= lapcheck.TOL_S for d in dets):
+                    continue
+                if m["op"] == "remove" and all(d["id"] != m.get("detection_id") for d in dets):
+                    continue
+                keep.append(m)
+            hs["marks"] = keep
+            if hs.get("overwritten") and not any(m.get("by") == "lost" for m in keep):
+                hs.pop("overwritten")                 # the lost changes are all back in FPVTrackside
+
+    def _overwritten(self, hid: str, timing: Dict[str, List[dict]]):
+        """Laps the app wrote that FPVTrackside no longer has (it saved the race
+        from memory over our write): flagged on the heat, until the next write."""
+        with self.lock:
+            hs = self._heat(hid)
+            written = [w for w in hs.get("written", []) if w.get("by") != "restore"]
+            if not written or hs.get("status") != "updated":
+                return
+            lost = []
+            for c in written[-1]["changes"]:
+                dets = timing.get(c["channel"], [])
+                if c["op"] == "remove" and any(d["id"] == c.get("detection_id") for d in dets):
+                    lost.append(c)
+                elif c["op"] == "add" and not any(abs(d["t"] - c["t"]) <= 0.05 for d in dets):
+                    lost.append(c)
+            if lost and not hs.get("overwritten"):
+                hs["overwritten"] = {"at": _now(), "changes": len(lost)}
+                # back on the list: the steps for the marshal, and the next Update laps
+                marks = hs.setdefault("marks", [])
+                have = {_change_id(m) for m in marks}
+                h = self.event.heats.get(hid)
+                off = self.state.get("offset") or 0.0
+                for c in lost:
+                    if _change_id(c) in have:
+                        continue
+                    m = {k: c[k] for k in ("op", "channel", "t", "detection_id") if k in c}
+                    q = self._quad(h, c["channel"])
+                    if c["op"] == "add" and q:
+                        m["video_t"] = round(float(self.event.to_video(q.video, c["t"] - off)), 3)
+                    marks.append(dict(m, by="lost"))
+                self.log(f"heat {h.number if h else hid}: FPVTrackside saved this heat over the app's lap changes "
+                         f"({len(lost)} lost) — the event wasn't reopened after the update")
 
     def _stats(self, h, q, race: dict):
         stem = h.stem(q.channel)
@@ -666,6 +777,7 @@ class EventDay:
             hs = self._heat(hid)
             hs.setdefault("written", []).append({"at": _now(), "by": by, "changes": changes})
             hs["status"] = "updated"
+            hs.pop("overwritten", None)
             hs["marks"], hs["decisions"] = [], {}
         self.log(f"heat {h.number}: {len(changes)} lap change(s) written to FPVTrackside ({by})")
         self._check(hid)
@@ -682,6 +794,7 @@ class EventDay:
                 hs = self._heat(hid)
                 hs.setdefault("written", []).append({"at": _now(), "by": "restore", "changes": []})
                 hs["status"] = "checked"
+                hs.pop("overwritten", None)
             self.log(f"heat {h.number}: original laps restored")
             self._check(hid)
 
@@ -690,3 +803,8 @@ def lapcheck_key(f: dict) -> str:
     """A finding's identity across re-checks: kind + time (0.1 s)."""
     return f"{'missed' if f['kind'] == 'missed' else 'det'}@{f['t']:.1f}" if not f.get("detection_id") \
         else f"det:{f['detection_id']}"
+
+
+def _change_id(c: dict) -> tuple:
+    """A lap change's identity: the detection it removes, or where it adds a lap (0.1 s)."""
+    return ("remove", c["detection_id"]) if c["op"] == "remove" else ("add", c["channel"], round(c["t"], 1))

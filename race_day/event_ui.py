@@ -6,6 +6,7 @@ The FPVTrackside event screen of lazy_spotter_v2 (gate validation for FPVTracksi
     │                                 │ timeline (timing / video / checks) │
     │                                 │ per pilot: laps, disagreements     │
     │                                 │ Accept · Reject · Add lap · Remove │
+    │                                 │ To do in FPVTrackside (the steps)  │
     │                                 │ Update laps in FPVTrackside        │
     └─────────────────────────────────┴────────────────────────────────────┘
 """
@@ -17,7 +18,7 @@ from typing import Dict, List, Optional
 import cv2
 import numpy as np
 from PyQt6.QtCore import QRectF, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
+from PyQt6.QtGui import QColor, QFont, QGuiApplication, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QHBoxLayout, QInputDialog, QLabel, QListWidget,
     QListWidgetItem, QMessageBox, QPushButton, QSplitter, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
@@ -44,6 +45,23 @@ def _mmss(t: Optional[float]) -> str:
 def _who(channel: str, pilot: str) -> str:
     """A pilot's label: the channel, and the name when there is one."""
     return channel if pilot in (None, "", "?", channel) else f"{channel} {pilot}"
+
+
+def step_text(st: dict) -> str:
+    """A change as a marshal's step in FPVTrackside (two lines). Stock
+    FPVTrackside's Lap Editor adds a lap only after the last one, so a lap in
+    between is added from the Replay, at its race time."""
+    lap = "the holeshot" if st["lap"] == 0 else f"lap {st['lap']}"
+    took = f" ({st['lap_time']:.2f} s lap)" if st.get("lap_time") else ""
+    who = _who(st["channel"], st["pilot"])
+    at = _mmss(st["race_t"])
+    if st["op"] == "remove":
+        return (f"{who} — disqualify {lap} at race time {at}{took}\n"
+                f"      Lap Editor → right-click that lap → Disqualify Lap")
+    how = f"Replay → seek to {at} → right-click {st['pilot'] if st['pilot'] not in ('', '?') else st['channel']}'s laps → Add Lap Now"
+    if st.get("last") and st.get("lap_time"):
+        how += f"   (or Lap Editor → Add Lap → {st['lap_time']:.2f})"
+    return f"{who} — add {lap} at race time {at}{took}\n      {how}"
 
 
 def _clock(t: float) -> str:
@@ -397,7 +415,9 @@ class EventPage(QWidget):
         self.learn_btn.clicked.connect(self._learn)
         self.auto = QCheckBox("Auto")
         self.auto.setToolTip("New heats are analysed and checked by themselves, and confident lap corrections\n"
-                             "are written to FPVTrackside. Uncertain ones wait for you.")
+                             "are written to FPVTrackside's files. Uncertain ones wait for you.\n"
+                             "FPVTrackside shows written laps after the event is reopened; don't edit those\n"
+                             "heats in FPVTrackside before then, or the change is lost.")
         self.auto.toggled.connect(lambda on: self.day and self.day.set_auto(on))
         self.status = QLabel("")
         self.status.setStyleSheet("color:#aaa")
@@ -434,13 +454,40 @@ class EventPage(QWidget):
         self.player.layout().insertWidget(1, self.legend)        # under the timeline
         vsplit.addWidget(self.player)
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Video", "Clock", "What", "Lap time", "Check"])
+        self.tree.setHeaderLabels(["Video", "Clock", "Race time", "What", "Lap time", "Check"])
+        self.tree.headerItem().setToolTip(2, "Time from the race start: what FPVTrackside's replay shows")
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.tree.itemDoubleClicked.connect(self._jump)
         self.tree.itemClicked.connect(self._jump)
         self.tree.currentItemChanged.connect(self._tree_selected)
         self.tree.itemChanged.connect(self._pilot_checked)
         vsplit.addWidget(self.tree)
+        # the accepted changes as steps for a marshal in FPVTrackside: stock FPVTrackside shows laps
+        # written to Race.json only after the event is reopened, a change made there shows at once
+        self.todo_box = QWidget()
+        tv = QVBoxLayout(self.todo_box)
+        tv.setContentsMargins(0, 0, 0, 0)
+        th = QHBoxLayout()
+        self.todo_title = QLabel("")
+        self.todo_title.setStyleSheet("font-weight:bold")
+        th.addWidget(self.todo_title, 1)
+        b_copy = QPushButton("Copy race time")
+        b_copy.setToolTip("The selected step's race time, to type into FPVTrackside")
+        b_copy.clicked.connect(self._copy_step)
+        th.addWidget(b_copy)
+        tv.addLayout(th)
+        self.todo = QListWidget()
+        self.todo.setStyleSheet("font-family:Menlo,monospace;font-size:12px")
+        self.todo.itemClicked.connect(self._step_clicked)
+        tv.addWidget(self.todo)
+        hint = QLabel("Make each change in FPVTrackside: it shows there at once, and the step goes away here when "
+                      "FPVTrackside saves the heat. Or Update laps in FPVTrackside writes them all to the file — "
+                      "FPVTrackside shows those only after the event is reopened.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#999;font-size:11px")
+        tv.addWidget(hint)
+        self.todo_box.hide()
+        vsplit.addWidget(self.todo_box)
         from race_day.review_ui import ReviewPanel
         self.review_panel = ReviewPanel(self, self.player)
         self.review_panel.finished.connect(self._review_end)
@@ -453,7 +500,7 @@ class EventPage(QWidget):
         self.review_panel.changed.connect(self._review_timer.start)
         self.review_panel.hide()
         vsplit.addWidget(self.review_panel)
-        vsplit.setSizes([520, 300, 300])
+        vsplit.setSizes([520, 300, 160, 300])
         rv.addWidget(vsplit, 1)
         btns = QHBoxLayout()
         self.b_analyse = QPushButton("Analyse")
@@ -612,6 +659,7 @@ class EventPage(QWidget):
             return
         self.detail = d
         sig = (d["status"], len(d["marks"]), len(d["written"]), str(d["decisions"]), str(d["learn_pilots"]),
+               len(d["todo"]), d["done_in_fpvtrackside"], bool(d["overwritten"]),
                sum(len(p["findings"]) for p in d["pilots"].values()), sum(len(p["timing"]) for p in d["pilots"].values()),
                tuple((len(p["passes"]), len(p["laps"]), str(p.get("review"))) for p in d["pilots"].values()))
         if load_video:
@@ -624,7 +672,14 @@ class EventPage(QWidget):
             return
         self._detail_sig = sig
         self.heat_title.setText(f"Heat {d['number']} — {d['label']}   ·   {_clock(d['start'])}–{_clock(d['end'])}"
-                                f"   ·   {d['status']}" + (f"   ·   updated {len(d['written'])}×" if d["written"] else ""))
+                                f"   ·   {d['status']}" + (f"   ·   updated {len(d['written'])}×" if d["written"] else "")
+                                + (f"   ·   {d['done_in_fpvtrackside']} done in FPVTrackside"
+                                   if d["done_in_fpvtrackside"] else ""))
+        if d["overwritten"]:
+            self.note.setText(f"⚠ FPVTrackside no longer has {d['overwritten']['changes']} of the laps written to it — "
+                              "it saved this heat before the event was reopened. They are back on the list: make them in "
+                              "FPVTrackside, or Update laps again and reopen the event in FPVTrackside.")
+        self._fill_todo(d)
         self.player.laps_at = {ch: [x["video_t"] for x in p["timing"]] for ch, p in d["pilots"].items()}
         lanes = []
         for ch, p in sorted(d["pilots"].items()):
@@ -671,7 +726,7 @@ class EventPage(QWidget):
             open_n = sum(1 for f in p["findings"] if f"{ch}|{f['key']}" not in d["decisions"])
             if not self.day.event.has_timing:
                 n_t = len(p.get("laps", []))
-            head = QTreeWidgetItem([ch, "", f"{_who(ch, p['pilot'])}  —  {'timing' if self.day.event.has_timing else 'video'} "
+            head = QTreeWidgetItem([ch, "", "", f"{_who(ch, p['pilot'])}  —  {'timing' if self.day.event.has_timing else 'video'} "
                                     f"{n_t} laps" + (f" · video {n_v} laps" if self.day.event.has_timing else "")
                                     + (f" · ⚠ {open_n} to check" if open_n else "")
                                     + ((" · reviewed ✔" if p["review"].get("status") == "complete"
@@ -686,9 +741,9 @@ class EventPage(QWidget):
             head.setFlags(head.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             head.setCheckState(0, Qt.CheckState.Checked if ch in d["learn_pilots"] else Qt.CheckState.Unchecked)
             head.setToolTip(0, "☑ = learn the track from this pilot's run")
-            f0 = head.font(2)
+            f0 = head.font(3)
             f0.setBold(True)
-            head.setFont(2, f0)
+            head.setFont(3, f0)
             self.tree.addTopLevelItem(head)
             flagged = {f.get("detection_id"): f for f in p["findings"] if f.get("detection_id")}
             removed = {m.get("detection_id") for m in d["marks"] if m["op"] == "remove"}
@@ -713,13 +768,14 @@ class EventPage(QWidget):
                     chk = ""
                 rows.append((x["video_t"], x["t"], what, lap, chk,
                              {"channel": ch, "detection_id": x["id"], "video_t": x["video_t"],
-                              "key": f["key"] if f else None}))
+                              "key": f["key"] if f else None, "race_t": x["race_t"]}))
             for f in p["findings"]:
                 if f["kind"] == "missed" or (f["kind"] == "unsure" and not f.get("detection_id")):
                     dec = d["decisions"].get(f"{ch}|{f['key']}")
                     rows.append((f.get("video_t"), f["t"], "Lap in the video, not in timing", f.get("lap_time"),
                                  (f"⚠ {f['reason']}" if not dec else f"{dec}: {f['reason']}"),
-                                 {"channel": ch, "key": f["key"], "video_t": f.get("video_t")}))
+                                 {"channel": ch, "key": f["key"], "video_t": f.get("video_t"),
+                                  "race_t": f.get("race_t")}))
             if not self.day.event.has_timing:                 # Replays without timing: the video's laps
                 for l in p.get("laps", []):
                     rows.append((l["t1"], l["t1"], f"Lap {l['lap']}", l["t1"] - l["t0"],
@@ -728,21 +784,53 @@ class EventPage(QWidget):
             for mi, m in enumerate(d["marks"]):
                 if m["channel"] == ch and m["op"] == "add":
                     rows.append((m.get("video_t"), m["t"], "Lap added by hand", None, "will be written",
-                                 {"channel": ch, "mark_index": mi, "video_t": m.get("video_t")}))
+                                 {"channel": ch, "mark_index": mi, "video_t": m.get("video_t"),
+                                  "race_t": m["t"] - d["start"]}))
             for vt, ct, what, lap, chk, data in sorted(rows, key=lambda r: r[1]):
-                it = QTreeWidgetItem([_mmss(vt), _clock(ct) if self.day.event.has_timing else "", what,
-                                      f"{lap:.2f}s" if lap else "", chk])
+                timed = self.day.event.has_timing
+                it = QTreeWidgetItem([_mmss(vt), _clock(ct) if timed else "",
+                                      _mmss(data.get("race_t")) if timed and data.get("race_t") is not None else "",
+                                      what, f"{lap:.2f}s" if lap else "", chk])
                 it.setData(0, Qt.ItemDataRole.UserRole, data)
                 if chk.startswith("⚠"):
-                    for c in range(5):
+                    for c in range(6):
                         it.setForeground(c, QColor(255, 170, 60))
                 head.addChild(it)
                 if sel_key and data.get("key") == sel_key:
                     self.tree.setCurrentItem(it)
             head.setExpanded(True)
-        for c in range(4):
+        for c in range(5):
             self.tree.resizeColumnToContents(c)
         self.tree.blockSignals(False)
+
+    def _fill_todo(self, d: dict):
+        steps = d["todo"] if self.day.event.has_timing else []
+        self.todo_box.setVisible(bool(steps))
+        row = self.todo.currentRow()
+        self.todo.clear()
+        for st in steps:
+            it = QListWidgetItem(step_text(st))
+            it.setData(Qt.ItemDataRole.UserRole, st)
+            it.setForeground(LANE_COLORS["remove"] if st["op"] == "remove" else LANE_COLORS["add"])
+            self.todo.addItem(it)
+        self.todo_title.setText(f"To do in FPVTrackside — {len(steps)} change{'s' if len(steps) != 1 else ''}"
+                                " (by race time)")
+        if 0 <= row < self.todo.count():
+            self.todo.setCurrentRow(row)
+
+    def _step_clicked(self, item):
+        st = item.data(Qt.ItemDataRole.UserRole) or {}
+        self.player.set_highlight(st.get("channel"))
+        if st.get("video_t") is not None:
+            self.player.stop()
+            self.player.seek_frames_before(st["video_t"], JUMP_FRAMES)
+
+    def _copy_step(self):
+        it = self.todo.currentItem() or (self.todo.item(0) if self.todo.count() else None)
+        if it:
+            st = it.data(Qt.ItemDataRole.UserRole)
+            QGuiApplication.clipboard().setText(_mmss(st["race_t"]))
+            self.note.setText(f"Copied {_mmss(st['race_t'])} ({_who(st['channel'], st['pilot'])}).")
 
     def _pilot_checked(self, item, col):
         data = item.data(0, Qt.ItemDataRole.UserRole) or {}
@@ -836,7 +924,8 @@ class EventPage(QWidget):
                                 f"Heat {d['number']} — {d['label']}\n\n" + "\n".join(lines) +
                                 "\n\nWritten like a marshal's correction. The original Race.json is kept "
                                 "(Restore original laps)."
-                                "\nIf FPVTrackside has this heat open, reopen it to see the change.") \
+                                "\n\nFPVTrackside shows these laps after the event is reopened. Don't edit this "
+                                "heat in FPVTrackside before then, or the change is lost.") \
                 == QMessageBox.StandardButton.Yes:
             self.day.write(self.heat_id)
             self._detail_sig = None
