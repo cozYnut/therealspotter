@@ -273,7 +273,10 @@ class EventDay:
 
     def changes(self, heat_id: str) -> List[dict]:
         """The lap changes that 'Update laps in FPVTrackside' would write:
-        accepted findings + the marshal's own marks."""
+        accepted findings + the marshal's own marks. An accepted finding about
+        a timing detection (false, or unsure about a timing lap) removes that
+        lap; any other accepted finding is a start/finish crossing seen in the
+        video (missed, or unsure about a video lap) and adds a lap there."""
         with self.lock:
             hs = self.state["heats"].get(heat_id, {})
             out = []
@@ -281,10 +284,10 @@ class EventDay:
                 for f in c.get("findings", []):
                     if hs.get("decisions", {}).get(f"{ch}|{lapcheck_key(f)}") != "accepted":
                         continue
-                    if f["kind"] == "missed":
-                        out.append({"op": "add", "channel": ch, "t": f["t"], "by": "check"})
-                    elif f.get("detection_id"):
+                    if f.get("detection_id"):
                         out.append({"op": "remove", "channel": ch, "detection_id": f["detection_id"], "by": "check"})
+                    else:
+                        out.append({"op": "add", "channel": ch, "t": f["t"], "by": "check"})
             out += [dict(m) for m in hs.get("marks", [])]
             return out
 
