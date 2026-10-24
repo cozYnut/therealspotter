@@ -198,6 +198,13 @@ For an **FPVTrackside event** it also follows the race day, from FPVTrackside's 
   it), the next race and the races to come with who they fly against, and every lap
   of the day as a chart.
 
+**On fril.co.il/live too:** **fril live…** (top bar of the FPVTrackside screen) takes fril's
+live ingest address with its token — the same one FPVTrackside's notifier sends to,
+`https://fril.co.il/api/live/ingest?token=…`. The app then sends the race on now and
+every race to come there (one `UpcomingRaces` event, `race_day/fril.py`) whenever that
+changes, and once a minute; fril.co.il/live shows them as **המרוצים הבאים**. The top bar
+says when it was last sent, or why it couldn't be.
+
 The race being run is never read from disk; its laps show when it ends — or live, if
 FPVTrackside's web server is on (*Menu → Application Settings → Web → Auto start HTTP
 Server*, at <http://localhost:8080>).

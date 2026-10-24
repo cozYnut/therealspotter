@@ -425,12 +425,17 @@ class EventPage(QWidget):
         self.ft_btn.setToolTip("Where FPVTrackside's web server is. With the FPVTrackside alpha (its REST API) and\n"
                                "this event open there, lap changes are made in FPVTrackside directly: they show at once.")
         self.ft_btn.clicked.connect(lambda: win.set_fpvtrackside())
+        self.fril_btn = QPushButton("fril live…")
+        self.fril_btn.setToolTip("Send the race on now and the races to come to fril.co.il/live\n"
+                                 "(its live ingest address, the same one FPVTrackside sends to)")
+        self.fril_btn.clicked.connect(lambda: win.set_fril())
         stop = QPushButton("Close")
         stop.clicked.connect(lambda: win.stop_event())
         for w in (self.title, self.learn_btn, self.auto):
             top.addWidget(w)
         top.addWidget(self.status, 1)
         top.addWidget(self.ft_btn)
+        top.addWidget(self.fril_btn)
         top.addWidget(stop)
         v.addLayout(top)
         self.banner = QLabel("")
@@ -574,6 +579,7 @@ class EventPage(QWidget):
         for b in (self.b_accept, self.b_reject, self.b_add, self.b_remove, self.b_write, self.b_restore):
             b.setVisible(timing)
         self.ft_btn.setVisible(timing and day.mode != "capture")
+        self.fril_btn.setVisible(timing and day.mode == "live")
         self.b_review.setVisible(True)
         self.legend.setVisible(timing)
         self._asked = set()
@@ -609,6 +615,11 @@ class EventPage(QWidget):
                                             else "not reachable — changes go to its files"))
         if self.dash_url:
             bits.append(f"dashboard {self.dash_url}")
+        fr = st.get("fril")
+        if fr:
+            bits.append("fril live: ⚠ " + fr["error"] if fr["error"] else
+                        f"fril live: sent {time.strftime('%H:%M:%S', time.localtime(fr['last_ok']))}"
+                        if fr["last_ok"] else "fril live: sending…")
         self.status.setText("   ·   ".join(bits))
         self.banner.setVisible(st["paused"])
         if st["paused"]:

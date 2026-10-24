@@ -86,6 +86,7 @@ class EventDay:
         self._stop = threading.Event()
         self._learn_wait: Optional[dict] = None           # learn requested, waiting for analyses
         self.ft = None                                    # ftapi.FPVTrackside (FPVTrackside events)
+        self.fril = None                                  # fril.FrilLive: the running order on fril.co.il/live
         self.ft_state = {"level": "none", "serves": False, "race": None, "running": False, "error": None}
 
     # ── lifecycle ──────────────────────────────────────────────
@@ -201,6 +202,13 @@ class EventDay:
             self.ft = ftapi.FPVTrackside(url or ftapi.DEFAULT_URL, token)
             self.cmds.put(("ft",))
 
+    def set_fril(self, url: Optional[str]):
+        """fril's live ingest address (with its token): the race on now and the
+        races to come are sent there (race_day/fril.py). Empty: not sent."""
+        from race_day import fril
+        self.fril = fril.FrilLive(url, log=self.log) if url and isinstance(self.event, trackside.Event) \
+            and self.mode == "live" else None
+
     def write(self, heat_id: str):
         self.cmds.put(("write", heat_id, "hand"))
 
@@ -220,6 +228,7 @@ class EventDay:
                     "auto": self.state["auto"], "offset": self.state["offset"], "error": self.error,
                     "heats": len(self.event.heats), "timing": self.event.has_timing,
                     "fpvtrackside": dict(self.ft_state, url=self.ft.url if self.ft else None),
+                    "fril": self.fril.status() if self.fril else None,
                     "unconfigured": list(getattr(self.event, "unconfigured", []))}
 
     def dashboard_status(self) -> dict:
@@ -439,6 +448,8 @@ class EventDay:
     def _refresh(self):
         r = self.event.refresh()
         self._poll_fpvtrackside()
+        if self.fril:                                 # the running order on fril.co.il/live (sent on a change)
+            self.fril.update(self.race_day())
         if self.ft_state["running"]:                  # FPVTrackside's own race control says so
             r["running"] = r["running"] or self.ft_state["race"] or "fpvtrackside"
         what = "Recording" if self.mode == "capture" else "Race running in FPVTrackside"

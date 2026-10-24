@@ -91,6 +91,20 @@ class Schedule:
             self._web_ok, self._web_failed_at = False, time.time()
             return None
 
+    def _channel_db(self) -> Dict[str, dict]:
+        """FPVTrackside's channel list (band, number, frequency), next to its
+        events folder when this event is still inside FPVTrackside's own
+        folder; optional (as in trackside.Event)."""
+        if not hasattr(self, "_db"):
+            self._db = {}
+            for p in (self.dir.parent.parent / "httpfiles" / "Channels.json",
+                      self.dir.parent.parent / "data" / "Channels.json"):
+                d = read_json(p)
+                if isinstance(d, list):
+                    self._db = {c["ID"]: c for c in d if isinstance(c, dict) and "ID" in c}
+                    break
+        return self._db
+
     # ── the schedule ───────────────────────────────────────────
 
     def get(self, running: Optional[str] = None) -> dict:
@@ -112,6 +126,7 @@ class Schedule:
                   if isinstance(s, dict) and "ID" in s}
         names = {p["ID"]: p.get("Name") or "?" for p in pilots if isinstance(p, dict) and "ID" in p}
         ids, disp, cols = ev.get("Channels") or [], ev.get("ChannelDisplayNames") or [], ev.get("ChannelColors") or []
+        db = self._channel_db()
         chan = {i: (disp[k] if k < len(disp) and disp[k] else i[:8]) for k, i in enumerate(ids)}
         color = {i: (cols[k] if k < len(cols) else "") for k, i in enumerate(ids)}
         in_event = set(ev.get("Rounds") or [])
@@ -132,7 +147,7 @@ class Schedule:
             if not rnd or not rnd.get("Valid", True) or (in_event and rnd["ID"] not in in_event):
                 continue
             races.append(self._race(name, race, result, rnd, stages, names, chan, color, holeshot_first,
-                                    running == name, running is None))
+                                    running == name, running is None, db))
         races.sort(key=lambda r: r["order"])
         for i, r in enumerate(races):
             r["index"] = i
@@ -144,7 +159,7 @@ class Schedule:
                 "laps": ev.get("Laps"), "web": bool(self._web_ok)}
 
     @staticmethod
-    def _race(name, race, result, rnd, stages, names, chan, color, holeshot_first, running, unknown) -> dict:
+    def _race(name, race, result, rnd, stages, names, chan, color, holeshot_first, running, unknown, db=None) -> dict:
         """running: FPVTrackside is recording this race now (the app saw it);
         unknown: the app can't tell (the event isn't open in it) — then a
         started race without an end is running unless it has gone quiet."""
@@ -178,8 +193,10 @@ class Schedule:
             marks = ([start] if start is not None and not holeshot_first else []) + ts
             laps = [round(b - a, 3) for a, b in zip(marks, marks[1:])]
             r = res.get(pid) or {}
+            c = (db or {}).get(cid, {})
             pilots.append({"name": names.get(pid, "?"), "channel": chan.get(cid, (cid or "")[:8]),
-                           "color": color.get(cid, ""), "holeshot": round(hs, 3) if hs is not None else None,
+                           "color": color.get(cid, ""), "band": c.get("Band"), "number": c.get("Number"),
+                           "frequency": c.get("Frequency"), "holeshot": round(hs, 3) if hs is not None else None,
                            "laps": laps, "total": round(ts[-1] - start, 3) if ts and start is not None else None,
                            "last": ts[-1] if ts else None, "position": r.get("Position"), "dnf": bool(r.get("DNF"))})
         if not any(p["position"] for p in pilots):              # no results yet: by laps, then who crossed first

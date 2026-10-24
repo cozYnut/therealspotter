@@ -547,8 +547,28 @@ class Main(QMainWindow):
         st = _app_settings()
         self.event_day.set_fpvtrackside(st.get("fpvtrackside_url") or "http://localhost:8080",
                                         st.get("fpvtrackside_token") or os.environ.get("FPV_API_TOKEN"))
+        self.event_day.set_fril(st.get("fril_live_url"))
         self.event_page.open(self.event_day)
         self.show_page(self.event_page)
+
+    def set_fril(self):
+        """fril.co.il/live's ingest address, with its token: the race on now and
+        the races to come are sent there. Kept in the app's settings."""
+        st = _app_settings()
+        url, ok = QInputDialog.getText(
+            self, "fril live", "The race on now and the races to come are sent to fril.co.il/live, the same way "
+            "FPVTrackside sends its live results.\n\nfril's live ingest address, with its token (empty = don't send):",
+            text=st.get("fril_live_url") or "https://fril.co.il/api/live/ingest?token=")
+        if not ok:
+            return
+        url = url.strip()
+        if url.endswith("?token="):                   # the template, never filled in
+            url = ""
+        if url and not url.startswith(("http://", "https://")):
+            return QMessageBox.warning(self, "fril live", "The address starts with https:// (or http://).")
+        _save_app_settings(fril_live_url=url)
+        if self.event_day:
+            self.event_day.set_fril(url)
 
     def set_fpvtrackside(self):
         """Where FPVTrackside's web server is, and its API token (only needed
