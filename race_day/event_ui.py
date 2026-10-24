@@ -17,7 +17,7 @@ from typing import Dict, List, Optional
 import cv2
 import numpy as np
 from PyQt6.QtCore import QRectF, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
+from PyQt6.QtGui import QColor, QFont, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QHBoxLayout, QInputDialog, QLabel, QListWidget,
     QListWidgetItem, QMessageBox, QPushButton, QSplitter, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
@@ -26,7 +26,13 @@ from PyQt6.QtWidgets import (
 JUMP_FRAMES = 6         # clicking a lap jumps this many frames before its pass
 STATUS_ICON = {"new": "•", "analysing": "⏳", "analysed": "◦", "checked": "✓", "updated": "↻"}
 LANE_COLORS = {"timing": QColor(235, 235, 235), "video": QColor(80, 200, 120), "flag": QColor(255, 160, 40),
-               "mark": QColor(90, 160, 255), "gate": QColor(60, 130, 90)}
+               "mark": QColor(90, 160, 255), "gate": QColor(60, 130, 90),
+               "remove": QColor(230, 60, 60), "add": QColor(80, 200, 120)}
+UPPER = ("timing", "remove", "add")      # the upper half of a pilot's row: FPVTrackside's laps
+TIMELINE_LEGEND = ("Upper half — FPVTrackside's laps:  <b>white</b> now  ·  <span style='color:#e63c3c'>red</span> removed "
+                   "at the next update  ·  <span style='color:#50c878'>green</span> added at the next update.     "
+                   "Lower half — the video:  <span style='color:#50c878'>green</span> start/finish passes  ·  "
+                   "<span style='color:#ffa028'>orange</span> to check (the video has no start/finish pass there)")
 
 
 def _mmss(t: Optional[float]) -> str:
@@ -44,36 +50,57 @@ def _clock(t: float) -> str:
     return time.strftime("%H:%M:%S", time.localtime(t)) + f".{int((t % 1) * 10)}"
 
 
+# one colour per pilot row (the dashboard uses the same palette)
+PILOT_COLORS = [QColor(77, 163, 255), QColor(255, 159, 67), QColor(62, 207, 142), QColor(197, 108, 240),
+                QColor(255, 107, 107), QColor(245, 196, 81), QColor(0, 210, 211), QColor(255, 159, 243)]
+
 REVIEW_COLORS = {"pending": QColor(150, 150, 150), "accepted": QColor(60, 220, 120), "fixed_id": QColor(255, 160, 40),
                  "added": QColor(80, 160, 255), "skipped": QColor(180, 100, 255), "rejected": QColor(230, 60, 60)}
 
 
 class Timeline(QWidget):
-    """One lane per pilot: timing laps (white), G1 passes in the video (green),
-    things to check (orange), the marshal's marks (blue); click to seek.
+    """One lane per pilot; click to seek. FPVTrackside events: the upper half
+    is FPVTrackside's laps (white now, red to be removed, green to be added
+    at the next update), the lower half the video (green start/finish
+    passes, orange things to check). Replays / Live capture: green start/finish
+    passes and the other gates (dark green).
     While reviewing, a row on top with the review marks (click one to select it)."""
     seek = pyqtSignal(float)
     mark_clicked = pyqtSignal(object)
 
+    LABEL_W = 44                         # the pilot label column
+    MIN_LANE = 14                        # a pilot row is at least this tall; it grows with the timeline
+
     def __init__(self):
         super().__init__()
-        self.setMinimumHeight(70)
         self.duration, self.pos = 1.0, 0.0
         self.lanes: List[dict] = []
         self.review: list = []                   # race_day.review.Mark
         self.review_sel = None
+        self.highlight = None                    # the selected pilot's row is drawn brighter
+        self._fit()
+
+    def _fit(self):
+        self.setMinimumHeight(self._top() + self.MIN_LANE * max(1, len(self.lanes)) + 4)
 
     def set_review(self, marks: list, sel=None):
         self.review, self.review_sel = marks, sel
-        self.setMinimumHeight(14 + 16 * max(1, len(self.lanes)) + (18 if marks else 0))
+        self._fit()
         self.update()
 
     def _top(self) -> int:
         return 20 if self.review else 0
 
+    def _lane_h(self) -> float:
+        return max(self.MIN_LANE, (self.height() - self._top() - 2) / max(1, len(self.lanes)))
+
+    def sizeHint(self):
+        from PyQt6.QtCore import QSize
+        return QSize(600, self._top() + 26 * max(1, len(self.lanes)) + 4)
+
     def set_data(self, duration: float, lanes: List[dict]):
         self.duration, self.lanes = max(duration, 1.0), lanes
-        self.setMinimumHeight(14 + 16 * max(1, len(lanes)) + (18 if self.review else 0))
+        self._fit()
         self.update()
 
     def set_pos(self, t: float):
@@ -81,7 +108,7 @@ class Timeline(QWidget):
         self.update()
 
     def _x(self, t):
-        return 40 + (self.width() - 50) * t / self.duration
+        return self.LABEL_W + 4 + (self.width() - self.LABEL_W - 14) * t / self.duration
 
     def mousePressEvent(self, e):
         x = e.position().x()
@@ -89,7 +116,7 @@ class Timeline(QWidget):
             near = [m for m in self.review if abs(self._x(m.t) - x) <= 5]
             if near:
                 return self.mark_clicked.emit(min(near, key=lambda m: abs(self._x(m.t) - x)))
-        t = (x - 40) / max(1, self.width() - 50) * self.duration
+        t = (x - self.LABEL_W - 4) / max(1, self.width() - self.LABEL_W - 14) * self.duration
         self.seek.emit(float(min(max(t, 0.0), self.duration)))
 
     def paintEvent(self, _):
@@ -105,20 +132,36 @@ class Timeline(QWidget):
                 pen.setWidthF(3.0 if m is self.review_sel else 1.5)
                 p.setPen(pen)
                 p.drawLine(x, 3, x, 17)
+        lh = self._lane_h()
+        W = self.width()
         for i, lane in enumerate(self.lanes):
-            y = self._top() + 6 + 16 * i
-            p.setPen(QColor(150, 150, 150))
-            p.drawText(QRectF(2, y, 36, 14), Qt.AlignmentFlag.AlignVCenter, lane["name"])
+            y0 = self._top() + 1 + lh * i
+            # alternate shades, a separator and the pilot's colour: rows easy to tell apart
+            p.fillRect(QRectF(0, y0, W, lh), QColor(52, 56, 68) if lane["name"] == self.highlight
+                       else QColor(34, 36, 42) if i % 2 == 0 else QColor(24, 25, 30))
+            p.fillRect(QRectF(0, y0 + 1, 4, lh - 2), PILOT_COLORS[i % len(PILOT_COLORS)])
+            p.setPen(QColor(55, 58, 66))
+            p.drawLine(0, int(y0 + lh), W, int(y0 + lh))
+            p.setPen(QPen(QColor(48, 50, 58), 1, Qt.PenStyle.DotLine))      # upper half | lower half
+            p.drawLine(self.LABEL_W, int(y0 + lh / 2), W, int(y0 + lh / 2))
+            f = QFont("Helvetica", int(min(12, max(9, lh * 0.38))))
+            f.setBold(True)
+            p.setFont(f)
+            p.setPen(PILOT_COLORS[i % len(PILOT_COLORS)])
+            p.drawText(QRectF(8, y0, self.LABEL_W - 8, lh), Qt.AlignmentFlag.AlignVCenter, lane["name"])
+            pad = max(1.5, lh * 0.08)
+            half = lh / 2
             for kind, ts in lane["marks"].items():
                 pen = QPen(LANE_COLORS[kind])
-                pen.setWidthF(2.0 if kind in ("flag", "mark") else 1.5)
+                pen.setWidthF(2.0 if kind in ("flag", "mark", "remove", "add") else 1.5)
                 p.setPen(pen)
+                top = y0 + (0 if kind in UPPER else half)
+                y1, y2 = top + pad + (half * 0.35 if kind == "gate" else 0), top + half - pad
                 for t in ts:
                     if t is None:
                         continue
-                    x = self._x(t)
-                    top = y + (0 if kind in ("timing", "flag") else 7)
-                    p.drawLine(int(x), top + (3 if kind == "gate" else 0), int(x), top + 7)
+                    x = int(self._x(t))
+                    p.drawLine(x, int(y1), x, int(y2))
         pen = QPen(QColor(255, 60, 60))
         pen.setWidth(2)
         p.setPen(pen)
@@ -137,10 +180,15 @@ class HeatPlayer(QWidget):
         self.view.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.view.setMinimumSize(480, 270)
         self.view.setStyleSheet("background:#111;color:#666")
-        v.addWidget(self.view, 1)
         self.timeline = Timeline()
         self.timeline.seek.connect(self.seek)
-        v.addWidget(self.timeline)
+        self.split = QSplitter(Qt.Orientation.Vertical)      # drag the boundary: a taller timeline
+        self.split.addWidget(self.view)
+        self.split.addWidget(self.timeline)
+        self.split.setChildrenCollapsible(False)
+        self.split.setStretchFactor(0, 1)
+        self.split.setSizes([400, 110])
+        v.addWidget(self.split, 1)
         row = QHBoxLayout()
         self.which = QComboBox()
         self.which.currentIndexChanged.connect(self._switch)
@@ -150,8 +198,8 @@ class HeatPlayer(QWidget):
         back.clicked.connect(lambda: self.seek(self.t - 1.0))
         fwd.clicked.connect(lambda: self.seek(self.t + 1.0))
         fb, ff = QPushButton("◀ frame"), QPushButton("frame ▶")
-        fb.clicked.connect(lambda: self.seek(self.t - 1 / max(self.fps, 1)))
-        ff.clicked.connect(lambda: self.step())
+        fb.clicked.connect(self.frame_back)
+        ff.clicked.connect(self.frame_forward)
         self.time_lbl = QLabel("")
         for w in (self.which, self.play_btn, back, fb, ff, fwd, self.time_lbl):
             row.addWidget(w)
@@ -165,6 +213,8 @@ class HeatPlayer(QWidget):
         self.playing, self._t0, self._p0 = False, 0.0, 0.0
         self.frame = None
         self.focus = None                        # (rect, channel): show only this quadrant, enlarged
+        self.highlight = None                    # channel whose feed stands out (the selected pilot)
+        self.colors: Dict[str, QColor] = {}      # channel → its colour (the timeline row's)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
 
@@ -223,6 +273,22 @@ class HeatPlayer(QWidget):
             self.frame, self.t = f, self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
             self._show()
 
+    def frame_forward(self):
+        """Pause and show the next frame."""
+        self.stop()
+        self.step()
+
+    def frame_back(self):
+        """Pause and show the previous frame — by frame number: heat videos
+        don't have evenly spaced frames, so going back by time can land on the
+        same frame again."""
+        if not self.cap:
+            return
+        self.stop()
+        nxt = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))       # after a read: the next frame's index
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, nxt - 2))
+        self.step()
+
     def toggle(self):
         if self.playing:
             self.stop()
@@ -250,6 +316,15 @@ class HeatPlayer(QWidget):
         if self.t < target:
             self.step()
 
+    def set_highlight(self, channel: Optional[str]):
+        """Make this pilot's feed stand out: a border in their colour, the other feeds a bit darker."""
+        if channel != self.highlight:
+            self.highlight = channel
+            self.timeline.highlight = channel
+            self.timeline.update()
+            if self.frame is not None:
+                self._show()
+
     def set_focus(self, rect=None, channel: str = ""):
         """Show only this quadrant of the video, enlarged (reviewing one pilot)."""
         self.focus = (tuple(rect), channel) if rect else None
@@ -267,7 +342,19 @@ class HeatPlayer(QWidget):
         s = min(W / w0, H / h0)
         img = cv2.resize(img, (max(1, int(w0 * s)), max(1, int(h0 * s))), interpolation=cv2.INTER_AREA)
         h1, w1 = img.shape[:2]
-        for q in self.quads.get(self.path, []):
+        quads = self.quads.get(self.path, [])
+        if self.highlight and not self.focus and len(quads) > 1 and any(q["channel"] == self.highlight for q in quads):
+            for q in quads:
+                x0, y0 = int(q["rect"][0] * w1), int(q["rect"][1] * h1)
+                x1, y1 = int((q["rect"][0] + q["rect"][2]) * w1), int((q["rect"][1] + q["rect"][3]) * h1)
+                if q["channel"] != self.highlight:
+                    img[y0:y1, x0:x1] = (img[y0:y1, x0:x1] * 0.55).astype(img.dtype)     # the others a bit darker
+            q = next(q for q in quads if q["channel"] == self.highlight)
+            c = self.colors.get(self.highlight, QColor(77, 163, 255))
+            x0, y0 = int(q["rect"][0] * w1), int(q["rect"][1] * h1)
+            x1, y1 = int((q["rect"][0] + q["rect"][2]) * w1) - 1, int((q["rect"][1] + q["rect"][3]) * h1) - 1
+            cv2.rectangle(img, (x0 + 1, y0 + 1), (x1 - 1, y1 - 1), (c.blue(), c.green(), c.red()), 4)
+        for q in quads:
             if self.focus:
                 if q["channel"] != self.focus[1]:
                     continue
@@ -341,12 +428,17 @@ class EventPage(QWidget):
         rv.addWidget(self.heat_title)
         vsplit = QSplitter(Qt.Orientation.Vertical)
         self.player = HeatPlayer()
+        self.legend = QLabel(TIMELINE_LEGEND)
+        self.legend.setWordWrap(True)
+        self.legend.setStyleSheet("color:#999;font-size:11px")
+        self.player.layout().insertWidget(1, self.legend)        # under the timeline
         vsplit.addWidget(self.player)
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Video", "Clock", "What", "Lap time", "Check"])
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.tree.itemDoubleClicked.connect(self._jump)
         self.tree.itemClicked.connect(self._jump)
+        self.tree.currentItemChanged.connect(self._tree_selected)
         self.tree.itemChanged.connect(self._pilot_checked)
         vsplit.addWidget(self.tree)
         from race_day.review_ui import ReviewPanel
@@ -390,11 +482,21 @@ class EventPage(QWidget):
         btns.addWidget(self.b_restore)
         btns.addWidget(self.b_write)
         rv.addLayout(btns)
+        self.note = QLabel("")
+        self.note.setStyleSheet("color:#888")
+        rv.addWidget(self.note)
         split.addWidget(right)
         split.setSizes([300, 980])
         v.addWidget(split, 1)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
+        # the video keys, the same in every screen (and while reviewing)
+        p = self.player
+        for key, fn in (("Space", p.toggle), ("Left", p.frame_back), ("Right", p.frame_forward),
+                        ("Shift+Left", lambda: p.seek(p.t - 1.0)), ("Shift+Right", lambda: p.seek(p.t + 1.0))):
+            sc = QShortcut(QKeySequence(key), self)
+            sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            sc.activated.connect(fn)
 
     # ── setup ──────────────────────────────────────────────────
 
@@ -411,6 +513,7 @@ class EventPage(QWidget):
         for b in (self.b_accept, self.b_reject, self.b_add, self.b_remove, self.b_write, self.b_restore):
             b.setVisible(timing)
         self.b_review.setVisible(True)
+        self.legend.setVisible(timing)
         self._asked = set()
         self.timer.start(1000)
         self.tick()
@@ -497,6 +600,8 @@ class EventPage(QWidget):
             return
         self._review_end()                       # another heat: the review is saved as it is
         self.heat_id, self._detail_sig = hid, None
+        self.player.set_highlight(None)
+        self.note.setText("")
         self._show_heat(load_video=True)
 
     # ── heat view ──────────────────────────────────────────────
@@ -523,13 +628,12 @@ class EventPage(QWidget):
         self.player.laps_at = {ch: [x["video_t"] for x in p["timing"]] for ch, p in d["pilots"].items()}
         lanes = []
         for ch, p in sorted(d["pilots"].items()):
-            lanes.append({"name": ch, "marks": {
-                "timing": [x["video_t"] for x in p["timing"]],
-                "video": p["video_g1"],
-                "gate": [x["t"] for x in p["passes"] if x["gate"] != 1] if self.day.mode in ("replays", "capture") else [],
-                "flag": [f.get("video_t") for f in p["findings"]
-                         if f"{ch}|{f['key']}" not in d["decisions"]],
-                "mark": [m.get("video_t") for m in d["marks"] if m["channel"] == ch and m["op"] == "add"]}})
+            if self.day.event.has_timing:
+                lanes.append({"name": ch, "marks": self._timing_lane(d, ch, p)})
+            else:
+                lanes.append({"name": ch, "marks": {
+                    "video": p["video_g1"], "gate": [x["t"] for x in p["passes"] if x["gate"] != 1]}})
+        self.player.colors = {ch: PILOT_COLORS[i % len(PILOT_COLORS)] for i, ch in enumerate(sorted(d["pilots"]))}
         self.player.timeline.set_data(self.player.duration, lanes)
         self._fill_tree(d)
         has_changes = bool(d["changes"])
@@ -537,6 +641,23 @@ class EventPage(QWidget):
         self.b_write.setText(f"Update laps in FPVTrackside ({len(d['changes'])})" if has_changes
                              else "Update laps in FPVTrackside")
         self.b_restore.setEnabled(bool(d["written"]))
+
+    @staticmethod
+    def _timing_lane(d: dict, ch: str, p: dict) -> dict:
+        """A pilot's row in an FPVTrackside event: FPVTrackside's laps now and
+        what the next update changes (upper), the video (lower)."""
+        dec = lambda f: d["decisions"].get(f"{ch}|{f['key']}")
+        removed = {f["detection_id"] for f in p["findings"] if f.get("detection_id") and dec(f) == "accepted"}
+        removed |= {m["detection_id"] for m in d["marks"] if m["channel"] == ch and m["op"] == "remove"}
+        added = [f.get("video_t") for f in p["findings"] if not f.get("detection_id") and dec(f) == "accepted"]
+        added += [m.get("video_t") for m in d["marks"] if m["channel"] == ch and m["op"] == "add"]
+        # to check: no start/finish pass in the video there (a timing lap it doesn't confirm, or a
+        # crossing worked out from the gates around it); stays until accepted
+        flags = [f.get("video_t") for f in p["findings"]
+                 if dec(f) != "accepted" and (f.get("detection_id") or not f.get("exact"))]
+        return {"timing": [x["video_t"] for x in p["timing"] if x["id"] not in removed],
+                "remove": [x["video_t"] for x in p["timing"] if x["id"] in removed],
+                "add": added, "video": p["video_g1"], "flag": flags}
 
     def _fill_tree(self, d):
         sel = self._selected()
@@ -641,12 +762,47 @@ class EventPage(QWidget):
 
     # ── actions ────────────────────────────────────────────────
 
+    def _tree_selected(self, item, _prev=None):
+        """The selected line's pilot: their feed stands out in the video and the timeline."""
+        data = (item.data(0, Qt.ItemDataRole.UserRole) or {}) if item else {}
+        self.player.set_highlight(data.get("channel"))
+
     def _decide(self, decision):
         s = self._selected()
         if not s or not s.get("key"):
             return QMessageBox.information(self, "Check", "Select a ⚠ line first.")
         self.day.decide(self.heat_id, s["channel"], s["key"], decision)
         self._detail_sig = None
+        self._next_finding(s["channel"], s["key"])
+
+    def _next_finding(self, ch: str, key: str):
+        """After Accept / Reject: the next undecided finding — the rest of this
+        pilot's, then the next pilot's (as the table lists them), then any
+        skipped earlier — selected, and the video 6 frames before it."""
+        d = self.day.heat_detail(self.heat_id)
+        if not d:
+            return
+        order = [(c, f) for c in sorted(d["pilots"]) for f in sorted(d["pilots"][c]["findings"], key=lambda f: f["t"])]
+        here = next((i for i, (c, f) in enumerate(order) if c == ch and f["key"] == key), -1)
+        todo = [(c, f) for c, f in order[here + 1:] + order[:max(here, 0)] if f"{c}|{f['key']}" not in d["decisions"]]
+        self._show_heat()                            # the table with the decision in it
+        if not todo:
+            self.note.setText("All findings in this heat are decided.")
+            return
+        c, f = todo[0]
+        for i in range(self.tree.topLevelItemCount()):
+            head = self.tree.topLevelItem(i)
+            for k in range(head.childCount()):
+                it = head.child(k)
+                data = it.data(0, Qt.ItemDataRole.UserRole) or {}
+                if data.get("channel") == c and data.get("key") == f["key"]:
+                    self.tree.setCurrentItem(it)
+                    self.tree.scrollToItem(it)
+                    self._jump(it)
+                    left = len(todo)
+                    self.note.setText(f"Next: {c} at {_mmss(f.get('video_t'))} — {left} finding{'s' if left > 1 else ''} "
+                                      "left to decide in this heat.")
+                    return
 
     def _add(self):
         s = self._selected()

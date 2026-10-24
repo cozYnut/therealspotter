@@ -607,7 +607,12 @@ class EventDay:
         stem = h.stem(q.channel)
         live0 = float(self.event.to_video(q.video, h.start)) if self.event.has_timing else 0.0
         meta = {"live_start_s": live0}
-        st = rstats.run_stats(race, meta, self._n_gates())
+        official = None
+        if self.event.has_timing:                     # the official laps: FPVTrackside's now (with any edits)
+            off = self.state.get("offset") or 0.0
+            official = [float(self.event.to_video(q.video, d["t"] - off))
+                        for d in self.event.timing(h).get(q.channel, [])]
+        st = rstats.run_stats(race, meta, self._n_gates(), official=official)
         st.update(stem=stem, pilot=h.pilots.get(q.channel, "?"), heat=h.number, channel=q.channel,
                   stage=h.stage, round=h.round, race=h.race, reviewed=(race.get("review") or {}).get("status"))
         labeling._write_json(self.tp.runs_dir / f"{stem}.stats.json", st)
@@ -653,6 +658,7 @@ class EventDay:
         try:
             new = trackside.apply_changes(race, changes, cids)
             trackside.write_race(h.dir, new, self.tp.dir / "backups")
+            self.event.timing(h, new)                 # the cached laps are the new ones right away
         except Exception as e:
             self.log(f"heat {h.number}: writing laps failed — {e}")
             return
@@ -669,6 +675,9 @@ class EventDay:
         if not h or self.event.running:
             return
         if trackside.restore_race(h.dir, self.tp.dir / "backups"):
+            restored = self.event.race_json(h)
+            if restored is not None:
+                self.event.timing(h, restored)            # the cached laps are the restored ones right away
             with self.lock:
                 hs = self._heat(hid)
                 hs.setdefault("written", []).append({"at": _now(), "by": "restore", "changes": []})

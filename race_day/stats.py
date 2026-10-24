@@ -19,11 +19,17 @@ def _sections(n: int) -> List[str]:
     return [f"G{g}→G{g % n + 1}" for g in range(1, n + 1)]
 
 
-def run_stats(race: dict, meta: dict, n: int, window=None) -> dict:
+def run_stats(race: dict, meta: dict, n: int, window=None, official: Optional[List[float]] = None) -> dict:
     """window = [t0, t1] (video seconds): only that part counts — a video that
-    also covers a restarted (void) attempt of the heat."""
+    also covers a restarted (void) attempt of the heat.
+    official: the timing system's lap crossings (FPVTrackside's current laps,
+    holeshot first), in video seconds. Then laps, lap times, holeshot and the
+    lap marks are those (the official result); gates and sections still come
+    from the video, grouped by these laps."""
     passes = sorted([p for p in race.get("passes", []) if p.get("gate_id", -1) >= 1], key=lambda p: p["t"])
     laps = race.get("laps", [])
+    if official is not None:
+        laps = [{"lap": i + 1, "t0": a, "t1": b, "dt": b - a} for i, (a, b) in enumerate(zip(official, official[1:]))]
     if window:
         w0, w1 = window
         passes = [p for p in passes if w0 <= p["t"] <= w1]
@@ -68,7 +74,11 @@ def run_stats(race: dict, meta: dict, n: int, window=None) -> dict:
         "section_median": [round(float(np.median(legs[g])), 3) if legs[g] else None for g in range(1, n + 1)],
         "section_grid": grid,
         "theoretical_best": round(sum(best_leg.values()), 3) if len(best_leg) == n else None,
-        "holeshot": round(passes[0]["t"] - live_start, 2) if passes else None,
+        "holeshot": (round(official[0] - live_start, 2) if official else None) if official is not None
+                    else (round(passes[0]["t"] - live_start, 2) if passes else None),
+        "laps_from": "timing" if official is not None else "video",
+        "lap_marks": [{"lap": l.get("lap", i + 1), "t0": round(l["t0"], 3), "t1": round(l["t1"], 3)}
+                      for i, l in enumerate(laps)],
         "first_gate": passes[0]["gate_id"] if passes else None,
         "flight_time": round(passes[-1]["t"] - passes[0]["t"], 2) if len(passes) >= 2 else None,
         "missed_gates": missed,

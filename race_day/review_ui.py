@@ -85,10 +85,8 @@ class ReviewPanel(QWidget):
         # keys: only while a review is open
         keys = [("Return", self.accept), ("Enter", self.accept), ("N", lambda: self.step(+1)),
                 ("Shift+N", lambda: self.step(-1)), ("X", self.reject), ("A", lambda: self.add("pass")),
-                ("M", lambda: self.add("skipped")), ("T", self.tag), ("Backspace", self.undo),
-                ("Space", self.player.toggle), ("Left", lambda: self._frame(-1)), ("Right", lambda: self._frame(+1)),
-                ("Shift+Left", lambda: self.player.seek(self.player.t - 1.0)),
-                ("Shift+Right", lambda: self.player.seek(self.player.t + 1.0))]
+                ("M", lambda: self.add("skipped")), ("T", self.tag), ("Backspace", self.undo)]
+        # Space / ← → / Shift+← → are the heat view's own video keys (event_ui.EventPage)
         keys += [(str(d), lambda d=d: self.digit(d)) for d in range(10)]
         self.shortcuts = []
         for key, fn in keys:
@@ -215,13 +213,6 @@ class ReviewPanel(QWidget):
         r.set_gate(int(buf))
         self.changed.emit()
         self._refresh()
-
-    def _frame(self, k: int):
-        self.player.stop()
-        if k > 0:
-            self.player.step()
-        else:
-            self.player.seek(self.player.t - 1.0 / max(self.player.fps, 1.0))
 
     # ── view ───────────────────────────────────────────────────
 

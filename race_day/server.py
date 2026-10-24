@@ -128,8 +128,10 @@ class DataView:
         r["field"] = field
         r["passes"] = [{"t": p["t"], "gate": p.get("gate_id", -1)} for p in race.get("passes", [])]
         w = r.get("window") or [float("-inf"), float("inf")]
-        r["lap_marks"] = [{"lap": l["lap"], "t0": l["t0"], "t1": l["t1"]} for l in race.get("laps", [])
-                          if l["t0"] >= w[0] and l["t1"] <= w[1]]
+        marks = (st or {}).get("lap_marks")
+        if marks is None:                            # stats from before lap_marks were kept
+            marks = [{"lap": l["lap"], "t0": l["t0"], "t1": l["t1"]} for l in race.get("laps", [])]
+        r["lap_marks"] = [m for m in marks if m["t0"] >= w[0] and m["t1"] <= w[1]]
         r["video_url"] = f"/video/{stem}.mp4{self.q}"
         return r
 
