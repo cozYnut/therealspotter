@@ -58,3 +58,26 @@ h1+.hint{margin-top:-8px}
 .cropbox { position: relative; overflow: hidden; aspect-ratio: 16 / 9; background: #000; border-radius: 8px; cursor: pointer; }
 .cropbox video { position: absolute; max-width: none; max-height: none; height: auto; border-radius: 0; }
 .cropbox .tap { position: absolute; right: 8px; bottom: 6px; font-size: 11px; color: #ccc; background: rgba(0,0,0,.5); padding: 1px 6px; border-radius: 4px; }
+
+/* race day (FPVTrackside events): race on now, races to come, TV */
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px;vertical-align:baseline}
+.lap{display:inline-block;font-size:12px;padding:1px 6px;margin:1px 3px 1px 0;border-radius:6px;background:var(--panel2);font-variant-numeric:tabular-nums}
+.lap.best{background:#0d3324;color:var(--good);font-weight:700}
+.pill.live{background:var(--live);color:#fff;font-weight:700}
+.clock{font-weight:700;font-variant-numeric:tabular-nums;margin-left:4px}
+.clock.big{font-size:28px}
+.up{padding:8px 0;border-bottom:1px solid var(--line)}.up:last-child{border-bottom:0}
+.up-head{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:6px}
+.upchip{display:inline-flex;align-items:center;font-size:13px;padding:3px 9px;margin:2px 4px 2px 0;border-radius:999px;background:var(--panel2)}
+.tv-head{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:10px}.tv-head h1{margin:0;font-size:28px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
+.tile{background:var(--panel);border:1px solid var(--line);border-left:6px solid var(--muted);border-radius:12px;padding:14px;min-width:0}
+.tile-head{display:flex;justify-content:space-between;align-items:baseline}
+.tile .who{font-size:24px;font-weight:800}.tile .pos{font-size:30px;font-weight:800;color:var(--ok)}
+.kv{display:flex;gap:18px;margin:8px 0;font-size:18px;font-weight:700;font-variant-numeric:tabular-nums}
+.kv .k{display:block;font-size:11px;font-weight:600;color:var(--muted)}
+.tile .lap{font-size:15px}
+a.v{display:block}
+table.race th:nth-child(2),table.race td:nth-child(2),table.race th:nth-child(3),table.race td:nth-child(3),
+table.race th:nth-child(5),table.race td:nth-child(5){text-align:left}
+.upchip a{margin-left:4px}

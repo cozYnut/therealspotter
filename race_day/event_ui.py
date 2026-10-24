@@ -434,11 +434,20 @@ class EventPage(QWidget):
         v.addWidget(self.banner)
 
         split = self.split = QSplitter(Qt.Orientation.Horizontal)
+        left = QWidget()
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        self.upnext = QLabel("")               # FPVTrackside events: the race on now and the next one
+        self.upnext.setWordWrap(True)
+        self.upnext.setStyleSheet("background:#1b2232;color:#ddd;padding:5px;border-radius:4px")
+        self.upnext.hide()
+        lv.addWidget(self.upnext)
         self.heats = QListWidget()
         self.heats.setMinimumWidth(180)
         self.heats.currentItemChanged.connect(self._select)
         self.heats.itemChanged.connect(self._checked)
-        split.addWidget(self.heats)
+        lv.addWidget(self.heats, 1)
+        split.addWidget(left)
 
         right = self.right = QWidget()
         rv = QVBoxLayout(right)
@@ -595,10 +604,26 @@ class EventPage(QWidget):
                                 else "⏸  Race running in FPVTrackside — race_day is paused until it ends")
             if st["mode"] != "capture":
                 self.player.stop()
+        self._fill_upnext()
         self._fill_heats()
         if self.heat_id:
             self._show_heat()
         self._ask_videos(st.get("unconfigured", []))
+
+    def _fill_upnext(self):
+        sc = self.day.race_day()
+        if not sc or not sc.get("has") or not (sc["current"] or sc["upcoming"]):
+            self.upnext.hide()
+            return
+        line = lambda r: f"<b>{r['label']}</b> — " + ", ".join(_who(p["channel"], p["name"]) for p in r["pilots"])
+        bits = []
+        if sc["current"]:
+            bits.append("<span style='color:#ff3b5c'>● Racing now</span>  " + line(sc["current"]))
+        if sc["upcoming"]:
+            bits.append("Next  " + line(sc["upcoming"][0]) + (f"  <span style='color:#999'>(+{len(sc['upcoming']) - 1} more)</span>"
+                                                              if len(sc["upcoming"]) > 1 else ""))
+        self.upnext.setText("<br>".join(bits))
+        self.upnext.show()
 
     def _ask_videos(self, names: List[str]):
         """Videos nobody has described yet: ask about one (the next tick asks the next)."""

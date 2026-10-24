@@ -74,6 +74,29 @@ the video.
   finding · **+ Lap / HS here** (add a lap or the holeshot at the video's time) ·
   **− Remove lap** · **Update laps in FPVTrackside** (writes the changes like a
   marshal's correction) · **Restore original laps**.
+- **Racing now · Next** (above the heat list): the race FPVTrackside is on and the
+  next one, with their pilots.
+
+#### Making the changes in FPVTrackside
+
+FPVTrackside (without its REST API, which only the alpha has) reads an event's files
+when the event opens and keeps them in memory: laps written by the app show in
+FPVTrackside **only after the event is reopened**, and if FPVTrackside saves that heat
+first (any edit there), the written laps are lost. So the app also lists every
+accepted change as a step to make in FPVTrackside itself — it shows there at once:
+
+- **To do in FPVTrackside** (under the table): one step per change, by **race time**
+  (the time from the race start, as FPVTrackside's replay shows it) — e.g.
+  *R1 cozYnut — add lap 3 at race time 1:29.41 (21.86 s lap): Replay → seek to 1:29.41 →
+  right-click the pilot's laps → Add Lap Now*, or *disqualify lap 2 at race time 0:41.90:
+  Lap Editor → right-click that lap → Disqualify Lap*. Click a step to see it in the video;
+  **Copy race time** copies its time. The table has a **Race time** column too.
+- When FPVTrackside saves the heat, the app checks it again: steps FPVTrackside now has
+  go away (the heat shows *n done in FPVTrackside*).
+- If FPVTrackside saved a heat over laps the app wrote, the heat says so and those
+  changes are back on the list.
+- **Update laps in FPVTrackside** still writes them all at once — then reopen the event in
+  FPVTrackside, and don't edit those heats there before you do. Auto mode writes the same way.
 - While FPVTrackside runs a race, the app pauses completely so FPVTrackside has
   the computer; it continues when the race ends.
 
@@ -144,6 +167,24 @@ the data folder** (the one open in the app live): results and leaderboard, each
 run (its video with gate and lap marks, laps, sections against the field), heats
 (the pilots' videos side by side, gap chart), pilots, and the track's gates.
 Read-only: nothing can be changed from the browser.
+
+For an **FPVTrackside event** it also follows the race day, from FPVTrackside's files
+(running order: round order, round, race):
+
+- **Race day** (top of Results): the race on now — LIVE, its clock, each pilot's
+  position, holeshot, laps and total — or the last one flown; then the next races with
+  their pilots and channels. The leaderboard gets a **Next race** column: *racing*,
+  *next race*, or *after 2 races* (two races fly before yours).
+- **Upcoming:** every race to come in running order — pilots find their name to see
+  when they fly.
+- **TV:** the race on now, big, for a screen at the pits.
+- **Pilot page:** best lap, best 3 laps and best holeshot (each opens the run that set
+  it), the next race and the races to come with who they fly against, and every lap
+  of the day as a chart.
+
+The race being run is never read from disk; its laps show when it ends — or live, if
+FPVTrackside's web server is on (*Menu → Application Settings → Web → Auto start HTTP
+Server*, at <http://localhost:8080>).
 
 ---
 

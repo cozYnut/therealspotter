@@ -56,12 +56,16 @@ function videoTag(r, attrs) {
 let STATUS = null;
 async function refreshStatus() {
   if (!EV) {
+    SCHED = null;
+    for (const id of ["#nav-up", "#nav-tv"]) $(id).style.display = "none";
     $("#track").textContent = "Race day"; $("#mode").textContent = ""; $("#phase").textContent = "";
     $("#phase").className = "badge"; $("#live").innerHTML = "";
     return;
   }
   try {
     STATUS = await api("/api/status");
+    SCHED = await api("/api/schedule").catch(() => SCHED);
+    for (const id of ["#nav-up", "#nav-tv"]) $(id).style.display = SCHED && SCHED.has ? "" : "none";
     $("#track").textContent = STATUS.track;
     $("#mode").textContent = MODES[STATUS.mode] || (STATUS.mode === "track" ? "track" : "FPVTrackside event");
     const ph = $("#phase");
@@ -69,7 +73,8 @@ async function refreshStatus() {
     else { ph.className = "badge result"; ph.textContent = "results"; }
     const ch = (STATUS.live && STATUS.live.channels) || {};
     const names = (STATUS.pilot_info && STATUS.pilot_info.pilots) || {};
-    $("#live").innerHTML = (STATUS.live && STATUS.live.heat ? `<span class="chip">Heat ${STATUS.live.heat}</span>` : "") +
+    $("#live").innerHTML = (SCHED && SCHED.current ? `<a class="chip on" href="${B()}tv">${esc(SCHED.current.label)}</a>` : "") +
+      (STATUS.live && STATUS.live.heat ? `<span class="chip">Heat ${STATUS.live.heat}</span>` : "") +
       (STATUS.pilot_info && STATUS.pilot_info.round != null && ["scheduled", "prestart", "running"].includes(STATUS.pilot_info.phase)
         ? `<span class="chip">${STATUS.pilot_info.stage ? esc(STATUS.pilot_info.stage) + " · " : ""}Round ${esc(STATUS.pilot_info.round)} · Race ${esc(STATUS.pilot_info.race ?? "–")} · ${esc(STATUS.pilot_info.phase)}</span>` : "") +
       Object.entries(ch).map(([c, s]) => {
@@ -92,15 +97,16 @@ function route() {
   let view, arg;
   if (parts[1] === "e" && parts[2]) {
     EV = parts[2];
-    const views = { "": home, run: runPage, heat: heatPage, pilot: pilotPage, track: trackPage };
+    const views = { "": home, run: runPage, heat: heatPage, pilot: pilotPage, track: trackPage,
+                    upcoming: upcomingPage, tv: tvPage };
     view = views[parts[3] || ""] || home;
     arg = parts[4];
   } else { EV = null; view = eventsPage; }
   $("#nav-res").style.display = $("#nav-track").style.display = EV ? "" : "none";
-  if (EV) { $("#nav-res").href = B(); $("#nav-track").href = B() + "track"; }
+  if (EV) { $("#nav-res").href = B(); $("#nav-track").href = B() + "track"; $("#nav-up").href = B() + "upcoming"; $("#nav-tv").href = B() + "tv"; }
   refreshStatus();
   view(arg, true).catch(showErr);
-  current.timer = setInterval(() => view(arg, false).catch(() => {}), 5000);
+  current.timer = setInterval(() => view(arg, false).catch(() => {}), view.every || 5000);
   window.scrollTo(0, 0);
 }
 function showErr(e) { $("#app").innerHTML = `<p class="muted">Couldn't load (${esc(e)}).</p>`; }
@@ -132,9 +138,10 @@ function lapBar(sections, times) {
 
 // ── home: learn progress or results ────────────────────────────
 async function home(_, first) {
-  const [st, data] = await Promise.all([api("/api/status"), api("/api/runs")]);
+  const [st, data, sc] = await Promise.all([api("/api/status"), api("/api/runs"), api("/api/schedule").catch(() => ({ has: false }))]);
+  SCHED = sc;
   const runs = data.runs, field = data.field || {};
-  if (st.phase === "learn") return learnView(st, runs);
+  if (st.phase === "learn") return learnView(st, runs, sc);
   const done = runs.filter((r) => r.status === "labelled");
   // leaderboard: best of each pilot
   const by = {};
@@ -147,17 +154,18 @@ async function home(_, first) {
   }
   const board = Object.values(by).sort((a, b) => (a.best_lap ?? 1e9) - (b.best_lap ?? 1e9));
   const fastest = (field.section_best || []).map((b, i) => b ? `<span class="pill">${esc(field.sections[i])} <b>${sec(b.time)}</b> ${esc(b.pilot)}</span>` : "").join(" ");
-  $("#app").innerHTML = `
+  const nextCol = sc.has;
+  $("#app").innerHTML = `${raceDay(sc)}
     <h1>Results</h1>
     ${field.sections ? hint("The bar below is the track, drawn as sections (G1→G2, G2→G3 …). Wider block = that stretch takes longer. Example: a wide G5→G6 block is the longest stretch of the lap.") : ""}
     ${lapBar(field.sections, field.section_median)}
     <h2>Leaderboard</h2>
-    ${hint("Best lap = fastest single lap. Best 3 laps = fastest 3 laps in a row. Theoretical best = your best time in every section added up — the lap you could fly. Consistency 2.5% = your laps vary about 2.5% (smaller = steadier). Speed vs field ×1.05 = 5% faster than the typical pilot here. Tap a pilot for their page.")}
+    ${hint("Best lap = fastest single lap. Best 3 laps = fastest 3 laps in a row. Theoretical best = your best time in every section added up — the lap you could fly. Consistency 2.5% = your laps vary about 2.5% (smaller = steadier). Speed vs field ×1.05 = 5% faster than the typical pilot here." + (sc.has ? " Next race: “after 2 races” = two races fly before yours." : "") + " Tap a pilot for their page.")}
     <div class="panel scroll"><table id="board"><thead><tr>
-      <th>Pilot</th><th>Best lap</th><th>Best 3 laps</th><th>Theoretical best</th><th>Consistency</th><th>Speed vs field</th><th>Runs</th></tr></thead>
+      <th>Pilot</th><th>Best lap</th><th>Best 3 laps</th><th>Theoretical best</th><th>Consistency</th><th>Speed vs field</th><th>Runs</th>${nextCol ? "<th>Next race</th>" : ""}</tr></thead>
       <tbody>${board.map((p, i) => `<tr class="click" onclick="location.hash='${B()}pilot/${encodeURIComponent(p.pilot)}'">
         <td><b>${i + 1}.</b> <span style="color:${colorFor(p.pilot)}">●</span> ${esc(p.pilot)}</td><td><b>${sec(p.best_lap)}</b></td><td>${sec(p.best3)}</td>
-        <td>${sec(p.tb)}</td><td>${pct(p.cv)} ${steadiness(p.cv)}</td><td class="${p.si > 1.005 ? "good" : p.si < 0.995 ? "bad" : ""}">${p.si ? "×" + sec(p.si) : "–"}</td><td>${p.runs}</td></tr>`).join("") ||
+        <td>${sec(p.tb)}</td><td>${pct(p.cv)} ${steadiness(p.cv)}</td><td class="${p.si > 1.005 ? "good" : p.si < 0.995 ? "bad" : ""}">${p.si ? "×" + sec(p.si) : "–"}</td><td>${p.runs}</td>${nextCol ? `<td>${nextText(sc.next[p.pilot])}</td>` : ""}</tr>`).join("") ||
       '<tr><td colspan="7" class="muted">No runs with laps yet.</td></tr>'}</tbody></table></div>
     ${fastest ? `<h2>Fastest sections</h2>${hint("Who holds the best time in each section of the track. Example: “G9→G10 0.48 Talper” — nobody flew from gate 9 to gate 10 faster than 0.48 s.")}<div class="panel">${fastest}</div>` : ""}
     <h2>Latest runs</h2>
@@ -180,8 +188,8 @@ function runCard(r) {
             : `<div class="meta" style="margin-top:8px">${r.status === "failed" ? "analysis failed" : "analysing…"}</div>`}</a>`;
 }
 
-function learnView(st, runs) {
-  $("#app").innerHTML = `
+function learnView(st, runs, sc) {
+  $("#app").innerHTML = `${raceDay(sc)}
     <h1>The track isn't learned yet</h1>
     ${hint("Gates and laps appear once the track is learned: in the race-day app, tick ☑ a few heats with full laps and press Learn track.")}
     <h2>Runs analysed</h2>
@@ -334,20 +342,134 @@ function gapChart(runs, n) {
 
 // ── pilot page ─────────────────────────────────────────────────
 async function pilotPage(name, first) {
-  const p = await api("/api/pilot/" + encodeURIComponent(name));
-  if (!first) return;
-  const runs = p.runs;
+  const [p, sc] = await Promise.all([api("/api/pilot/" + encodeURIComponent(name)).catch(() => null),
+                                     api("/api/schedule").catch(() => ({ has: false }))]);
+  SCHED = sc;
+  // the schedule part changes during the day; the rest only with new runs
+  const sig = JSON.stringify([p && p.runs.length, sc.has && sc.next[name], sc.has && sc.upcoming.length, sc.current && sc.current.id]);
+  if (!first && sig === current.sig) return;
+  current.sig = sig;
+  const runs = p ? p.runs : [];
+  // the run that set a number: its card opens that run
+  const bestOf = (key) => runs.filter((r) => r[key] != null).reduce((a, r) => (a && a[key] <= r[key] ? a : r), null);
+  const card = (k, r, key, h) => fact(k, r ? `<a class="v good" href="${B()}run/${encodeURIComponent(r.stem)}">${sec(r[key])}</a>` : '<div class="v">–</div>',
+    h + (r ? ` Heat ${r.heat} ↗` : ""));
+  const mine = sc.has ? [...(sc.current ? [sc.current] : []), ...sc.upcoming].filter((r) => r.pilots.some((x) => x.name === name)) : [];
   $("#app").innerHTML = `<h1><span style="color:${colorFor(name)}">●</span> ${esc(name)}</h1>
     <div class="facts">
-      ${fact("Best lap", `<div class="v good">${sec(Math.min(...runs.map((r) => r.best_lap ?? 1e9)))}</div>`, "Fastest lap over all your runs today.")}
-      ${fact("Runs", `<div class="v">${runs.length}</div>`, "Runs recorded for you.")}
-      ${fact("Laps", `<div class="v">${runs.reduce((a, r) => a + r.laps, 0)}</div>`, "Full laps flown, all runs together.")}
+      ${card("Best lap", bestOf("best_lap"), "best_lap", "Fastest lap over all your runs today.")}
+      ${card("Best 3 laps", bestOf("best3"), "best3", "Fastest 3 laps in a row.")}
+      ${card("Best holeshot", bestOf("holeshot"), "holeshot", "Fastest from take-off to the first gate.")}
+      ${fact("Laps", `<div class="v">${runs.reduce((a, r) => a + r.laps, 0)}</div>`, `Full laps flown, ${runs.length} run${runs.length === 1 ? "" : "s"} together.`)}
+      ${sc.has ? fact("Next race", `<div class="v">${nextText(sc.next[name])}</div>`, "From FPVTrackside's running order.") : ""}
     </div>
+    ${sc.has ? `<h2>Upcoming races</h2>${hint("Your races to come, with who you fly against.")}
+      ${mine.map((r) => `<div class="panel">${r === sc.current ? `<div class="up-head"><b>${esc(r.label)}</b> <span class="pill live">racing now</span></div>
+        <div>${r.pilots.map((x) => `<span class="upchip">${chan(x)} ${pilotLink(x.name)}</span>`).join("")}</div>` : upRow(r, sc.upcoming.indexOf(r))}</div>`).join("")
+        || '<p class="muted">No races to come for you in FPVTrackside.</p>'}` : ""}
+    ${runs.length ? `<h2>Every lap</h2>${hint("All your laps of the day in the order you flew them, one bar per lap (shorter bar = faster lap). Green = your best. Tap a bar to open that run.")}
+      <div class="panel scroll">${lapsChart(runs)}</div>
     <h2>Runs</h2>${hint("Each of your runs — tap one to open it. The chart shows your best lap in each run through the day (R1, R2 …): going down = you got faster. Dashed line = the typical lap on this track.")}<div class="panel scroll"><table><thead><tr><th>Run</th><th>Laps</th><th>Best</th><th>Average</th><th>Consistency</th></tr></thead><tbody>
       ${runs.map((r) => `<tr class="click" onclick="location.hash='${B()}run/${encodeURIComponent(r.stem)}'"><td>Heat ${r.heat} · ${esc(r.channel)}</td><td>${r.laps}</td><td>${sec(r.best_lap)}</td><td>${sec(r.mean_lap)}</td><td>${pct(r.lap_cv)} ${steadiness(r.lap_cv)}</td></tr>`).join("")}</tbody></table>
       ${lapChart(runs.map((r) => r.best_lap).filter((x) => x), p.field.median_lap).replaceAll(">L", ">R")}</div>
-    <h2>Strengths and weaknesses</h2>${hint("Your best time in each section, from all your runs, against the typical pilot. Green bar to the left = a strength (you're faster there), red bar to the right = where you lose time.")}<div class="panel">${sectionBars(p.sections || [], p.vs_field_median)}</div>`;
+    <h2>Strengths and weaknesses</h2>${hint("Your best time in each section, from all your runs, against the typical pilot. Green bar to the left = a strength (you're faster there), red bar to the right = where you lose time.")}<div class="panel">${sectionBars(p.sections || [], p.vs_field_median)}</div>`
+    : '<p class="muted">No analysed runs for this pilot yet.</p>'}`;
 }
+
+// every lap of a pilot's day as bars, heat by heat
+function lapsChart(runs) {
+  const order = [...runs].sort((a, b) => a.heat - b.heat);
+  const all = order.flatMap((r) => (r.lap_times || []).map((t, i) => ({ t, r, i })));
+  if (!all.length) return '<p class="muted">No laps yet.</p>';
+  const best = Math.min(...all.map((x) => x.t)), hi = Math.max(...all.map((x) => x.t)) * 1.05;
+  const bw = 16, gap = 4, sepw = 12, H = 150, top = 14, base = H - 30;
+  let x = 30, out = "", prev = null;
+  for (const a of all) {
+    if (prev && a.r !== prev) { x += sepw; out += `<line x1="${x - sepw / 2}" x2="${x - sepw / 2}" y1="${top}" y2="${base}" stroke="#2a3347"/>`; }
+    if (a.r !== prev) out += `<text x="${x}" y="${H - 8}" fill="#8a96ad" font-size="10">H${a.r.heat}</text>`;
+    const h = ((base - top) * a.t) / hi;
+    out += `<a href="${B()}run/${encodeURIComponent(a.r.stem)}"><rect x="${x}" y="${base - h}" width="${bw}" height="${h}" rx="2" fill="${a.t === best ? "var(--good)" : "#4da3ff"}"><title>Heat ${a.r.heat} lap ${a.i + 1}: ${sec(a.t)} s</title></rect></a>`;
+    x += bw + gap; prev = a.r;
+  }
+  return `<svg width="${x + 10}" height="${H}" style="width:${x + 10}px;max-width:none">
+    <text x="0" y="${top - 2}" fill="#8a96ad" font-size="10">s</text><text x="0" y="${base - ((base - top) * best) / hi + 4}" fill="var(--good)" font-size="10">${sec(best, 1)}</text>${out}</svg>`;
+}
+
+// ── race day (FPVTrackside events): the race on now, the races to come ──
+let SCHED = null;
+const pilotLink = (n) => `<a href="${B()}pilot/${encodeURIComponent(n)}">${esc(n)}</a>`;
+const chan = (p) => `<span class="dot" style="background:${esc(p.color || "#8a96ad")}"></span>${esc(p.channel)}`;
+// a pilot's next race: in the running race, in the next one, or how many races fly before theirs
+const nextText = (s) => s == null ? '<span class="muted">–</span>' : s === "Racing" ? '<span class="pill live">racing</span>'
+  : s === "Staging" ? '<span class="pill ok">next race</span>' : `after ${s} race${s === "1" ? "" : "s"}`;
+const typePill = (r) => r.practice ? '<span class="pill">practice</span>' : r.type === "TimeTrial" ? '<span class="pill">time trial</span>' : "";
+const whenText = (i) => i === 0 ? '<span class="pill ok">next</span>' : `<span class="muted">after ${i} race${i > 1 ? "s" : ""}</span>`;
+
+function lapChips(laps) {
+  const best = Math.min(...laps);
+  return laps.map((l) => `<span class="lap${l === best && laps.length > 1 ? " best" : ""}">${sec(l)}</span>`).join("");
+}
+
+function raceTable(r) {
+  return `<div class="scroll"><table class="race"><thead><tr><th>Pos</th><th>Pilot</th><th>Chan</th><th>Holeshot</th><th>Laps</th><th>Total</th></tr></thead><tbody>
+    ${r.pilots.map((p) => `<tr><td>${p.position ?? "–"}${p.dnf ? ' <span class="muted">DNF</span>' : ""}</td><td>${pilotLink(p.name)}</td><td>${chan(p)}</td>
+      <td>${sec(p.holeshot)}</td><td>${lapChips(p.laps) || '<span class="muted">–</span>'}</td><td>${sec(p.total)}</td></tr>`).join("")}</tbody></table></div>`;
+}
+
+function upRow(r, i) {
+  return `<div class="up"><div class="up-head"><b>${esc(r.label)}</b> ${typePill(r)} ${whenText(i)}</div>
+    <div>${r.pilots.map((p) => `<span class="upchip">${chan(p)} ${pilotLink(p.name)}</span>`).join("")}</div></div>`;
+}
+
+function nowPanel(sc) {
+  const r = sc.current || sc.last;
+  if (!r) return "";
+  return `<div class="panel"><div class="up-head"><b>${sc.current ? "Racing now" : "Last race"}</b> · ${esc(r.label)} ${typePill(r)}
+    ${sc.current ? `<span class="pill live">LIVE</span> <span class="clock" data-start="${r.start}"></span>` : ""}</div>${raceTable(r)}</div>`;
+}
+
+// Home's race-day block: the race on now (or the last one) and the next three
+function raceDay(sc) {
+  if (!sc || !sc.has) return "";
+  const up = sc.upcoming;
+  return `<h1>Race day</h1>
+    ${hint("From FPVTrackside: the race on now (or the last one flown), then the races to come with their pilots and channels.")}
+    ${nowPanel(sc)}
+    <div class="panel"><div class="up-head"><b>Next races</b> <span class="muted">${up.length} to fly</span></div>
+      ${up.slice(0, 3).map(upRow).join("") || '<span class="muted">No races to come in FPVTrackside.</span>'}
+      ${up.length > 3 ? `<a href="${B()}upcoming">See all ${up.length} →</a>` : ""}</div>`;
+}
+
+async function upcomingPage(_, first) {
+  const sc = SCHED = await api("/api/schedule");
+  if (!sc.has) { $("#app").innerHTML = '<p class="muted">Upcoming races are shown for FPVTrackside events.</p>'; return; }
+  $("#app").innerHTML = `<h1>Upcoming races</h1>
+    ${hint("In running order, from FPVTrackside. Find your name to see when you fly: “after 2 races” = two races fly before yours.")}
+    ${sc.current ? nowPanel(sc) : ""}
+    ${sc.upcoming.map((r, i) => `<div class="panel">${upRow(r, i)}</div>`).join("") || '<p class="muted">No races to come. They show here as soon as they are set up in FPVTrackside.</p>'}`;
+}
+
+// TV: the race on now, big, for a screen at the pits
+async function tvPage(_, first) {
+  const sc = SCHED = await api("/api/schedule");
+  const r = sc.has && (sc.current || sc.last);
+  if (!r) { $("#app").innerHTML = '<p class="muted">No race yet.</p>'; return; }
+  $("#app").innerHTML = `<div class="tv-head"><h1>${esc(r.label)}</h1>${typePill(r)}
+      ${sc.current ? `<span class="pill live">LIVE</span><span class="clock big" data-start="${r.start}"></span>` : '<span class="muted">last race</span>'}</div>
+    ${sc.current && !sc.web ? hint("Laps show when the race ends. To see them live, switch on FPVTrackside's web server (Menu → Application Settings → Web → Auto start HTTP Server).") : ""}
+    <div class="tiles">${r.pilots.map((p) => `<div class="tile" style="border-left-color:${esc(p.color || "#8a96ad")}">
+      <div class="tile-head"><span class="who">${pilotLink(p.name)}</span><span class="pos">${p.position ? "P" + p.position : ""}</span></div>
+      <div class="kv"><div><span class="k">Chan</span>${esc(p.channel)}</div><div><span class="k">Laps</span>${p.laps.length}</div><div><span class="k">Total</span>${sec(p.total)}</div></div>
+      <div class="laps">${lapChips(p.laps)}</div></div>`).join("")}</div>
+    ${sc.upcoming.length ? `<h2>Next</h2>${upRow(sc.upcoming[0], 0)}` : ""}`;
+}
+tvPage.every = 1000;
+
+// race clocks: seconds since the race start, ticking
+setInterval(() => document.querySelectorAll(".clock[data-start]").forEach((c) => {
+  const t = Date.now() / 1000 - Number(c.dataset.start);
+  c.textContent = t >= 0 ? `${Math.floor(t / 60)}:${(t % 60).toFixed(1).padStart(4, "0")}` : "";
+}), 100);
 
 // ── track page ─────────────────────────────────────────────────
 async function trackPage(_, first) {

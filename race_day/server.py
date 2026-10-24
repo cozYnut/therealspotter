@@ -17,6 +17,8 @@ with HTTP range requests, which phone browsers need to play and seek.
     /api/heat/<n>           the runs of a heat, with passes for the gap chart
     /api/pilot/<name>       a pilot's runs and section strengths
     /api/track              learned gates (images), sections, hardest sections
+    /api/schedule           FPVTrackside events: every race in running order, the current race, the races
+                            to come, and each pilot's next race (race_day/schedule.py)
     /video/<stem>.mp4       a run's video
     /img?p=<path>           an image inside the event's data folder (gate crops)
 """
@@ -57,6 +59,7 @@ class DataView:
         self.q = "?e=" + urllib.parse.quote(event_id) if event_id else ""
         self._cache = {}
         self._lock = threading.Lock()
+        self._schedule = None
 
     @property
     def tp(self):
@@ -184,6 +187,20 @@ class DataView:
               for b, m in zip(best_sections, field.get("section_median") or [None] * n)]
         return {"pilot": name, "runs": sorted(mine, key=lambda s: s["stem"]), "sections": field.get("sections"),
                 "best_sections": best_sections, "vs_field_median": vs, "field": field}
+
+    def schedule(self):
+        """The meeting as FPVTrackside runs it (an FPVTrackside event only). The
+        race FPVTrackside is recording now is known when the event is open in
+        the app, and is then never read from disk."""
+        event = self.tp.dir.parent                   # the data folder is <event>/lazySpotter
+        if not (event / "Event.json").exists():
+            return {"has": False}
+        if self._schedule is None:
+            from race_day.schedule import Schedule
+            self._schedule = Schedule(event)
+        ev = getattr(self.day, "event", None)
+        running = getattr(ev, "running", None) if getattr(self.day, "mode", None) == "live" else None
+        return self._schedule.get(running)
 
     def track(self):
         out = {"gates": [], "legs_s": None, "field": self.field()}
@@ -385,6 +402,8 @@ def make_handler(lib: Library):
                     return self._json(r) if r else self._json({"error": "no such pilot"}, 404)
                 if p == "/api/track":
                     return self._json(view.track())
+                if p == "/api/schedule":
+                    return self._json(view.schedule())
                 if p.startswith("/video/"):
                     name = Path(p).name
                     if not view.visible(Path(name).stem):          # void runs aren't served

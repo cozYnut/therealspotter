@@ -52,8 +52,10 @@ def parse_time(s: Optional[str]) -> Optional[float]:
         return None
     d, _, t = s.partition(" ")
     h, m, sec = (t.split(":") + ["0", "0"])[:3]
-    base = datetime.strptime(d, "%Y/%m/%d")
-    return base.timestamp() + int(h) * 3600 + int(m) * 60 + float(sec or 0)
+    whole = float(sec or 0)
+    # the whole local time at once: on a day the clocks change, midnight + hours is an hour off
+    local = datetime.strptime(d, "%Y/%m/%d").replace(hour=int(h), minute=int(m), second=int(whole))
+    return local.timestamp() + (whole - int(whole))
 
 
 def _iso_time(s: str) -> float:

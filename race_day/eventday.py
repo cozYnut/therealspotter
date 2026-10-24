@@ -218,6 +218,16 @@ class EventDay:
                                "phase": "running" if st["race_running"] else "finished"},
                 "runs_total": len(self.state["runs"]), "heats": st["heats"], "error": st["error"]}
 
+    def race_day(self) -> Optional[dict]:
+        """An FPVTrackside event's running order (race_day/schedule.py): the race
+        on now and the next ones. None for tracks and folders of videos."""
+        if not isinstance(self.event, trackside.Event):
+            return None
+        if getattr(self, "_schedule", None) is None:
+            from race_day.schedule import Schedule
+            self._schedule = Schedule(self.event.dir)
+        return self._schedule.get(self.event.running if self.mode == "live" else None)
+
     def heat_list(self) -> List[dict]:
         """Newest first: number, label, pilots with their timing laps, status."""
         out = []
