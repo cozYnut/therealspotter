@@ -12,6 +12,11 @@ When FPVTrackside starts a race, race_day pauses completely: the event folder
 isn't read (except to see the race end) and the worker processes are
 stopped (SIGSTOP), so FPVTrackside has the computer to itself.
 
+With FPVTrackside's REST API (the FPVTrackside alpha on, race_day/ftapi.py)
+and the event open in FPVTrackside, lap changes go through the API instead
+of into Race.json: FPVTrackside shows them at once, and a running race is
+seen from FPVTrackside's race control rather than from the files.
+
 State: <event>/lazySpotter/race_day.json — a restart loses nothing.
 
 Live capture (mode "capture"): the same, on a track's own recordings
@@ -80,6 +85,8 @@ class EventDay:
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._stop = threading.Event()
         self._learn_wait: Optional[dict] = None           # learn requested, waiting for analyses
+        self.ft = None                                    # ftapi.FPVTrackside (FPVTrackside events)
+        self.ft_state = {"level": "none", "serves": False, "race": None, "running": False, "error": None}
 
     # ── lifecycle ──────────────────────────────────────────────
 
@@ -187,6 +194,13 @@ class EventDay:
         """Replays: what a loose video is (single / 2×2, heat, pilots)."""
         self.event.set_info(name, info)
 
+    def set_fpvtrackside(self, url: str, token: Optional[str] = None):
+        """Where FPVTrackside's web server is (its REST API, when it has one)."""
+        from race_day import ftapi
+        if isinstance(self.event, trackside.Event):
+            self.ft = ftapi.FPVTrackside(url or ftapi.DEFAULT_URL, token)
+            self.cmds.put(("ft",))
+
     def write(self, heat_id: str):
         self.cmds.put(("write", heat_id, "hand"))
 
@@ -205,6 +219,7 @@ class EventDay:
                     "analysing": kinds.count("analyse"), "labelling": kinds.count("label"),
                     "auto": self.state["auto"], "offset": self.state["offset"], "error": self.error,
                     "heats": len(self.event.heats), "timing": self.event.has_timing,
+                    "fpvtrackside": dict(self.ft_state, url=self.ft.url if self.ft else None),
                     "unconfigured": list(getattr(self.event, "unconfigured", []))}
 
     def dashboard_status(self) -> dict:
@@ -226,7 +241,11 @@ class EventDay:
         if getattr(self, "_schedule", None) is None:
             from race_day.schedule import Schedule
             self._schedule = Schedule(self.event.dir)
-        return self._schedule.get(self.event.running if self.mode == "live" else None)
+        running = self.event.running if self.mode == "live" else None
+        if self.ft_state["serves"]:
+            running = self.ft_state["race"] if self.ft_state["running"] else None
+            self._schedule.web = self.ft.url
+        return self._schedule.get(running)
 
     def heat_list(self) -> List[dict]:
         """Newest first: number, label, pilots with their timing laps, status."""
@@ -283,6 +302,9 @@ class EventDay:
                 "learn_pilots": hs.get("learn_pilots", []),
                 "changes": self.changes(heat_id), "todo": self.marshal_todo(heat_id),
                 "done_in_fpvtrackside": hs.get("done_in_fpvtrackside", 0), "overwritten": hs.get("overwritten"),
+                "api_error": hs.get("api_error"), "api": bool(self.ft_state["serves"]),
+                "api_writes": sum(1 for w in hs.get("written", []) if w.get("via") == "api" and not w.get("undone")
+                                  and w.get("by") != "restore"),
                 "videos": sorted({str(q.video) for q in h.quads})}
 
     def changes(self, heat_id: str) -> List[dict]:
@@ -398,8 +420,27 @@ class EventDay:
                 self.log(self.error)
             self._stop.wait(0.3)
 
+    def _poll_fpvtrackside(self):
+        """The API's level, whether FPVTrackside has this event open, and its
+        race control (what's selected, whether it's running)."""
+        from race_day import ftapi
+        st = {"level": "none", "serves": False, "race": None, "running": False, "error": None}
+        if self.ft:
+            try:
+                st["level"] = self.ft.level()
+                st["serves"] = self.ft.serves(self.event.dir.name)
+                if st["serves"]:
+                    rc = self.ft.race_control()
+                    st["race"], st["running"] = rc["race"], rc["state"] in ("starting", "running")
+            except ftapi.ApiError as e:
+                st["error"] = str(e)
+        self.ft_state = st
+
     def _refresh(self):
         r = self.event.refresh()
+        self._poll_fpvtrackside()
+        if self.ft_state["running"]:                  # FPVTrackside's own race control says so
+            r["running"] = r["running"] or self.ft_state["race"] or "fpvtrackside"
         what = "Recording" if self.mode == "capture" else "Race running in FPVTrackside"
         if r["running"] and not self.paused:
             self.paused = True
@@ -446,6 +487,8 @@ class EventDay:
                             self._submit_heat(hid)
                         elif hs.get("status") == "checked":
                             self._auto_write(hid)
+            elif kind == "ft":
+                self._poll_fpvtrackside()
             elif kind == "write":
                 self._write(cmd[1], cmd[2])
             elif kind == "restore":
@@ -766,11 +809,13 @@ class EventDay:
 
     def _write(self, hid: str, by: str):
         h = self.event.heats.get(hid)
-        if not h or self.event.running:
+        if not h or self.event.running or self.ft_state["running"]:
             return
         changes = self.changes(hid)
         if not changes:
             return
+        if self.ft_state["serves"]:
+            return self._write_api(h, changes, by)
         race = self.event.race_json(h)
         if race is None:
             self.log(f"heat {h.number}: Race.json busy — will retry")
@@ -792,10 +837,85 @@ class EventDay:
         self.log(f"heat {h.number}: {len(changes)} lap change(s) written to FPVTrackside ({by})")
         self._check(hid)
 
+    def _write_api(self, h, changes: List[dict], by: str):
+        """The changes through FPVTrackside's REST API, one lap correction per
+        pilot. An added crossing is placed after the pilot's latest earlier
+        crossing (both on FPVTrackside's clock); with none, at its time from
+        the race start. The crossings it creates and the ones it discounts are
+        kept, so Restore can undo exactly those."""
+        from race_day import ftapi
+        race = self.event.race_json(h) or {}
+        pid = {self.event.channel_name(pc["Channel"]): pc["Pilot"] for pc in race.get("PilotChannels") or []
+               if pc.get("Channel") and pc.get("Pilot")}
+        timing = self.event.timing(h)
+        created, invalidated, done, errors = [], [], [], []
+        for ch in sorted({c["channel"] for c in changes}):
+            mine = [c for c in changes if c["channel"] == ch]
+            if ch not in pid:
+                errors.append(f"{ch}: no pilot on this channel in FPVTrackside")
+                continue
+            dets = timing.get(ch, [])
+            inval = [c["detection_id"] for c in mine if c["op"] == "remove"]
+            anchored, by_time = [], []
+            for c in (c for c in mine if c["op"] == "add"):
+                before = [d for d in dets if d["t"] < c["t"] - 0.001]
+                if before and (c["t"] - before[-1]["t"]) * 1000 <= 600000:
+                    anchored.append((c, {"anchor": before[-1]["id"],
+                                         "offset_ms": max(1, round((c["t"] - before[-1]["t"]) * 1000))}))
+                else:
+                    by_time.append(c)
+            try:
+                known = {d["id"].lower() for d in dets}
+                if inval or anchored:
+                    laps = self.ft.lap_corrections(h.id, pid[ch], inval, [a for _, a in anchored])
+                    for c, _ in anchored:              # the crossing it made for each added lap
+                        hit = min((l for l in laps if l["detection"] not in known and l["pilot"] == pid[ch].lower()),
+                                  key=lambda l: abs(l["race_time"] - (c["t"] - h.start)), default=None)
+                        if hit and abs(hit["race_time"] - (c["t"] - h.start)) < 0.5:
+                            created.append(hit["detection"])
+                            known.add(hit["detection"])
+                    invalidated += inval
+                    done += [c for c in mine if c["op"] == "remove"] + [c for c, _ in anchored]
+                for c in by_time:
+                    created += self.ft.add_lap(h.id, pid[ch], round((c["t"] - h.start) * 1000))
+                    done.append(c)
+            except ftapi.ApiError as e:
+                errors.append(f"{ch}: {e}")
+        with self.lock:
+            hs = self._heat(h.id)
+            if done:
+                hs.setdefault("written", []).append({"at": _now(), "by": by, "via": "api", "changes": done,
+                                                     "created": created, "invalidated": invalidated})
+                hs["status"] = "updated"
+                hs.pop("overwritten", None)
+                ids = {_change_id(c) for c in done}        # what went through stops being a change to make
+                hs["marks"] = [m for m in hs.get("marks", []) if _change_id(m) not in ids]
+                for ch, c in hs.get("check", {}).items():
+                    for f in c.get("findings", []):
+                        if hs.get("decisions", {}).get(f"{ch}|{lapcheck_key(f)}") == "accepted":
+                            fc = ({"op": "remove", "detection_id": f["detection_id"]} if f.get("detection_id")
+                                  else {"op": "add", "channel": ch, "t": f["t"]})
+                            if _change_id(fc) in ids:
+                                hs["decisions"].pop(f"{ch}|{lapcheck_key(f)}")
+            hs["api_error"] = "; ".join(errors) or None
+        if done:
+            self.log(f"heat {h.number}: {len(done)} lap change(s) made in FPVTrackside through its API ({by})")
+        for e in errors:
+            self.log(f"heat {h.number}: FPVTrackside refused a change — {e}")
+        self._save()
+
     def _restore(self, hid: str):
         h = self.event.heats.get(hid)
         if not h or self.event.running:
             return
+        with self.lock:
+            api_writes = [w for w in self._heat(hid).get("written", []) if w.get("via") == "api" and not w.get("undone")]
+        if api_writes:
+            if not self.ft_state["serves"]:
+                self.log(f"heat {h.number}: changes made through FPVTrackside's API can only be undone through it "
+                         "— it isn't reachable (or has another event open)")
+                return
+            return self._restore_api(h, api_writes)
         if trackside.restore_race(h.dir, self.tp.dir / "backups"):
             restored = self.event.race_json(h)
             if restored is not None:
@@ -807,6 +927,31 @@ class EventDay:
                 hs.pop("overwritten", None)
             self.log(f"heat {h.number}: original laps restored")
             self._check(hid)
+
+
+    def _restore_api(self, h, writes: List[dict]):
+        """Undo the API's changes, newest first: the crossings it added are
+        discounted, the ones it discounted count again."""
+        from race_day import ftapi
+        failed = []
+        for w in reversed(writes):
+            try:
+                for d in w.get("created", []):
+                    self.ft.set_valid(h.id, d, False)
+                for d in w.get("invalidated", []):
+                    self.ft.set_valid(h.id, d, True)
+                w["undone"] = _now()
+            except ftapi.ApiError as e:
+                failed.append(str(e))
+        with self.lock:
+            hs = self._heat(h.id)
+            hs.setdefault("written", []).append({"at": _now(), "by": "restore", "via": "api", "changes": []})
+            if not failed:
+                hs["status"] = "checked"
+            hs["api_error"] = "; ".join(failed) or None
+        self.log(f"heat {h.number}: " + (f"undoing in FPVTrackside failed — {failed[0]}" if failed
+                                         else "original laps restored in FPVTrackside"))
+        self._save()
 
 
 def lapcheck_key(f: dict) -> str:

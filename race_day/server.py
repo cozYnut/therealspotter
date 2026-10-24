@@ -195,6 +195,8 @@ class DataView:
         event = self.tp.dir.parent                   # the data folder is <event>/lazySpotter
         if not (event / "Event.json").exists():
             return {"has": False}
+        if hasattr(self.day, "race_day"):              # open in the app: it knows the race being run
+            return self.day.race_day() or {"has": False}
         if self._schedule is None:
             from race_day.schedule import Schedule
             self._schedule = Schedule(event)

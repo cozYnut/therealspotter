@@ -421,11 +421,16 @@ class EventPage(QWidget):
         self.auto.toggled.connect(lambda on: self.day and self.day.set_auto(on))
         self.status = QLabel("")
         self.status.setStyleSheet("color:#aaa")
+        self.ft_btn = QPushButton("FPVTrackside…")
+        self.ft_btn.setToolTip("Where FPVTrackside's web server is. With the FPVTrackside alpha (its REST API) and\n"
+                               "this event open there, lap changes are made in FPVTrackside directly: they show at once.")
+        self.ft_btn.clicked.connect(lambda: win.set_fpvtrackside())
         stop = QPushButton("Close")
         stop.clicked.connect(lambda: win.stop_event())
         for w in (self.title, self.learn_btn, self.auto):
             top.addWidget(w)
         top.addWidget(self.status, 1)
+        top.addWidget(self.ft_btn)
         top.addWidget(stop)
         v.addLayout(top)
         self.banner = QLabel("")
@@ -568,6 +573,7 @@ class EventPage(QWidget):
         timing = day.event.has_timing
         for b in (self.b_accept, self.b_reject, self.b_add, self.b_remove, self.b_write, self.b_restore):
             b.setVisible(timing)
+        self.ft_btn.setVisible(timing and day.mode != "capture")
         self.b_review.setVisible(True)
         self.legend.setVisible(timing)
         self._asked = set()
@@ -595,6 +601,12 @@ class EventPage(QWidget):
         if st["labelling"]:
             bits.append(f"labelling {st['labelling']} heats")
         bits.append(f"{st['heats']} heats")
+        ft = st.get("fpvtrackside") or {}
+        if ft.get("url") and self.day.event.has_timing:
+            bits.append("FPVTrackside: " + ("REST API ✓ — changes show there at once" if ft["serves"]
+                                            else "REST API, another event open" if ft["level"] == "rest"
+                                            else "web server only — changes go to its files" if ft["level"] == "web"
+                                            else "not reachable — changes go to its files"))
         if self.dash_url:
             bits.append(f"dashboard {self.dash_url}")
         self.status.setText("   ·   ".join(bits))
@@ -684,7 +696,8 @@ class EventPage(QWidget):
             return
         self.detail = d
         sig = (d["status"], len(d["marks"]), len(d["written"]), str(d["decisions"]), str(d["learn_pilots"]),
-               len(d["todo"]), d["done_in_fpvtrackside"], bool(d["overwritten"]),
+               len(d["todo"]), d["done_in_fpvtrackside"], bool(d["overwritten"]), d["api"], d["api_error"],
+               d["api_writes"],
                sum(len(p["findings"]) for p in d["pilots"].values()), sum(len(p["timing"]) for p in d["pilots"].values()),
                tuple((len(p["passes"]), len(p["laps"]), str(p.get("review"))) for p in d["pilots"].values()))
         if load_video:
@@ -704,6 +717,8 @@ class EventPage(QWidget):
             self.note.setText(f"⚠ FPVTrackside no longer has {d['overwritten']['changes']} of the laps written to it — "
                               "it saved this heat before the event was reopened. They are back on the list: make them in "
                               "FPVTrackside, or Update laps again and reopen the event in FPVTrackside.")
+        if d["api_error"]:
+            self.note.setText(f"⚠ FPVTrackside refused: {d['api_error']}")
         self._fill_todo(d)
         self.player.laps_at = {ch: [x["video_t"] for x in p["timing"]] for ch, p in d["pilots"].items()}
         lanes = []
@@ -721,6 +736,8 @@ class EventPage(QWidget):
         self.b_write.setText(f"Update laps in FPVTrackside ({len(d['changes'])})" if has_changes
                              else "Update laps in FPVTrackside")
         self.b_restore.setEnabled(bool(d["written"]))
+        self.b_write.setToolTip("Made in FPVTrackside through its REST API: shows there at once" if d["api"] else
+                                "Written to the heat's Race.json: FPVTrackside shows it after the event is reopened")
 
     @staticmethod
     def _timing_lane(d: dict, ch: str, p: dict) -> dict:
@@ -829,7 +846,7 @@ class EventPage(QWidget):
         self.tree.blockSignals(False)
 
     def _fill_todo(self, d: dict):
-        steps = d["todo"] if self.day.event.has_timing else []
+        steps = d["todo"] if self.day.event.has_timing and not d["api"] else []
         self.todo_box.setVisible(bool(steps))
         row = self.todo.currentRow()
         self.todo.clear()
@@ -947,16 +964,21 @@ class EventPage(QWidget):
                 lines.append(f"− remove {c['channel']} {name}'s lap at {_clock(t) if t else '?'}")
         if QMessageBox.question(self, "Update laps in FPVTrackside",
                                 f"Heat {d['number']} — {d['label']}\n\n" + "\n".join(lines) +
-                                "\n\nWritten like a marshal's correction. The original Race.json is kept "
-                                "(Restore original laps)."
-                                "\n\nFPVTrackside shows these laps after the event is reopened. Don't edit this "
-                                "heat in FPVTrackside before then, or the change is lost.") \
+                                ("\n\nMade in FPVTrackside through its REST API, as a marshal's correction: "
+                                 "it shows there at once. Restore original laps undoes it." if d["api"] else
+                                 "\n\nWritten like a marshal's correction. The original Race.json is kept "
+                                 "(Restore original laps)."
+                                 "\n\nFPVTrackside shows these laps after the event is reopened. Don't edit this "
+                                 "heat in FPVTrackside before then, or the change is lost.")) \
                 == QMessageBox.StandardButton.Yes:
             self.day.write(self.heat_id)
             self._detail_sig = None
 
     def _restore(self):
-        if QMessageBox.question(self, "Restore", "Put this heat's original laps back in FPVTrackside?") \
+        d = self.detail if self.heat_id else None
+        how = (" (through FPVTrackside's REST API — it undoes the changes made through it)" if d and d.get("api_writes")
+               else "")
+        if QMessageBox.question(self, "Restore", f"Put this heat's original laps back in FPVTrackside?{how}") \
                 == QMessageBox.StandardButton.Yes:
             self.day.restore(self.heat_id)
             self._detail_sig = None

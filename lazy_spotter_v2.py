@@ -42,7 +42,7 @@ import cv2
 from PyQt6.QtCore import QObject, Qt, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QApplication, QComboBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QPushButton, QSpinBox, QStackedWidget, QVBoxLayout, QWidget,
 )
 
@@ -544,8 +544,33 @@ class Main(QMainWindow):
             self.event_day = None
             return QMessageBox.critical(self, "Can't open the event", str(e))
         _save_app_settings(event_dir=folder)
+        st = _app_settings()
+        self.event_day.set_fpvtrackside(st.get("fpvtrackside_url") or "http://localhost:8080",
+                                        st.get("fpvtrackside_token") or os.environ.get("FPV_API_TOKEN"))
         self.event_page.open(self.event_day)
         self.show_page(self.event_page)
+
+    def set_fpvtrackside(self):
+        """Where FPVTrackside's web server is, and its API token (only needed
+        from another computer). Kept in the app's settings."""
+        st = _app_settings()
+        url, ok = QInputDialog.getText(
+            self, "FPVTrackside", "FPVTrackside's web server (Menu → Application Settings → Web → Auto start HTTP "
+            "Server).\nWith the FPVTrackside alpha (its REST API) and this event open there, lap changes are made in "
+            "FPVTrackside directly.\n\nAddress:", text=st.get("fpvtrackside_url") or "http://localhost:8080")
+        if not ok:
+            return
+        token, ok = QInputDialog.getText(
+            self, "FPVTrackside", "API token — only when FPVTrackside runs on another computer (a web user's API key, "
+            "or its FPV_API_TOKEN). Leave empty on the same computer:", text=st.get("fpvtrackside_token") or "")
+        if not ok:
+            return
+        url = url.strip() or "http://localhost:8080"
+        if "://" not in url:
+            url = "http://" + url
+        _save_app_settings(fpvtrackside_url=url, fpvtrackside_token=token.strip())
+        if self.event_day:
+            self.event_day.set_fpvtrackside(url, token.strip() or os.environ.get("FPV_API_TOKEN"))
 
     def stop_event(self):
         """Close the event / live track (EventPage's and LivePage's Close)."""

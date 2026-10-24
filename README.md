@@ -77,7 +77,23 @@ the video.
 - **Racing now · Next** (above the heat list): the race FPVTrackside is on and the
   next one, with their pilots.
 
-#### Making the changes in FPVTrackside
+#### With FPVTrackside's REST API (the FPVTrackside alpha)
+
+**FPVTrackside…** (top bar) sets where FPVTrackside's web server is (default
+`http://localhost:8080`; switch it on in FPVTrackside: *Menu → Application Settings → Web →
+Auto start HTTP Server*) and, only when FPVTrackside runs on another computer, its API
+token. The top bar shows what the app found:
+
+- **REST API ✓** — the alpha, with this event open: **Update laps in FPVTrackside** makes
+  the changes in FPVTrackside itself, through its API, one lap correction per pilot
+  (an added lap is placed after the pilot's previous crossing, so the two computers'
+  clocks don't matter). They show there at once; nothing has to be reopened. **Restore
+  original laps** undoes exactly those changes. Auto mode works the same way. A race
+  running is seen from FPVTrackside's race control.
+- **web server only** / **not reachable** — stock FPVTrackside: the changes go to its
+  files, as below.
+
+#### Making the changes in FPVTrackside (stock FPVTrackside)
 
 FPVTrackside (without its REST API, which only the alpha has) reads an event's files
 when the event opens and keeps them in memory: laps written by the app show in
