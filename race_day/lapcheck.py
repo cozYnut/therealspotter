@@ -104,13 +104,15 @@ def check_pilot(race: dict, dets: List[dict], to_clock, n_gates: int, offset: fl
     detections for this channel ({"t", "holeshot", "id"}); to_clock: video
     seconds → clock seconds. gray: video intervals with no picture (a flat
     gray feed); race_video: the race's start and end in video seconds.
-    Returns laps from both sides and the findings. With no picture for most
+    Returns laps from both sides, the findings, and `confirmed`: the timing
+    crossings the video showed (a crossing neither confirmed nor in a finding
+    wasn't checked — e.g. while there was no picture). With no picture for most
     of the race the run is "no video" and nothing is reported; otherwise
     nothing is reported while the picture is missing."""
     gray = gray or []
     if race_video and _share(gray, *race_video) >= NO_VIDEO_SHARE:
         return {"timing_laps": max(0, len(dets) - 1), "video_laps": 0, "matched": 0, "findings": [],
-                "no_video": True}
+                "no_video": True, "confirmed": []}
     passes = [p for p in race.get("passes", []) if p.get("gate_id", -1) >= 1]
     lo, hi = start - 2.0, end + 30.0
     bnd = []
@@ -189,7 +191,8 @@ def check_pilot(race: dict, dets: List[dict], to_clock, n_gates: int, offset: fl
     findings = [f for f in findings if f not in blind]
     findings.sort(key=lambda f: f["t"])
     return {"timing_laps": max(0, len(det) - 1), "video_laps": max(0, len(bnd) - 1),
-            "matched": len(md), "findings": findings, "no_video_findings": len(blind)}
+            "matched": len(md), "findings": findings, "no_video_findings": len(blind),
+            "confirmed": [det[i]["id"] for i in md]}        # the timing crossings the video showed
 
 
 def heat_offset(per_pilot_diffs: List[float]) -> Optional[float]:

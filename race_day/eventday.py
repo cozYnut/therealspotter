@@ -305,6 +305,8 @@ class EventDay:
                 "run": hs.get("runs", {}).get(ch, {}),
                 "checked": bool(check), "no_video": bool(check.get("no_video")),
                 "no_video_findings": check.get("no_video_findings", 0),
+                "confirmed": check.get("confirmed"),          # None: checked before this was recorded
+                "gray": self._gray(h.stem(ch)),
             }
         return {"id": h.id, "number": h.number, "label": h.label, "start": h.start, "end": h.end,
                 "status": hs.get("status", "new"), "pilots": pilots, "decisions": hs.get("decisions", {}),
@@ -394,6 +396,14 @@ class EventDay:
             return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
         except ValueError:
             return None
+
+    def _gray(self, stem: str) -> List[list]:
+        """A run's stretches with no picture (video seconds), from its picture.json."""
+        p = self.tp.runs_dir / f"{stem}.picture.json"
+        try:
+            return json.loads(p.read_text(encoding="utf-8")).get("gray", []) if p.exists() else []
+        except (OSError, ValueError):
+            return []
 
     def _open_findings(self, heat_id: str) -> int:
         hs = self.state["heats"].get(heat_id, {})

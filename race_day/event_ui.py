@@ -819,7 +819,17 @@ class EventPage(QWidget):
             removed = {m.get("detection_id") for m in d["marks"] if m["op"] == "remove"}
             n_gates = d.get("n_gates") or 0
             no_pic = p.get("no_video")
-            gates = (lambda a, b: None if no_pic else lap_gates(p["passes"], n_gates, a, b))
+            gray = p.get("gray") or []
+            in_gray = (lambda vt: vt is not None and any(a - 1.0 <= vt <= b + 1.0 for a, b in gray))
+
+            def gates(a, b):
+                """A lap's gates; none when the lap ended with no picture, marked when part of it had none."""
+                if no_pic or in_gray(b):
+                    return None
+                g = lap_gates(p["passes"], n_gates, a, b)
+                part = a is not None and b is not None and any(x < b and y > a for x, y in gray)
+                return (*g, True) if g and part else g
+            confirmed = p.get("confirmed")
             prev = prev_vt = None
             rows = []
             for i, x in enumerate(p["timing"]):
@@ -836,8 +846,12 @@ class EventPage(QWidget):
                     chk = (f"⚠ {f['reason']}" if not dec else f"{dec}: {f['reason']}")
                 elif p.get("no_video"):
                     chk = "no video"
-                elif p.get("checked"):
+                elif in_gray(x["video_t"]):
+                    chk = "📵 no picture then — not checked"
+                elif p.get("checked") and (confirmed is None or x["id"] in confirmed):
                     chk = "✓ seen in the video"
+                elif p.get("checked"):
+                    chk = "not checked by the video"
                 else:
                     chk = ""
                 rows.append((x["video_t"], x["t"], what, lap, chk,
@@ -880,10 +894,17 @@ class EventPage(QWidget):
                                       what, f"{lap:.2f}s" if lap else "", f"{g[0]}/{g[1]}" if g else "", chk])
                 it.setData(0, Qt.ItemDataRole.UserRole, data)
                 if g:
-                    it.setToolTip(5, "All gates seen in this lap" if not g[2] else
-                                  "Not seen in this lap: " + ", ".join(f"G{x}" for x in g[2]))
-                    if g[2]:
+                    part = len(g) > 3
+                    it.setToolTip(5, ("All gates seen in this lap" if not g[2] else
+                                      "Not seen in this lap: " + ", ".join(f"G{x}" for x in g[2]))
+                                  + (" — no picture for part of this lap" if part else ""))
+                    if g[2] and not part:
                         it.setForeground(5, QColor(255, 170, 60))
+                    elif part:
+                        it.setForeground(5, QColor(150, 150, 150))
+                if chk.startswith("📵") or chk.startswith("not checked"):
+                    for c in range(7):
+                        it.setForeground(c, QColor(150, 150, 150))
                 if chk.startswith("⚠"):
                     for c in range(7):
                         it.setForeground(c, QColor(255, 170, 60))
