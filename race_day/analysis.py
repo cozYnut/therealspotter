@@ -3,8 +3,9 @@ Analysis workers, in two pools:
 
   heavy  analysing videos — by default ONE process, which analyses a heat's
          pilots together (race_day/heat_analysis.py: the heat video decoded
-         once, YOLO and CLIP loaded once, YOLO batched over the pilots).
-         ~3 GB, where a process per pilot took ~3 GB each (11.6 GB for four).
+         once, by the hardware decoder; YOLO on the Neural Engine; only the
+         race; no YOLO for pilots with no picture). ~1.3 GB, where a process
+         per pilot took ~3 GB each (11.6 GB for four).
   light  labelling and learning — one process with no models (fast, ~0.1 GB),
          so they never wait behind a heat being analysed.
 
@@ -81,12 +82,16 @@ def _analyse_quad(video: str, rect, out_json: str, n_gates: int, log_path: str, 
     return {"seconds": round(time.time() - t0, 1), "device": _W["device"]}
 
 
-def _analyse_heat(video: str, runs: List[dict], n_gates: int) -> dict:
+def _analyse_heat(video: str, runs: List[dict], n_gates: int, window=None) -> dict:
     """The pilots `runs` of one heat video, together (race_day/heat_analysis.py).
-    runs: [{"stem", "rect", "out_json", "log"}] → {stem: {"seconds", "device"} or {"error"}}."""
+    runs: [{"stem", "rect", "out_json", "log"}]; window: (start, end) in video
+    seconds, or None for the whole video → {stem: {"seconds", "device"} or {"error"}}.
+    With the detector on the Neural Engine (Core ML), CLIP runs on the CPU: the
+    process then never starts PyTorch on the GPU (~1.5 GB)."""
     from race_day.heat_analysis import analyse_heat
-    res = analyse_heat(video, runs, _W["model"], n_gates, device=_W["device"], clip_device=_W["clip"],
-                       blank_memory=_blank_memory)
+    clip = "cpu" if _W["model"].endswith(".mlpackage") else _W["clip"]
+    res = analyse_heat(video, runs, _W["model"], n_gates, device=_W["device"], clip_device=clip,
+                       blank_memory=_blank_memory, window=window)
     for r in runs:
         got = res.get(r["stem"]) or {"error": "not analysed"}
         if "picture" in got:
@@ -133,12 +138,13 @@ class AnalysisPool:
         self.light = ProcessPoolExecutor(max_workers=1, mp_context=ctx)
         self.n = len(devices)
 
-    def submit_heat(self, video: Path, runs: List[dict], n_gates: int) -> Future:
+    def submit_heat(self, video: Path, runs: List[dict], n_gates: int, window=None) -> Future:
         """A heat video's pilots, analysed together. runs: [{"stem", "rect",
-        "out_json"}]; each pilot's log is <stem>.analysis.log next to its result."""
+        "out_json"}]; each pilot's log is <stem>.analysis.log next to its result.
+        window: (start, end) in video seconds — only that part (the race)."""
         runs = [dict(r, rect=tuple(r["rect"]), out_json=str(r["out_json"]),
                      log=str(Path(r["out_json"]).with_name(f"{r['stem']}.analysis.log"))) for r in runs]
-        return self.pool.submit(_analyse_heat, str(video), runs, n_gates)
+        return self.pool.submit(_analyse_heat, str(video), runs, n_gates, window)
 
     def submit(self, video: Path, out_json: Path, n_gates: int) -> Future:
         log = Path(out_json).with_name(Path(out_json).name.replace(".race_data.json", ".analysis.log"))

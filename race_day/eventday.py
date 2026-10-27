@@ -49,7 +49,7 @@ def _now():
 
 class EventDay:
     def __init__(self, event_dir=None, mode: str = "live", workers: int = 1, det_model: str = str(DEFAULT_DET_MODEL),
-                 clip_device: str = "mps", log: Callable[[str], None] = print, event=None):
+                 clip_device: str = "mps", log: Callable[[str], None] = print, event=None, use_coreml: bool = True):
         if event is not None:                             # live capture: trackside.TrackVideos
             self.event = event
         elif (Path(event_dir) / "Event.json").exists():
@@ -62,6 +62,7 @@ class EventDay:
         self.tp.dir.mkdir(exist_ok=True)
         self.tp.runs_dir.mkdir(exist_ok=True)
         self.workers, self.det_model, self.clip_device, self.log = workers, det_model, clip_device, log
+        self.use_coreml = use_coreml                      # the detector on the Neural Engine (race_day/models.py)
         self.lock = threading.RLock()
         self.cmds: "queue.Queue" = queue.Queue()
         self.state = {"event": self.event.name, "n_gates": None, "learned_from": [], "learned_at": None,
@@ -94,7 +95,7 @@ class EventDay:
     def start(self):
         from race_day.analysis import AnalysisPool
         from race_day.models import worker_devices
-        self.pool = AnalysisPool(worker_devices(Path(self.det_model), self.workers, False), self.clip_device)
+        self.pool = AnalysisPool(worker_devices(Path(self.det_model), self.workers, self.use_coreml), self.clip_device)
         self._thread.start()
 
     def stop(self):
@@ -547,13 +548,29 @@ class EventDay:
             for video, quads in by_video.items():
                 runs = [{"stem": h.stem(q.channel), "rect": q.rect, "out_json": self.tp.race_data(h.stem(q.channel))}
                         for q in quads]
-                fut = self.pool.submit_heat(video, runs, self._n_gates())
+                fut = self.pool.submit_heat(video, runs, self._n_gates(), self._race_window(h, quads[0].video))
                 for q in quads:
                     stem = h.stem(q.channel)
                     self.jobs[f"a:{stem}"] = ("analyse", h.id, fut, {"stem": stem, "channel": q.channel})
                     hs.setdefault("runs", {})[q.channel] = {"stem": stem, "status": "analysing", "kind": q.kind}
                     if hs.get("status") in (None, "new"):
                         hs["status"] = "analysing"
+
+    RACE_BEFORE_S, RACE_AFTER_S = 5.0, 30.0       # analysed around an FPVTrackside race (as the lap check looks)
+
+    def _race_window(self, h, video) -> Optional[tuple]:
+        """An FPVTrackside heat: only the race is analysed — from a few seconds
+        before the start to the end plus as long as the lap check looks for
+        late crossings (lapcheck: end + 30 s) — in video seconds. Other videos
+        (loose, recorded here) have no race times: the whole video."""
+        if not isinstance(self.event, trackside.Event) or not h.start or not h.end:
+            return None
+        try:
+            a = float(self.event.to_video(video, h.start)) - self.RACE_BEFORE_S
+            b = float(self.event.to_video(video, h.end)) + self.RACE_AFTER_S
+        except Exception:
+            return None
+        return (max(0.0, a), b) if b > a else None
 
     def _collect(self):
         """Finished jobs → next step."""

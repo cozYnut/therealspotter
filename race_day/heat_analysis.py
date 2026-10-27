@@ -1,50 +1,156 @@
 """
 A heat's pilots analysed together, in one process.
 
-An FPVTrackside heat (or a 2×2 recording) is ONE video with up to four
-pilots in it. Analysing each pilot in its own worker meant decoding the same
-video four times and loading PyTorch, YOLO and CLIP four times (~3 GB each).
-Here the video is decoded once: every frame is cut into the pilots' pictures
-(race_day/capture.cut_quad — exactly what QuadReader gives one pilot) and
-each picture goes to that pilot's own pipeline — the unchanged
-extract_race.run_race_extraction, one thread per pilot, with its own
-tracker, pass detector, camera motion and pass scorer. YOLO and CLIP are
-loaded once and shared, and YOLO looks at the pilots' pictures of the same
-moment in one call (a batch of up to four), which is cheaper on the GPU than
-four calls. A pilot's result is the same as analysing them alone.
+An FPVTrackside heat (or a 2×2 recording) is ONE video with up to four pilots
+in it. It is analysed in three stages that run at the same time:
 
-Measured on 2027Race1 heat 2 (four pilots, M5 Pro): 295 s and 3.15 GB, where
-four worker processes took 250 s and 11.6 GB and one took 498 s and 3.4 GB;
-all three found the same 228 passes.
+  decoder   reads the video once — with the Mac's hardware decoder
+            (VideoToolbox, through ffmpeg) when there is one, so the CPU is
+            left to the pilots — and cuts every kept frame into the pilots'
+            pictures (race_day/capture.cut_quad, what QuadReader gives one
+            pilot). Only the frames QuadReader would keep (at most 30 a second,
+            counted from the video's first frame), and for an FPVTrackside heat
+            only the race (from a few seconds before the start): the staging
+            before it isn't analysed.
+  detector  runs YOLO on each pilot's picture, a few moments ahead of the
+            pilots, so the detector and the pilots' work overlap. A pilot
+            whose picture has been gray (no signal) or still (crashed, landed,
+            waiting on the pad) for IDLE_S isn't run through YOLO until the
+            picture moves again: their tracker just sees no gates then.
+  pilots    one thread per pilot, each the unchanged
+            extract_race.run_race_extraction (its own tracker, pass detector,
+            camera motion and pass scorer), given its picture and its
+            detections. CLIP is loaded once and shared.
 
-  analyse_heat(video, runs, det_model, n_gates, device, clip_device)
+YOLO is the Core ML copy on the Neural Engine (race_day/models.py), one call
+per picture; with the .pt on the GPU the pilots' pictures of a moment go in
+one call instead.
+
+  analyse_heat(video, runs, det_model, n_gates, device, clip_device, window=…)
       runs: [{"stem", "rect", "out_json", "log"}] — the pilots to analyse
-      → {stem: {"seconds", "device"} or {"error"}}
+      window: (start, end) in video seconds — the part to analyse (None: all)
+      → {stem: {"seconds", "device", "picture"} or {"error"}}
 
 Each pilot keeps its own log (<stem>.analysis.log) and its own result file; a
 pilot whose analysis fails doesn't stop the others.
 """
 
+import bisect
 import contextlib
 import os
 import queue
+import shutil
+import subprocess
 import sys
 import threading
 import time
 import traceback
-from concurrent.futures import Future
-from typing import Dict, List
+import types
+from typing import Dict, List, Optional, Tuple
 
 import cv2
+import numpy as np
 
 from race_day.capture import cut_quad, frame_step, gray_intervals, no_picture
 
-QUEUE_FRAMES = 8          # pictures waiting per pilot (a few MB each): the decoder stays a little ahead
-BATCH_WAIT_S = 0.03       # how long the detector waits for the other pilots' pictures of a moment
+QUEUE_FRAMES = 8          # pictures waiting per pilot (a few MB each)
+AHEAD = 4                 # moments the decoder keeps ready for the detector
+DET_CONF, DET_MAX = 0.25, 50      # what extract_race asks the detector for
+IDLE_S = 2.0              # gray or still this long → no YOLO until the picture moves again
+STILL_DIFF = 1.5          # mean change of a 160×90 gray picture below this: still (flying is 10+)
+
+
+# ── reading the video ─────────────────────────────────────────────
+
+def frame_times(video: str) -> Optional[List[float]]:
+    """Every frame's time (s from the first frame, as OpenCV's
+    CAP_PROP_POS_MSEC gives it), from the container's index (ffprobe, no
+    decoding). None without ffprobe."""
+    if not shutil.which("ffprobe"):
+        return None
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time",
+                            "-of", "csv=p=0", str(video)], capture_output=True, text=True, timeout=120)
+        pts = sorted(float(x) for x in r.stdout.split() if x.strip() not in ("", "N/A"))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return [round(p - pts[0], 6) for p in pts] if pts else None
+
+
+def _kept(n: int, times: Optional[List[float]], src_fps: float, step: int, window) -> Tuple[int, int]:
+    """(first, last) frame index to analyse: every step-th frame counted from
+    frame 0, as QuadReader keeps them, inside the window."""
+    if not window:
+        return 0, n - 1
+    t0, t1 = window
+    if times:
+        i0, i1 = bisect.bisect_left(times, t0), bisect.bisect_right(times, t1) - 1
+    else:
+        i0, i1 = int(t0 * src_fps), int(t1 * src_fps)
+    i0 = max(0, i0 + (-i0) % step)                 # the next kept frame
+    return i0, min(n - 1, max(i0, i1))
+
+
+def _ffmpeg_frames(video: str, i0: int, i1: int, step: int, size: Tuple[int, int], hw: bool, times: List[float]):
+    """(t, frame) for frames i0, i0+step … i1, decoded by ffmpeg
+    (VideoToolbox when hw), converted like OpenCV does (BT.601). Frames before
+    i0 are decoded but not converted or sent. Raises if ffmpeg gives nothing."""
+    w, h = size
+    sel = f"select='between(n\\,{i0}\\,{i1})*not(mod(n-{i0}\\,{step}))'"
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
+    if hw:
+        cmd += ["-hwaccel", "videotoolbox"]
+    cmd += ["-i", str(video), "-an", "-vf", f"{sel},scale=in_color_matrix=bt601:in_range=tv",
+            "-fps_mode", "passthrough", "-frames:v", str((i1 - i0) // step + 1),
+            "-pix_fmt", "bgr24", "-f", "rawvideo", "pipe:1"]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=w * h * 3)
+    sent = 0
+    try:
+        nbytes = w * h * 3
+        i = i0
+        while True:
+            buf = p.stdout.read(nbytes)
+            if len(buf) < nbytes:
+                break
+            yield times[i], np.frombuffer(buf, np.uint8).reshape(h, w, 3)
+            sent += 1
+            i += step
+    finally:
+        p.stdout.close()
+        p.kill()
+        p.wait()
+    if not sent:
+        raise IOError(f"ffmpeg decoded nothing: {p.stderr.read().decode('utf-8', 'ignore')[-300:]}")
+
+
+def _opencv_frames(video: str, i0: int, i1: int, step: int):
+    """(t, frame), read the way QuadReader reads (the fallback without ffmpeg)."""
+    cap = cv2.VideoCapture(str(video))
+    try:
+        if i0:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, i0)
+        i = i0
+        while i <= i1:
+            ok, frame = cap.read()
+            if not ok:
+                return
+            yield cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0, frame
+            for _ in range(step - 1):
+                cap.grab()
+            i += step
+    finally:
+        cap.release()
+
+
+# ── the stages ────────────────────────────────────────────────────
+
+class _NoBoxes:
+    """YOLO's result for a picture it wasn't run on: no gates."""
+    boxes = ()
 
 
 class Feed:
-    """One pilot's pictures from the shared decoder, read like QuadReader:
+    """One pilot's pictures and detections, read like QuadReader:
     read() → (ok, frame), then .t; .fps, .frame_count, .rect, .step, .gray_t."""
 
     def __init__(self, rect, fps: float, frame_count: int, step: int):
@@ -52,14 +158,20 @@ class Feed:
         self.rect, self.fps, self.frame_count, self.step = tuple(rect), fps, frame_count, step
         self.t = 0.0
         self.gray_t: List[float] = []
+        self.result = _NoBoxes()                 # the detections of the picture read last
         self.closed = threading.Event()          # the pilot's pipeline stopped: no more pictures for it
+        # the detector's view of this pilot (only the detector thread uses these)
+        self.prev_small = None
+        self.idle_since: Optional[float] = None
 
     def read(self):
         item = self.q.get()
         if item is None:
             return False, None
-        self.t, crop = item
-        if no_picture(crop):
+        if isinstance(item, BaseException):      # the decoder or detector failed: so does this pilot
+            raise item
+        self.t, crop, gray, self.result = item
+        if gray:
             self.gray_t.append(self.t)
         return True, crop
 
@@ -74,86 +186,119 @@ class Feed:
     def release(self):
         self.closed.set()
 
-
-def decode(video: str, feeds: List[Feed], size=(960, 540)):
-    """Read the video once; each frame's pilot pictures go to their feeds."""
-    cap = cv2.VideoCapture(str(video))
-    step = feeds[0].step
-    try:
-        while not all(f.closed.is_set() for f in feeds):
-            ok, frame = cap.read()
-            if not ok:
-                break
-            t = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-            for _ in range(step - 1):             # skipped frames: decoded, not converted (as QuadReader)
-                cap.grab()
-            for f in feeds:
-                if not f.closed.is_set():
-                    f.put((t, cut_quad(frame, f.rect, size)))
-    finally:
-        cap.release()
-        for f in feeds:
-            f.put(None)
+    def idle(self, crop, gray: bool, t: float) -> bool:
+        """Gray or still for IDLE_S: the detector skips this picture."""
+        small = cv2.resize(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), (160, 90), interpolation=cv2.INTER_AREA)
+        still = gray or (self.prev_small is not None
+                         and float(cv2.absdiff(small, self.prev_small).mean()) < STILL_DIFF)
+        self.prev_small = small
+        if not still:
+            self.idle_since = None
+            return False
+        if self.idle_since is None:
+            self.idle_since = t
+        return t - self.idle_since >= IDLE_S
 
 
-class SharedDetector:
-    """One YOLO for all the pilots, called like YOLO (det(frame, **kw)[0]).
-    With batch, the pictures the pilots ask about at the same moment go to
-    the GPU in one call; each pilot gets its own picture's result."""
+class PilotDetector:
+    """What a pilot's pipeline calls as its YOLO: the detections the detector
+    stage already made for the picture it just read."""
 
-    def __init__(self, model_path: str, device, n: int, batch: bool = True):
-        from ultralytics import YOLO
-        self.yolo = YOLO(model_path)
-        self.model = self.yolo.model                 # .model.names, as extract_race reads it
-        self.device, self.batch = device, batch and n > 1
-        self.active = n
-        self.lock = threading.Lock()
-        self.requests: "queue.Queue" = queue.Queue()
-        if self.batch:
-            threading.Thread(target=self._serve, daemon=True).start()
+    def __init__(self, feed: Feed, model):
+        self.feed, self.model = feed, model         # .model.names, as extract_race reads it
 
     def __call__(self, frame, **kw):
-        if self.device:
-            kw["device"] = self.device
-        if not self.batch:
-            with self.lock:
-                return self.yolo(frame, **kw)
-        fut: Future = Future()
-        self.requests.put((frame, kw, fut))
-        return [fut.result()]
+        return [self.feed.result]
 
-    def pilot_done(self):
-        """A pilot's pipeline finished: the batch no longer waits for it."""
-        with self.lock:
-            self.active -= 1
 
-    def close(self):
-        if self.batch:
-            self.requests.put(None)
+class Detector:
+    """YOLO for every pilot's picture of every moment (see the module doc)."""
 
-    def _serve(self):
-        while True:
-            first = self.requests.get()
-            if first is None:
-                return
-            items = [first]
-            deadline = time.time() + BATCH_WAIT_S
-            while len(items) < max(1, self.active):
-                try:
-                    item = self.requests.get(timeout=max(0.0, deadline - time.time()))
-                except queue.Empty:
+    def __init__(self, model_path: str, device):
+        from ultralytics import YOLO
+        self.yolo = YOLO(model_path, task="detect")
+        # what extract_race reads the class names from (det.model.names). A Core ML YOLO's .model is only its
+        # path, and without the names every gate would be "class0"… — and a flagpole, which the pass detector
+        # and the pass scorer treat apart, would pass for a gate.
+        self.model = types.SimpleNamespace(names=dict(self.yolo.names))
+        self.coreml = str(model_path).endswith(".mlpackage")
+        self.kw = dict(conf=DET_CONF, max_det=DET_MAX, verbose=False)
+        if device and not self.coreml:
+            self.kw["device"] = device
+
+    def detect(self, crops: List[np.ndarray]) -> list:
+        if not crops:
+            return []
+        if self.coreml:                          # the Neural Engine: one picture per call (a fixed shape)
+            return [self.yolo(c, **self.kw)[0] for c in crops]
+        return list(self.yolo(crops, **self.kw))  # the GPU: the moment's pictures in one call
+
+    def run(self, moments: "queue.Queue", feeds: List[Feed], stopped: threading.Event):
+        try:
+            while True:
+                m = moments.get()
+                if m is None or isinstance(m, BaseException):
+                    end = m
                     break
-                if item is None:
-                    self.requests.put(None)          # handled after this batch
+                t, crops = m
+                live = [i for i, f in enumerate(feeds) if not f.closed.is_set()]
+                if not live:                     # every pilot stopped: nothing left to detect for
+                    end = None
                     break
-                items.append(item)
+                grays = {i: no_picture(crops[i]) for i in live}
+                todo = [i for i in live if not feeds[i].idle(crops[i], grays[i], t)]
+                results = dict(zip(todo, self.detect([crops[i] for i in todo])))
+                for i in live:
+                    feeds[i].put((t, crops[i], grays[i], results.get(i, _NoBoxes())))
+        except BaseException as e:               # every pilot gets the failure
+            end = e
+        finally:
+            stopped.set()                        # the decoder stops too
+        for f in feeds:
+            f.put(end)
+
+
+def decode(video: str, rects: List[tuple], span: Tuple[int, int], step: int, times: Optional[List[float]],
+           moments: "queue.Queue", stopped: threading.Event, size=(960, 540)):
+    """Read the kept frames once; each moment's pilot pictures go to the
+    detector. The hardware decoder when there is ffmpeg (and the frame index),
+    else OpenCV — also if ffmpeg fails before its first frame."""
+    def put(item) -> bool:
+        while not stopped.is_set():
             try:
-                results = self.yolo([f for f, _, _ in items], **items[0][1])
-                for (_, _, fut), r in zip(items, results):
-                    fut.set_result(r)
-            except Exception as e:                   # every pilot waiting on this batch gets the error
-                for _, _, fut in items:
-                    fut.set_exception(e)
+                moments.put(item, timeout=0.5)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    i0, i1 = span
+    try:
+        sent = False
+        if shutil.which("ffmpeg") and times:
+            try:
+                for t, frame in _ffmpeg_frames(video, i0, i1, step, _size(video), sys.platform == "darwin", times):
+                    sent = True
+                    if not put((t, [cut_quad(frame, r, size) for r in rects])):
+                        return
+            except Exception:
+                if sent:                         # failed halfway: the analysis can't be trusted
+                    raise
+        if not sent:
+            for t, frame in _opencv_frames(video, i0, i1, step):
+                if not put((t, [cut_quad(frame, r, size) for r in rects])):
+                    return
+        put(None)
+    except BaseException as e:
+        put(e)
+
+
+def _size(video: str) -> Tuple[int, int]:
+    cap = cv2.VideoCapture(str(video))
+    try:
+        return int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    finally:
+        cap.release()
 
 
 class SharedClip:
@@ -185,7 +330,7 @@ class _PerThreadOutput:
 
 
 def analyse_heat(video: str, runs: List[dict], det_model: str, n_gates: int, device="mps",
-                 clip_device: str = "mps", blank_memory=None, batch: bool = True) -> Dict[str, dict]:
+                 clip_device: str = "mps", blank_memory=None, window=None) -> Dict[str, dict]:
     """Analyse the pilots `runs` of one video together (see the module doc).
     blank_memory(n_gates) → a gate memory file for one pilot (deleted after)."""
     from extract_race import run_race_extraction
@@ -197,11 +342,17 @@ def analyse_heat(video: str, runs: List[dict], det_model: str, n_gates: int, dev
     n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
     step = frame_step(src_fps)
-    feeds = [Feed(r["rect"], src_fps / step, n_frames // step, step) for r in runs]
-    det = SharedDetector(det_model, device, len(runs), batch)
+    times = frame_times(video)
+    if times and len(times) != n_frames:            # the index and the decoder disagree: OpenCV reads it
+        times = None
+    i0, i1 = _kept(n_frames, times, src_fps, step, window)
+    feeds = [Feed(r["rect"], src_fps / step, (i1 - i0) // step + 1, step) for r in runs]
+    det = Detector(det_model, device)
     clip = SharedClip(clip_device)
     results: Dict[str, dict] = {}
     out, err = _PerThreadOutput(sys.stdout), _PerThreadOutput(sys.stderr)
+    moments: "queue.Queue" = queue.Queue(maxsize=AHEAD)
+    stopped = threading.Event()
 
     def pilot(run: dict, feed: Feed):
         mem = None
@@ -212,9 +363,10 @@ def analyse_heat(video: str, runs: List[dict], det_model: str, n_gates: int, dev
                 try:
                     run_race_extraction(str(video), det_model, mem, run["out_json"], clip_device=clip_device,
                                         gate_id_logic="greedy", det_device=device, reader=feed,
-                                        stem=run["stem"], det=det, clip=clip)
-                    results[run["stem"]] = {"seconds": round(time.time() - t0, 1), "device": device,
-                                            "picture": {"duration": round(feed.frame_count / feed.fps, 2),
+                                        stem=run["stem"], det=PilotDetector(feed, det.model), clip=clip)
+                    results[run["stem"]] = {"seconds": round(time.time() - t0, 1),
+                                            "device": "coreml" if det.coreml else device,
+                                            "picture": {"duration": round(n_frames // step / feed.fps, 2),
                                                         "gray": gray_intervals(feed.gray_t, 1.0 / feed.fps)}}
                 except Exception:
                     traceback.print_exc()                 # into this pilot's log
@@ -225,18 +377,17 @@ def analyse_heat(video: str, runs: List[dict], det_model: str, n_gates: int, dev
             results[run["stem"]] = {"error": f"{type(e).__name__}: {e}"}
         finally:
             feed.release()
-            det.pilot_done()
             if mem:
                 os.unlink(mem)
 
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         threads = [threading.Thread(target=pilot, args=(r, f), daemon=True) for r, f in zip(runs, feeds)]
+        threads.append(threading.Thread(target=det.run, args=(moments, feeds, stopped), daemon=True))
         for th in threads:
             th.start()
         try:
-            decode(video, feeds)
+            decode(video, [f.rect for f in feeds], (i0, i1), step, times, moments, stopped)
         finally:
             for th in threads:
                 th.join()
-            det.close()
     return results

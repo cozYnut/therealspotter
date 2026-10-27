@@ -251,13 +251,25 @@ On 52 reviewed runs of three tracks: 96.2% of passes found on time, 55 false
 passes, gate number right 98.7%.
 
 **A heat's pilots are analysed together** (`race_day/heat_analysis.py`), in one
-worker process: the heat video is decoded once and cut into the pilots' pictures,
-each pilot has its own pipeline (steps 2–3), YOLO and CLIP are loaded once, and
-YOLO looks at the pilots' pictures of the same moment in one call. The result per
-pilot is the same as analysing them one by one. Labelling and learning run in a
-second, light process. Measured on a four-pilot heat (M5 Pro): about 5 min and
-3.2 GB for the analysis, where a process per pilot took 4 min and 11.6 GB. Videos
-are analysed at most 30 frames a second (a 60 fps heat video: every 2nd frame).
+worker process, in three stages that run at the same time:
+
+- **decoding** — the heat video is read once, by the Mac's hardware decoder
+  (VideoToolbox, through ffmpeg; OpenCV without it), and cut into the pilots'
+  pictures; at most 30 frames a second (a 60 fps heat video: every 2nd frame),
+  and for an FPVTrackside heat only the race (from 5 s before the start to 30 s
+  after the end — the staging isn't analysed);
+- **the detector** — YOLO as a Core ML model on the **Neural Engine**
+  (`race_day/models.py`: exported once, at exactly the picture size the
+  analysis uses, fp16), running a few moments ahead of the pilots; a pilot whose
+  picture has been gray (no signal) or still (crashed, landed, on the pad) for
+  2 s gets no YOLO until it moves again;
+- **the pilots** — each its own pipeline (steps 2–3); CLIP is loaded once.
+
+Without Core ML the detector is the .pt on the GPU, the pilots' pictures of a
+moment in one call. On 2027Race1 (4 heats, 16 pilots) the laps and the lap check
+against LapRF match the GPU's (all 38 timing laps; one crossing it left unsure is
+now confirmed), and 98% of gate passes are within 0.5 s of it; the analysis uses
+about 1.3 GB. Labelling and learning run in a second, light process.
 
 ## Project structure
 
