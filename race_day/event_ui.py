@@ -434,6 +434,11 @@ class EventPage(QWidget):
                              "FPVTrackside shows written laps after the event is reopened; don't edit those\n"
                              "heats in FPVTrackside before then, or the change is lost.")
         self.auto.toggled.connect(lambda on: self.day and self.day.set_auto(on))
+        self.pause_race = QCheckBox("Pause during races")
+        self.pause_race.setToolTip("Stop analysing while FPVTrackside runs a race, so it has the computer to\n"
+                                   "itself (on), or keep analysing (off). Lap checks and writing laps to\n"
+                                   "FPVTrackside always wait for the race to end.")
+        self.pause_race.toggled.connect(lambda on: self.day and self.day.set_pause_in_race(on))
         self.status = QLabel("")
         self.status.setStyleSheet("color:#aaa")
         self.ft_btn = QPushButton("FPVTrackside…")
@@ -446,7 +451,7 @@ class EventPage(QWidget):
         self.fril_btn.clicked.connect(lambda: win.set_fril())
         stop = QPushButton("Close")
         stop.clicked.connect(lambda: win.stop_event())
-        for w in (self.title, self.learn_btn, self.auto):
+        for w in (self.title, self.learn_btn, self.auto, self.pause_race):
             top.addWidget(w)
         top.addWidget(self.status, 1)
         top.addWidget(self.ft_btn)
@@ -592,6 +597,10 @@ class EventPage(QWidget):
         self.auto.setChecked(bool(day.state.get("auto")))
         self.auto.blockSignals(False)
         self.auto.setVisible(day.mode == "live")
+        self.pause_race.blockSignals(True)
+        self.pause_race.setChecked(bool(day.state.get("pause_in_race", True)))
+        self.pause_race.blockSignals(False)
+        self.pause_race.setVisible(day.event.has_timing and day.mode != "capture")
         timing = day.event.has_timing
         for b in (self.b_accept, self.b_reject, self.b_add, self.b_remove, self.b_write, self.b_restore):
             b.setVisible(timing)
@@ -638,12 +647,18 @@ class EventPage(QWidget):
                         f"fril live: sent {time.strftime('%H:%M:%S', time.localtime(fr['last_ok']))}"
                         if fr["last_ok"] else "fril live: sending…")
         self.status.setText("   ·   ".join(bits))
-        self.banner.setVisible(st["paused"])
+        racing_on = st["race_running"] and not st["paused"] and st["mode"] != "capture"
+        self.banner.setVisible(st["paused"] or racing_on)
         if st["paused"]:
+            self.banner.setStyleSheet("background:#7a4b00;color:white;padding:4px")
             self.banner.setText("● Recording — analysis and learning wait until it stops" if st["mode"] == "capture"
                                 else "⏸  Race running in FPVTrackside — race_day is paused until it ends")
             if st["mode"] != "capture":
                 self.player.stop()
+        elif racing_on:
+            self.banner.setStyleSheet("background:#1e4e79;color:white;padding:4px")
+            self.banner.setText("▶  Race running in FPVTrackside — analysis goes on (pause during races is off); "
+                                "lap checks and writing laps wait for the race to end")
         self._fill_upnext()
         self._fill_heats()
         if self.heat_id:

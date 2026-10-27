@@ -10,7 +10,10 @@ Everything runs between races, by itself:
 
 When FPVTrackside starts a race, race_day pauses completely: the event folder
 isn't read (except to see the race end) and the worker processes are
-stopped (SIGSTOP), so FPVTrackside has the computer to itself.
+stopped (SIGSTOP), so FPVTrackside has the computer to itself. The pause can
+be switched off (set_pause_in_race): analysis then goes on during the race;
+only the lap check and writing laps — which open the heat files FPVTrackside
+may be saving — wait for the race to end, and are done then.
 
 With FPVTrackside's REST API (the FPVTrackside alpha on, race_day/ftapi.py)
 and the event open in FPVTrackside, lap changes go through the API instead
@@ -66,7 +69,7 @@ class EventDay:
         self.lock = threading.RLock()
         self.cmds: "queue.Queue" = queue.Queue()
         self.state = {"event": self.event.name, "n_gates": None, "learned_from": [], "learned_at": None,
-                      "auto": False, "offset": None, "heats": {}, "runs": {}}
+                      "auto": False, "pause_in_race": True, "offset": None, "heats": {}, "runs": {}}
         if self.tp.race_day_state.exists():
             try:
                 saved = json.loads(self.tp.race_day_state.read_text(encoding="utf-8"))
@@ -80,6 +83,8 @@ class EventDay:
             self.state["auto"] = False
         self.pool = None
         self.paused = False
+        self.race_on = False                              # a race is running in FPVTrackside (paused or not)
+        self._after_race: List[str] = []                  # heats whose lap check waits for the race to end
         self.learning: Optional[object] = None            # Future of the learn job
         self.jobs: Dict[str, tuple] = {}                  # key → (kind, heat id, Future, info)
         self.error: Optional[str] = None
@@ -124,6 +129,13 @@ class EventDay:
 
     def set_auto(self, on: bool):
         self.cmds.put(("auto", bool(on) and self.mode == "live"))
+
+    def set_pause_in_race(self, on: bool):
+        """Pause analysis while FPVTrackside runs a race (on), or go on (off).
+        Takes effect at the next look at the event (a few seconds)."""
+        with self.lock:
+            self.state["pause_in_race"] = bool(on)
+        self.cmds.put(("save",))
 
     def set_checked(self, heat_id: str, on: bool):
         """Tick / untick every pilot of a heat for learning."""
@@ -221,8 +233,9 @@ class EventDay:
     def status(self) -> dict:
         with self.lock:
             kinds = [j[0] for j in self.jobs.values()]
-            return {"event": self.event.name, "mode": self.mode, "race_running": bool(self.event.running),
-                    "paused": self.paused, "learned": labeling.is_learned(self.tp),
+            return {"event": self.event.name, "mode": self.mode, "race_running": bool(self.event.running) or self.race_on,
+                    "paused": self.paused, "pause_in_race": self.state.get("pause_in_race", True),
+                    "learned": labeling.is_learned(self.tp),
                     "n_gates": self.state["n_gates"], "learning": self.learning is not None,
                     "learn_waiting": self._learn_wait is not None,
                     "analysing": kinds.count("analyse"), "labelling": kinds.count("label"),
@@ -464,16 +477,25 @@ class EventDay:
         if self.ft_state["running"]:                  # FPVTrackside's own race control says so
             r["running"] = r["running"] or self.ft_state["race"] or "fpvtrackside"
         what = "Recording" if self.mode == "capture" else "Race running in FPVTrackside"
-        if r["running"] and not self.paused:
+        # a recording always pauses (it must never be choppy); an FPVTrackside race only with pause_in_race
+        pause = bool(r["running"]) and (self.mode == "capture" or self.state.get("pause_in_race", True))
+        if r["running"] and not self.race_on:
+            self.race_on = True
+            if not pause:
+                self.log(f"{what} — analysis goes on (pause during races is off)")
+        if pause and not self.paused:
             self.paused = True
             if self.pool:
                 self.pool.pause()
             self.log(f"{what} — paused")
-        elif not r["running"] and self.paused:
+        elif not pause and self.paused:
             self.paused = False
             if self.pool:
                 self.pool.resume()
-            self.log(f"{what} over — continuing")
+            self.log(f"{what} over — continuing" if not r["running"] else "Pause during races is off — continuing")
+        if not r["running"] and self.race_on:
+            self.race_on = False
+            self._race_over()
         if self.paused:
             return
         for hid in r["new"] + r["changed"]:
@@ -484,6 +506,15 @@ class EventDay:
             elif self.state["auto"] and hs.get("status") == "new":
                 self._submit_heat(hid)
         if r["new"]:
+            self._save()
+
+    def _race_over(self):
+        """The race ended: the lap checks (and Auto's corrections) that waited for it."""
+        waiting, self._after_race = self._after_race, []
+        for hid in dict.fromkeys(waiting):
+            self._check(hid)
+            self._auto_write(hid)
+        if waiting:
             self._save()
 
     def _handle_cmds(self):
@@ -711,7 +742,10 @@ class EventDay:
         be there (FPVTrackside saves a race from memory, over our write, when
         the event wasn't reopened in between)."""
         h = self.event.heats.get(hid)
-        if not h or (self.event.running and self.event.has_timing):   # don't open Race.json during a race
+        if not h:
+            return
+        if (self.event.running or self.race_on) and self.event.has_timing:   # don't open Race.json during a race:
+            self._after_race.append(hid)                                     # checked when it ends
             return
         timing = self.event.timing(h)
         before = {_change_id(c) for c in self.changes(hid)} if external else set()
@@ -838,6 +872,9 @@ class EventDay:
 
     def _auto_write(self, hid: str):
         if not self.state["auto"]:
+            return
+        if self.event.running or self.race_on:          # never during a race: after it (_race_over)
+            self._after_race.append(hid)
             return
         with self.lock:
             hs = self._heat(hid)
