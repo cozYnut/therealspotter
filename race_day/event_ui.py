@@ -47,6 +47,21 @@ def _who(channel: str, pilot: str) -> str:
     return channel if pilot in (None, "", "?", channel) else f"{channel} {pilot}"
 
 
+GATE_TOL_S = 0.5      # a lap's own start/finish pass may land just after its lap line (the antenna offset)
+
+
+def lap_gates(passes: List[dict], n_gates: int, t0: Optional[float], t1: Optional[float]) -> Optional[tuple]:
+    """The different gates a pilot passed in one lap — between the lap lines
+    at video times t0 and t1 — and the ones not seen: (seen, n_gates, missing).
+    None when it can't be told (no lap start, or the run's gates aren't
+    labelled yet). The lap's own start/finish pass is counted once: its end
+    (the pass at t1), not its start."""
+    if t0 is None or t1 is None or n_gates < 1 or not any(x.get("gate", -1) >= 1 for x in passes):
+        return None
+    seen = {x["gate"] for x in passes if x.get("gate", -1) >= 1 and t0 + GATE_TOL_S < x["t"] <= t1 + GATE_TOL_S}
+    return len(seen), n_gates, [g for g in range(1, n_gates + 1) if g not in seen]
+
+
 def step_text(st: dict) -> str:
     """A change as a marshal's step in FPVTrackside (two lines). Stock
     FPVTrackside's Lap Editor adds a lap only after the last one, so a lap in
@@ -473,7 +488,9 @@ class EventPage(QWidget):
         self.player.layout().insertWidget(1, self.legend)        # under the timeline
         vsplit.addWidget(self.player)
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["Video", "Clock", "Race time", "What", "Lap time", "Check"])
+        self.tree.setHeaderLabels(["Video", "Clock", "Race time", "What", "Lap time", "Gates", "Check"])
+        self.tree.headerItem().setToolTip(5, "Gates the video saw the pilot pass in this lap (hover a lap for the "
+                                             "ones not seen)")
         self.tree.headerItem().setToolTip(2, "Time from the race start: what FPVTrackside's replay shows")
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.tree.itemDoubleClicked.connect(self._jump)
@@ -789,7 +806,7 @@ class EventPage(QWidget):
                                     + (f" · {p['no_video_findings']} not checked (no picture then)"
                                        if p.get("no_video_findings") else "")
                                     + ("" if run.get("status") in (None, "analysed") else f" · {run.get('status')}"),
-                                    "", ""])
+                                    "", "", ""])
             head.setData(0, Qt.ItemDataRole.UserRole, {"channel": ch, "pilot_row": True})
             head.setFlags(head.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             head.setCheckState(0, Qt.CheckState.Checked if ch in d["learn_pilots"] else Qt.CheckState.Unchecked)
@@ -800,12 +817,16 @@ class EventPage(QWidget):
             self.tree.addTopLevelItem(head)
             flagged = {f.get("detection_id"): f for f in p["findings"] if f.get("detection_id")}
             removed = {m.get("detection_id") for m in d["marks"] if m["op"] == "remove"}
-            prev = None
+            n_gates = d.get("n_gates") or 0
+            no_pic = p.get("no_video")
+            gates = (lambda a, b: None if no_pic else lap_gates(p["passes"], n_gates, a, b))
+            prev = prev_vt = None
             rows = []
             for i, x in enumerate(p["timing"]):
                 f = flagged.get(x["id"])
                 lap = x["t"] - prev if prev is not None else None
-                prev = x["t"]
+                lap_g = None if x["holeshot"] else gates(prev_vt, x["video_t"])
+                prev, prev_vt = x["t"], x["video_t"]
                 what = "Holeshot" if x["holeshot"] else f"Lap {i}"
                 what += "  (manual)" if x["type"] == "Manual" else ""
                 if x["id"] in removed:
@@ -821,38 +842,56 @@ class EventPage(QWidget):
                     chk = ""
                 rows.append((x["video_t"], x["t"], what, lap, chk,
                              {"channel": ch, "detection_id": x["id"], "video_t": x["video_t"],
-                              "key": f["key"] if f else None, "race_t": x["race_t"]}))
+                              "key": f["key"] if f else None, "race_t": x["race_t"], "gates": lap_g}))
+            # a lap that isn't a LapRF lap starts at the lap line before it, whichever kind: LapRF's,
+            # one only the video saw, or one added by hand
+            line_vts = sorted([x["video_t"] for x in p["timing"] if x["id"] not in removed]
+                              + [f["video_t"] for f in p["findings"] if f.get("video_t") is not None
+                                 and (f["kind"] == "missed" or (f["kind"] == "unsure" and not f.get("detection_id")))]
+                              + [m["video_t"] for m in d["marks"] if m["channel"] == ch and m["op"] == "add"
+                                 and m.get("video_t") is not None])
+
+            def since_line(vt):
+                before = [t for t in line_vts if t < vt - GATE_TOL_S]
+                return gates(before[-1], vt) if before and vt is not None else None
             for f in p["findings"]:
                 if f["kind"] == "missed" or (f["kind"] == "unsure" and not f.get("detection_id")):
                     dec = d["decisions"].get(f"{ch}|{f['key']}")
                     rows.append((f.get("video_t"), f["t"], "Lap in the video, not in timing", f.get("lap_time"),
                                  (f"⚠ {f['reason']}" if not dec else f"{dec}: {f['reason']}"),
                                  {"channel": ch, "key": f["key"], "video_t": f.get("video_t"),
-                                  "race_t": f.get("race_t")}))
+                                  "race_t": f.get("race_t"),
+                                  "gates": None if f.get("holeshot") else since_line(f.get("video_t"))}))
             if not self.day.event.has_timing:                 # Replays without timing: the video's laps
                 for l in p.get("laps", []):
                     rows.append((l["t1"], l["t1"], f"Lap {l['lap']}", l["t1"] - l["t0"],
                                  "reviewed ✓" if p.get("reviewed") else "",
-                                 {"channel": ch, "video_t": l["t1"]}))
+                                 {"channel": ch, "video_t": l["t1"], "gates": gates(l["t0"], l["t1"])}))
             for mi, m in enumerate(d["marks"]):
                 if m["channel"] == ch and m["op"] == "add":
                     rows.append((m.get("video_t"), m["t"], "Lap added by hand", None, "will be written",
                                  {"channel": ch, "mark_index": mi, "video_t": m.get("video_t"),
-                                  "race_t": m["t"] - d["start"]}))
+                                  "race_t": m["t"] - d["start"], "gates": since_line(m.get("video_t"))}))
             for vt, ct, what, lap, chk, data in sorted(rows, key=lambda r: r[1]):
                 timed = self.day.event.has_timing
+                g = data.get("gates")
                 it = QTreeWidgetItem([_mmss(vt), _clock(ct) if timed else "",
                                       _mmss(data.get("race_t")) if timed and data.get("race_t") is not None else "",
-                                      what, f"{lap:.2f}s" if lap else "", chk])
+                                      what, f"{lap:.2f}s" if lap else "", f"{g[0]}/{g[1]}" if g else "", chk])
                 it.setData(0, Qt.ItemDataRole.UserRole, data)
+                if g:
+                    it.setToolTip(5, "All gates seen in this lap" if not g[2] else
+                                  "Not seen in this lap: " + ", ".join(f"G{x}" for x in g[2]))
+                    if g[2]:
+                        it.setForeground(5, QColor(255, 170, 60))
                 if chk.startswith("⚠"):
-                    for c in range(6):
+                    for c in range(7):
                         it.setForeground(c, QColor(255, 170, 60))
                 head.addChild(it)
                 if sel_key and data.get("key") == sel_key:
                     self.tree.setCurrentItem(it)
             head.setExpanded(True)
-        for c in range(5):
+        for c in range(6):
             self.tree.resizeColumnToContents(c)
         self.tree.blockSignals(False)
 

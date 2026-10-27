@@ -310,7 +310,7 @@ class EventDay:
                 "status": hs.get("status", "new"), "pilots": pilots, "decisions": hs.get("decisions", {}),
                 "marks": hs.get("marks", []), "written": hs.get("written", []),
                 "learn_pilots": hs.get("learn_pilots", []),
-                "changes": self.changes(heat_id), "todo": self.marshal_todo(heat_id),
+                "changes": self.changes(heat_id), "todo": self.marshal_todo(heat_id), "n_gates": self._n_gates(),
                 "done_in_fpvtrackside": hs.get("done_in_fpvtrackside", 0), "overwritten": hs.get("overwritten"),
                 "api_error": hs.get("api_error"), "api": bool(self.ft_state["serves"]),
                 "api_writes": sum(1 for w in hs.get("written", []) if w.get("via") == "api" and not w.get("undone")
