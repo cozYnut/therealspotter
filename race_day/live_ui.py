@@ -102,17 +102,15 @@ class LivePage(EventPage):
         self.split.insertWidget(idx, vs)
 
     def _build_heat_list(self):
-        """Several heats can be chosen for analysis."""
-        left = QWidget()
-        hv = QVBoxLayout(left)
-        hv.setContentsMargins(0, 0, 0, 0)
+        """Several heats can be chosen for analysis. The button goes under the
+        heat list, in the list's own panel (EventPage.left) — a second panel
+        would leave the first one empty in the splitter, taking the space
+        meant for the video."""
         self.heats.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        hv.addWidget(self.heats, 1)
         self.b_analyse_sel = QPushButton("Analyse selected heats")
         self.b_analyse_sel.setToolTip("Select heats in the list (⌘/Shift-click for several), then analyse them")
         self.b_analyse_sel.clicked.connect(self._analyse_selected)
-        hv.addWidget(self.b_analyse_sel)
-        self.split.insertWidget(0, left)
+        self.left.layout().addWidget(self.b_analyse_sel)
         self.split.setSizes([280, 1000])
         self.b_analyse.setText("Analyse this heat")
 

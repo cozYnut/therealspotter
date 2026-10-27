@@ -444,7 +444,7 @@ class EventPage(QWidget):
         v.addWidget(self.banner)
 
         split = self.split = QSplitter(Qt.Orientation.Horizontal)
-        left = QWidget()
+        left = self.left = QWidget()          # the heat list's side (LivePage adds its buttons here)
         lv = QVBoxLayout(left)
         lv.setContentsMargins(0, 0, 0, 0)
         self.upnext = QLabel("")               # FPVTrackside events: the race on now and the next one
