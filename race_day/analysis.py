@@ -1,17 +1,22 @@
 """
-Analysis workers: one process per channel, so a heat's 4 runs are analysed
-at the same time. Half the workers run the detector as Core ML (Neural
-Engine), half as .pt on the GPU — measured fastest on an M5 Pro.
+Analysis workers, in two pools:
+
+  heavy  analysing videos — by default ONE process, which analyses a heat's
+         pilots together (race_day/heat_analysis.py: the heat video decoded
+         once, YOLO and CLIP loaded once, YOLO batched over the pilots).
+         ~3 GB, where a process per pilot took ~3 GB each (11.6 GB for four).
+  light  labelling and learning — one process with no models (fast, ~0.1 GB),
+         so they never wait behind a heat being analysed.
 
 Each run goes through extract_race.run_race_extraction with a blank gate
 memory: this finds the passes (pass scorer) and their gate images; gate IDs
 and laps are added afterwards by labeling.py, once the track is learned.
 
-Everything heavy runs here, never in the app: analysing (a whole video, or
-one pilot's quadrant of an FPVTrackside heat video read in place), labelling
-and learning. pause() stops the worker processes outright (SIGSTOP) — used
-while FPVTrackside runs a race, so it has the computer to itself — and
-resume() lets them continue where they were.
+Everything heavy runs here, never in the app: analysing (a heat's pilots,
+read in place from the heat video), labelling and learning. pause() stops the
+worker processes outright (SIGSTOP) — used while FPVTrackside runs a race, so
+it has the computer to itself — and resume() lets them continue where they
+were.
 """
 
 import contextlib
@@ -76,6 +81,19 @@ def _analyse_quad(video: str, rect, out_json: str, n_gates: int, log_path: str, 
     return {"seconds": round(time.time() - t0, 1), "device": _W["device"]}
 
 
+def _analyse_heat(video: str, runs: List[dict], n_gates: int) -> dict:
+    """The pilots `runs` of one heat video, together (race_day/heat_analysis.py).
+    runs: [{"stem", "rect", "out_json", "log"}] → {stem: {"seconds", "device"} or {"error"}}."""
+    from race_day.heat_analysis import analyse_heat
+    res = analyse_heat(video, runs, _W["model"], n_gates, device=_W["device"], clip_device=_W["clip"],
+                       blank_memory=_blank_memory)
+    for r in runs:
+        got = res.get(r["stem"]) or {"error": "not analysed"}
+        if "picture" in got:
+            _write_picture(r["out_json"], r["stem"], got.pop("picture"))
+    return res
+
+
 def _write_picture(race_json, stem: str, data: dict):
     """<stem>.picture.json: when the pilot's feed had no picture (gray)."""
     Path(race_json).with_name(f"{stem}.picture.json").write_text(json.dumps(data), encoding="utf-8")
@@ -104,6 +122,7 @@ def _learn(track_dir: str, stems: List[str], n_gates: int, log_path: str, g1_tim
 
 class AnalysisPool:
     def __init__(self, devices: List[Tuple[str, Optional[str]]], clip_device: str = "mps"):
+        """devices: (model path, device) per heavy worker (models.worker_devices)."""
         ctx = mp.get_context("spawn")
         self._mgr = ctx.Manager()
         slots = self._mgr.Queue()
@@ -111,7 +130,15 @@ class AnalysisPool:
             slots.put(d)
         self.pool = ProcessPoolExecutor(max_workers=len(devices), mp_context=ctx,
                                         initializer=_init, initargs=(slots, clip_device))
+        self.light = ProcessPoolExecutor(max_workers=1, mp_context=ctx)
         self.n = len(devices)
+
+    def submit_heat(self, video: Path, runs: List[dict], n_gates: int) -> Future:
+        """A heat video's pilots, analysed together. runs: [{"stem", "rect",
+        "out_json"}]; each pilot's log is <stem>.analysis.log next to its result."""
+        runs = [dict(r, rect=tuple(r["rect"]), out_json=str(r["out_json"]),
+                     log=str(Path(r["out_json"]).with_name(f"{r['stem']}.analysis.log"))) for r in runs]
+        return self.pool.submit(_analyse_heat, str(video), runs, n_gates)
 
     def submit(self, video: Path, out_json: Path, n_gates: int) -> Future:
         log = Path(out_json).with_name(Path(out_json).name.replace(".race_data.json", ".analysis.log"))
@@ -123,15 +150,18 @@ class AnalysisPool:
 
     def submit_label(self, track_dir: Path, stems: List[str], quads=None) -> Future:
         """quads: stem → (video, rect), to record missing no-picture intervals."""
-        return self.pool.submit(_label, str(track_dir), list(stems), quads)
+        return self.light.submit(_label, str(track_dir), list(stems), quads)
 
     def submit_learn(self, track_dir: Path, stems: List[str], n_gates: int, g1_times=None) -> Future:
         log = Path(track_dir) / "learn.log"
-        return self.pool.submit(_learn, str(track_dir), list(stems), n_gates, str(log), g1_times)
+        return self.light.submit(_learn, str(track_dir), list(stems), n_gates, str(log), g1_times)
 
     def _pids(self) -> List[int]:
-        procs = getattr(self.pool, "_processes", None) or {}
-        return [p.pid for p in procs.values() if p.pid]
+        out = []
+        for ex in (self.pool, self.light):
+            procs = getattr(ex, "_processes", None) or {}
+            out += [p.pid for p in procs.values() if p.pid]
+        return out
 
     def pause(self):
         """Stop the workers where they are (no CPU, memory kept)."""
@@ -151,4 +181,5 @@ class AnalysisPool:
     def shutdown(self, wait: bool = True):
         self.resume()
         self.pool.shutdown(wait=wait, cancel_futures=not wait)
+        self.light.shutdown(wait=wait, cancel_futures=not wait)
         self._mgr.shutdown()

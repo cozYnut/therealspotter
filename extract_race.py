@@ -108,14 +108,20 @@ def run_race_extraction(
     reader=None,
     stem: Optional[str] = None,
     track=None,
+    det=None,
+    clip=None,
 ):
     """reader: something with read() → (ok, frame), .t (seconds), .fps,
     .frame_count and release() — e.g. race_day.capture.QuadReader for one
     pilot's quadrant of a heat video, read in place. Default: the whole video.
     track: the TrackPaths whose learned timing labels the gates (default: the
-    track the output file is in)."""
-    print(f"Loading detector: {det_model_path}")
-    det = YOLO(det_model_path)
+    track the output file is in). det / clip: an already loaded detector
+    (called like YOLO's, with .model.names) and CLIP embedder (.embed_bgr) to
+    use instead of loading them — a heat's four pilots share one of each
+    (race_day/heat_analysis.py)."""
+    if det is None:
+        print(f"Loading detector: {det_model_path}")
+        det = YOLO(det_model_path)
     # a Core ML model (.mlpackage) picks its own hardware; a .pt runs on det_device
     # (Ultralytics' default is the CPU, even on Apple Silicon)
     det_kw = {} if str(det_model_path).endswith(".mlpackage") or not det_device else {"device": det_device}
@@ -125,7 +131,8 @@ def run_race_extraction(
     _cfg = pipeline_cfg.load()
     tracker = TimeTracker(**pipeline_cfg.tracker_kwargs(_cfg))
     passdet = PassDetector(**pipeline_cfg.gates_passdet_kwargs(_cfg))
-    clip = ClipEmbedder(device=clip_device)
+    if clip is None:
+        clip = ClipEmbedder(device=clip_device)
 
     gatedb = GateDB(
         sim_thresh=sim_thresh, require_same_type=require_same_type,

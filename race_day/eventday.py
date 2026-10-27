@@ -48,7 +48,7 @@ def _now():
 
 
 class EventDay:
-    def __init__(self, event_dir=None, mode: str = "live", workers: int = 4, det_model: str = str(DEFAULT_DET_MODEL),
+    def __init__(self, event_dir=None, mode: str = "live", workers: int = 1, det_model: str = str(DEFAULT_DET_MODEL),
                  clip_device: str = "mps", log: Callable[[str], None] = print, event=None):
         if event is not None:                             # live capture: trackside.TrackVideos
             self.event = event
@@ -526,16 +526,34 @@ class EventDay:
             if any(j[1] == hid for j in self.jobs.values()):
                 return
             hs["status"] = "analysing"
+            self._submit_runs(h, [c for c in h.pilots], force)
+        self._after_analysis(hid)
+
+    def _submit_runs(self, h, channels: List[str], force: bool = False):
+        """Analyse these pilots of heat h: one job per video (a heat is one
+        2×2 video, plus one for its DJI pilots), its pilots analysed together
+        (race_day/heat_analysis.py). Pilots already analysed or being analysed
+        are left out unless force."""
+        by_video: Dict[str, list] = {}
+        with self.lock:
+            hs = self._heat(h.id)
             for q in h.quads:
-                if q.channel not in h.pilots:
+                if q.channel not in channels or q.channel not in h.pilots:
                     continue
                 stem = h.stem(q.channel)
-                if not force and self.tp.race_data(stem).exists():
+                if f"a:{stem}" in self.jobs or (not force and self.tp.race_data(stem).exists()):
                     continue
-                fut = self.pool.submit_quad(q.video, q.rect, self.tp.race_data(stem), self._n_gates(), stem)
-                self.jobs[f"a:{stem}"] = ("analyse", hid, fut, {"stem": stem, "channel": q.channel})
-                hs["runs"][q.channel] = {"stem": stem, "status": "analysing", "kind": q.kind}
-        self._after_analysis(hid)
+                by_video.setdefault(str(q.video), []).append(q)
+            for video, quads in by_video.items():
+                runs = [{"stem": h.stem(q.channel), "rect": q.rect, "out_json": self.tp.race_data(h.stem(q.channel))}
+                        for q in quads]
+                fut = self.pool.submit_heat(video, runs, self._n_gates())
+                for q in quads:
+                    stem = h.stem(q.channel)
+                    self.jobs[f"a:{stem}"] = ("analyse", h.id, fut, {"stem": stem, "channel": q.channel})
+                    hs.setdefault("runs", {})[q.channel] = {"stem": stem, "status": "analysing", "kind": q.kind}
+                    if hs.get("status") in (None, "new"):
+                        hs["status"] = "analysing"
 
     def _collect(self):
         """Finished jobs → next step."""
@@ -548,6 +566,9 @@ class EventDay:
                 res, err = None, f"{type(e).__name__}: {e}"
             else:
                 err = None
+            if kind == "analyse" and not err:          # a heat job: each pilot has its own result
+                res = (res or {}).get(info["stem"]) or {"error": "not analysed"}
+                err = res.get("error")
             with self.lock:
                 hs = self._heat(hid)
                 if kind == "analyse":
@@ -597,26 +618,14 @@ class EventDay:
         analysed first (if they aren't yet), then learned from."""
         with self.lock:
             self.state["n_gates"] = n_gates
+        by_heat: Dict[str, List[str]] = {}
         for hid, ch in runs:
-            self._submit_quad(hid, ch)
+            by_heat.setdefault(hid, []).append(ch)
+        for hid, chs in by_heat.items():                 # a heat's chosen pilots analysed together
+            if hid in self.event.heats:
+                self._submit_runs(self.event.heats[hid], chs)
         self._learn_wait = {"runs": runs, "n_gates": n_gates}
         self.log(f"Learning the track ({n_gates} gates) from {len(runs)} pilot runs…")
-
-    def _submit_quad(self, hid: str, channel: str):
-        h = self.event.heats.get(hid)
-        q = self._quad(h, channel)
-        if not q:
-            return
-        stem = h.stem(channel)
-        if self.tp.race_data(stem).exists() or f"a:{stem}" in self.jobs:
-            return
-        with self.lock:
-            hs = self._heat(hid)
-            fut = self.pool.submit_quad(q.video, q.rect, self.tp.race_data(stem), self._n_gates(), stem)
-            self.jobs[f"a:{stem}"] = ("analyse", hid, fut, {"stem": stem, "channel": channel})
-            hs.setdefault("runs", {})[channel] = {"stem": stem, "status": "analysing", "kind": q.kind}
-            if hs.get("status") in (None, "new"):
-                hs["status"] = "analysing"
 
     def _run_learn(self, runs: List[tuple], n_gates: int):
         """Learn from the chosen runs. With FPVTrackside's timing, each run's

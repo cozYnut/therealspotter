@@ -161,6 +161,24 @@ def sample_no_picture(path, rect, every: float = 1.0) -> dict:
     return {"duration": round(dur, 2), "gray": gray_intervals(gray, every)}
 
 
+def cut_quad(frame, rect, size=(960, 540)):
+    """One pilot's picture from a video frame: the quadrant `rect` (x, y, w, h
+    as fractions of the frame), scaled to `size`. QuadReader and the heat
+    decoder (race_day/heat_analysis.py) both cut with this, so a pilot gets
+    the same picture whichever reads the video."""
+    H, W = frame.shape[:2]
+    x, y, w, h = rect
+    crop = frame[int(round(y * H)):int(round((y + h) * H)), int(round(x * W)):int(round((x + w) * W))]
+    if size and (crop.shape[1], crop.shape[0]) != tuple(size):
+        crop = cv2.resize(crop, tuple(size), interpolation=cv2.INTER_AREA)
+    return crop
+
+
+def frame_step(src_fps: float, max_fps: float = 31.0) -> int:
+    """Every n-th frame keeps a video at most max_fps (a 60 fps heat video: 2)."""
+    return max(1, int(round((src_fps or 30.0) / max_fps)))
+
+
 class QuadReader:
     """One pilot's picture from a video, read in place (no copy is made):
     the quadrant `rect` (x, y, w, h as fractions of the frame) scaled to
@@ -174,7 +192,7 @@ class QuadReader:
         if not self.cap.isOpened():
             raise IOError(f"cannot open video: {path}")
         src_fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
-        self.step = max(1, int(round(src_fps / max_fps)))
+        self.step = frame_step(src_fps, max_fps)
         self.fps = src_fps / self.step
         self.frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT)) // self.step
         self.rect, self.size = tuple(rect), tuple(size) if size else None
@@ -188,11 +206,7 @@ class QuadReader:
         self.t = self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
         for _ in range(self.step - 1):            # skipped frames: decoded, not converted
             self.cap.grab()
-        H, W = frame.shape[:2]
-        x, y, w, h = self.rect
-        crop = frame[int(round(y * H)):int(round((y + h) * H)), int(round(x * W)):int(round((x + w) * W))]
-        if self.size and (crop.shape[1], crop.shape[0]) != self.size:
-            crop = cv2.resize(crop, self.size, interpolation=cv2.INTER_AREA)
+        crop = cut_quad(frame, self.rect, self.size)
         if no_picture(crop):
             self.gray_t.append(self.t)
         return True, crop
