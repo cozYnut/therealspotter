@@ -32,6 +32,8 @@ from typing import Optional
 RESEND_S = 60.0          # fril shows the list while it's fresh (3 min): re-sent this often
 RETRY_S = 10.0           # after a failed send, the next try
 TIMEOUT = 5.0
+# fril.co.il is behind Cloudflare, which refuses Python's own "Python-urllib/…" (HTTP 403)
+USER_AGENT = "LazySpotter/2 (race-day app)"
 MAX_RACES = 30           # what fril keeps
 
 
@@ -99,7 +101,8 @@ class FrilLive:
         while True:
             p = self._q.get()
             req = urllib.request.Request(self.url, data=json.dumps(p).encode(), method="PUT",
-                                         headers={"Content-Type": "application/json; charset=utf-8"})
+                                         headers={"Content-Type": "application/json; charset=utf-8",
+                                                  "User-Agent": USER_AGENT})
             try:
                 with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
                     r.read()
@@ -107,7 +110,8 @@ class FrilLive:
                     self.log("fril live: sending again")
                 self.last_ok, self.error = time.time(), None
             except urllib.error.HTTPError as e:
-                self._failed("the token was refused (HTTP 401)" if e.code == 401 else f"HTTP {e.code}")
+                self._failed("the token was refused (HTTP 401)" if e.code == 401 else
+                             "blocked by fril's firewall (HTTP 403)" if e.code == 403 else f"HTTP {e.code}")
             except (urllib.error.URLError, OSError) as e:
                 self._failed(str(getattr(e, "reason", e)))
 
