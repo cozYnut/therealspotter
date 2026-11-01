@@ -257,7 +257,8 @@ class HeatPlayer(QWidget):
         self.which.blockSignals(True)
         self.which.clear()
         for vpath in videos:
-            self.which.addItem("DJI feeds" if vpath.endswith("3.mp4") else "Analog 2×2", vpath)
+            dji = any(q.get("kind") == "dji" for q in quads.get(vpath, []))
+            self.which.addItem("DJI feeds" if dji else "Analog 2×2", vpath)
         self.which.setVisible(len(videos) > 1)
         self.which.blockSignals(False)
         self._open(videos[0] if videos else None)
@@ -747,7 +748,7 @@ class EventPage(QWidget):
             quads = {}
             for ch, p in d["pilots"].items():
                 quads.setdefault(p["quad"]["video"], []).append({"rect": p["quad"]["rect"], "channel": ch,
-                                                                 "pilot": p["pilot"]})
+                                                                 "pilot": p["pilot"], "kind": p["quad"]["kind"]})
             self.player.load(d["videos"], quads, {ch: [x["video_t"] for x in p["timing"]] for ch, p in d["pilots"].items()})
         if sig == self._detail_sig and not load_video:
             return

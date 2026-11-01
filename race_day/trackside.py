@@ -4,9 +4,10 @@ An FPVTrackside event folder, read without disturbing FPVTrackside.
 FPVTrackside keeps one folder per heat inside the event folder:
 
     <event>/Event.json, Pilots.json, Rounds.json, Stages.json
-    <event>/<heat id>/2.mp4               the analog 2×2 grid (one quadrant per channel)
-                      2.recordinfo.xml    channel → quadrant, and the clock time of every frame
-                      3.mp4 + .xml        a second grid (DJI feeds) when the heat had DJI pilots
+    <event>/<heat id>/N.mp4               a 2×2 grid (one quadrant per channel); N is the
+                                          video source's number in FPVTrackside (2, 0, …)
+                      N.recordinfo.xml    channel → quadrant, and the clock time of every frame
+                      M.mp4 + .xml        a second grid (DJI feeds) when the heat had DJI pilots
                       Race.json           pilots, channels, timing detections and laps
 
 race_day's own data lives in <event>/lazySpotter/ — nothing else in the event
@@ -39,9 +40,9 @@ OLD_SUBDIR = "race_day"    # where it was before 2026-10-22 (only the Race.json 
 STABLE_S = 10.0          # a file must be unchanged this long before it's opened
 NEVER = "0001/01/01"     # FPVTrackside's "no time" (a heat that wasn't flown)
 
-# files looked at in every heat folder (stat only)
-_HEAT_FILES = ("Race.json", "2.mp4", "2.recordinfo.xml", "2.recordinfo.xml.bak",
-               "3.mp4", "3.recordinfo.xml", "3.recordinfo.xml.bak")
+# files looked at in every heat folder (stat only): Race.json and the videos,
+# named by their video source's number (2.mp4, 0.mp4…)
+_HEAT_FILE = re.compile(r"^(Race\.json|\d+\.mp4|\d+\.recordinfo\.xml(\.bak)?)$")
 _EVENT_FILES = ("Event.json", "Pilots.json", "Rounds.json", "Stages.json")
 
 
@@ -91,7 +92,7 @@ class Quad:
     channel: str                   # display name: R1, R6, DR8…
     video: Path                    # the heat's video file (read in place)
     rect: Tuple[float, float, float, float]   # x, y, w, h — fractions of the frame
-    kind: str                      # "analog" (2.mp4) or "dji" (3.mp4)
+    kind: str                      # "analog" or "dji" (a grid of DJI feeds)
 
 
 @dataclass
@@ -259,10 +260,16 @@ class Event:
         for name in names:
             d = self.dir / name
             files = {}
-            for fn in _HEAT_FILES:
-                s = _stat(d / fn)
-                if s:
-                    files[fn] = s
+            try:
+                for e in os.scandir(d):
+                    if _HEAT_FILE.match(e.name):
+                        try:
+                            st = e.stat()
+                            files[e.name] = (st.st_size, st.st_mtime)
+                        except OSError:
+                            pass
+            except OSError:
+                pass
             sig = tuple(sorted((k, v) for k, v in files.items()))
             f = self._folders.get(name)
             if f is None:                            # first sight: trust the files' own times
@@ -272,11 +279,11 @@ class Event:
                 f.sig, f.changed_at, f.files = sig, now, files
             recording = any(k.endswith(".mp4") for k in files) and now - f.changed_at < STABLE_S
             unfinished = any(k.endswith(".recordinfo.xml.bak") and k[:-4] not in files
-                             and k[:1] + ".mp4" in files for k in files) and now - f.changed_at < 120
+                             and k.split(".")[0] + ".mp4" in files for k in files) and now - f.changed_at < 120
             if recording or unfinished:
                 running = name
-            elif "2.mp4" in files and "2.recordinfo.xml" in files and "Race.json" in files \
-                    and now - f.changed_at >= STABLE_S:
+            elif "Race.json" in files and any(k.endswith(".mp4") and k[:-4] + ".recordinfo.xml" in files
+                                              for k in files) and now - f.changed_at >= STABLE_S:
                 ready.append(name)
         self.running = running
         new, changed = [], []
@@ -314,24 +321,25 @@ class Event:
         pilots = {self.channel_name(pc["Channel"]): self.pilot_names.get(pc["Pilot"], "?")
                   for pc in race.get("PilotChannels") or [] if pc.get("Channel") and pc.get("Pilot")}
         quads = []
-        for n, kind in (("2", "analog"), ("3", "dji")):
-            if (d / f"{n}.mp4").exists() and (d / f"{n}.recordinfo.xml").exists():
-                quads += self._read_bounds(d / f"{n}.recordinfo.xml", d / f"{n}.mp4", kind)
+        for fn in sorted((k for k in self._folders[name].files if k.endswith(".mp4")), key=lambda k: int(k[:-4])):
+            if (d / fn).exists() and (d / f"{fn[:-4]}.recordinfo.xml").exists():
+                quads += self._read_bounds(d / f"{fn[:-4]}.recordinfo.xml", d / fn)
         if not quads:
             return None
         return Heat(id=name, dir=d, start=start, end=end, stage=self.stages.get(rnd.get("Stage"), ""),
                     round=rnd.get("RoundNumber"), race=race.get("RaceNumber"), pilots=pilots, quads=quads,
                     sig=self._folders[name].sig)
 
-    def _read_bounds(self, xml: Path, video: Path, kind: str) -> List[Quad]:
-        """Channel → quadrant from the head of a recordinfo.xml (before its frame list)."""
+    def _read_bounds(self, xml: Path, video: Path) -> List[Quad]:
+        """Channel → quadrant from the head of a recordinfo.xml (before its frame list).
+        A grid of DJI channels ('DJIO4 R8') is a "dji" video, any other "analog"."""
         try:
             with open(xml, "rb") as f:
                 head = f.read(64 * 1024).decode("utf-8", "ignore")
         except OSError:
             return []
         head = head.split("<FrameTimes>")[0]
-        out = []
+        found = []
         for b in re.findall(r"<VideoBounds>(.*?)</VideoBounds>", head, re.S):
             ch = re.search(r"<Channel>([^<]*)</Channel>", b)
             vals = [re.search(rf"<{k}>([^<]*)</{k}>", b) for k in ("X", "Y", "Width", "Height")]
@@ -339,8 +347,9 @@ class Event:
                 continue
             name = self._recordinfo_channel(ch.group(1))
             if name:
-                out.append(Quad(name, video, tuple(float(v.group(1)) for v in vals), kind))
-        return out
+                found.append((ch.group(1).strip(), name, tuple(float(v.group(1)) for v in vals)))
+        kind = "dji" if found and all(text.upper().startswith("DJI") for text, _, _ in found) else "analog"
+        return [Quad(name, video, rect, kind) for _, name, rect in found]
 
     # ── per-heat data (only for finished heats) ──────────────────
 
