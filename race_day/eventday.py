@@ -85,6 +85,7 @@ class EventDay:
         self.paused = False
         self.race_on = False                              # a race is running in FPVTrackside (paused or not)
         self._after_race: List[str] = []                  # heats whose lap check waits for the race to end
+        self._retried: set = set()                        # stuck heats labelled again (once per session)
         self.learning: Optional[object] = None            # Future of the learn job
         self.jobs: Dict[str, tuple] = {}                  # key → (kind, heat id, Future, info)
         self.error: Optional[str] = None
@@ -173,7 +174,7 @@ class EventDay:
         q = self._quad(h, channel)
         if not q:
             return
-        clock = float(self.event.to_clock(q.video, video_t)) + (self.state.get("offset") or 0.0)
+        clock = float(self.event.to_clock(q.video, video_t)) + self._offset(heat_id)
         with self.lock:
             self._heat(heat_id).setdefault("marks", []).append(
                 {"op": "add", "channel": channel, "t": round(clock, 3), "video_t": round(video_t, 3), "by": "hand"})
@@ -305,7 +306,7 @@ class EventDay:
             race = self._race(h.stem(ch))
             pilots[ch] = {
                 "pilot": h.pilots[ch], "quad": {"video": str(q.video), "rect": q.rect, "kind": q.kind},
-                "timing": [{"t": d["t"], "video_t": float(self.event.to_video(q.video, d["t"] - (self.state["offset"] or 0))),
+                "timing": [{"t": d["t"], "video_t": float(self.event.to_video(q.video, d["t"] - self._offset(heat_id))),
                             "id": d["id"], "holeshot": d["holeshot"], "type": d["type"], "lap": d.get("lap"),
                             "race_t": d["t"] - h.start} for d in dets],
                 "video_g1": [p["t"] for p in lapcheck.g1_passes(race)] if race else [],
@@ -388,7 +389,7 @@ class EventDay:
                                 "race_t": d["t"] - h.start,
                                 "lap": d.get("lap") if d.get("lap") is not None else first + k,
                                 "lap_time": d["t"] - dets[k - 1]["t"] if k else None, "detection_id": d["id"]})
-        off = self.state.get("offset") or 0.0
+        off = self._offset(heat_id)
         for st in out:
             q = self._quad(h, st["channel"])
             st["video_t"] = float(self.event.to_video(q.video, st["t"] - off)) if q else None
@@ -398,6 +399,13 @@ class EventDay:
 
     def _heat(self, heat_id: str) -> dict:
         return self.state["heats"].setdefault(heat_id, {"status": "new", "runs": {}})
+
+    def _offset(self, heat_id: str) -> float:
+        """Timing − video at the start/finish: the heat's own (measured in its
+        lap check), else the event's."""
+        with self.lock:
+            off = self.state["heats"].get(heat_id, {}).get("offset")
+            return off if off is not None else (self.state.get("offset") or 0.0)
 
     @staticmethod
     def _quad(h, channel):
@@ -505,8 +513,26 @@ class EventDay:
                 self._check(hid, external=True)       # Race.json changed (a marshal edit): check again
             elif self.state["auto"] and hs.get("status") == "new":
                 self._submit_heat(hid)
+        if not r["running"]:
+            self._unstick()
         if r["new"]:
             self._save()
+
+    def _unstick(self):
+        """A heat analysed but never checked (its check was waiting for a race
+        when the app closed, or its labelling failed) is labelled — and so
+        checked — again, once per session."""
+        if self.learning is not None or not labeling.is_learned(self.tp):
+            return
+        busy = {j[1] for j in self.jobs.values()} | set(self._after_race)
+        with self.lock:
+            stuck = [hid for hid, hs in self.state["heats"].items()
+                     if hs.get("status") == "analysed" and hid in self.event.heats
+                     and hid not in busy and hid not in self._retried]
+        for hid in stuck:
+            self._retried.add(hid)
+            self.log(f"heat {self.event.heats[hid].number}: analysed but not checked — labelling it again")
+            self._submit_label(hid)
 
     def _race_over(self):
         """The race ended: the lap checks (and Auto's corrections) that waited for it."""
@@ -690,7 +716,6 @@ class EventDay:
         lap crossings are passed in as known G1 moments (any run with one
         full lap is enough, and learning is much faster)."""
         stems, g1 = [], {}
-        offset = self.state.get("offset") or 0.0
         for hid, ch in runs:
             h = self.event.heats.get(hid)
             if not h or not self.tp.race_data(h.stem(ch)).exists():
@@ -699,7 +724,7 @@ class EventDay:
             q = self._quad(h, ch)
             if self.event.has_timing and q:
                 dets = self.event.timing(h).get(ch, [])
-                g1[h.stem(ch)] = [float(self.event.to_video(q.video, d["t"] - offset)) for d in dets]
+                g1[h.stem(ch)] = [float(self.event.to_video(q.video, d["t"] - self._offset(hid))) for d in dets]
         if not stems:
             self.log("Nothing analysed to learn from")
             return
@@ -754,17 +779,20 @@ class EventDay:
             self._overwritten(hid, timing)
         races = {c: self._race(h.stem(c)) for c in h.pilots}
         q_of = {q.channel: q for q in h.quads}
-        if self.state["offset"] is None:                      # the timing antenna vs the visual gate
-            diffs = []
-            for c, race in races.items():
-                if race and c in q_of:
-                    vc = [float(self.event.to_clock(q_of[c].video, p["t"])) for p in lapcheck.g1_passes(race)]
-                    diffs += lapcheck.pairs_offset([d["t"] for d in timing.get(c, [])], vc)
-            off = lapcheck.heat_offset(diffs)
-            if off is not None:
-                with self.lock:
-                    self.state["offset"] = off
-        offset = self.state["offset"] or 0.0
+        diffs = []                                            # the timing antenna vs the visual gate, this heat
+        for c, race in races.items():
+            if race and c in q_of:
+                vc = [float(self.event.to_clock(q_of[c].video, p["t"])) for p in lapcheck.g1_passes(race)]
+                diffs += lapcheck.pairs_offset([d["t"] for d in timing.get(c, [])], vc)
+        off = lapcheck.heat_offset(diffs)
+        with self.lock:
+            if self.state["offset"] is None and off is not None:    # the event's: for heats with too few pairs
+                self.state["offset"] = off
+            self._heat(hid)["offset"] = off
+        offset = self._offset(hid)
+        rejected = self.event.rejected(h) if self.event.has_timing else {}
+        rules = dict(getattr(self.event, "rules", {}), race_type=h.race_type, target_laps=h.target_laps) \
+            if self.event.has_timing else {}
         out = {}
         for c, race in races.items():
             if not race or c not in q_of:
@@ -779,7 +807,8 @@ class EventDay:
                                        self._n_gates(), offset, h.start, h.end, self._lap_ref(),
                                        low_quality=q.kind == "dji", gray=gray,
                                        race_video=(float(self.event.to_video(q.video, h.start)),
-                                                   float(self.event.to_video(q.video, h.end))))
+                                                   float(self.event.to_video(q.video, h.end))),
+                                       rejected=rejected.get(c, []), rules=rules)
             for f in res["findings"]:
                 f["key"] = lapcheck_key(f)
             out[c] = res
@@ -836,7 +865,7 @@ class EventDay:
                 marks = hs.setdefault("marks", [])
                 have = {_change_id(m) for m in marks}
                 h = self.event.heats.get(hid)
-                off = self.state.get("offset") or 0.0
+                off = self._offset(hid)
                 for c in lost:
                     if _change_id(c) in have:
                         continue
@@ -854,7 +883,7 @@ class EventDay:
         meta = {"live_start_s": live0}
         official = None
         if self.event.has_timing:                     # the official laps: FPVTrackside's now (with any edits)
-            off = self.state.get("offset") or 0.0
+            off = self._offset(h.id)
             official = [float(self.event.to_video(q.video, d["t"] - off))
                         for d in self.event.timing(h).get(q.channel, [])]
         st = rstats.run_stats(race, meta, self._n_gates(), official=official)

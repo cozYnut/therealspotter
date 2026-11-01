@@ -66,6 +66,12 @@ the video.
   per run is enough.
 - **Auto (top):** new heats are analysed and checked by themselves, and confident
   lap corrections are written to FPVTrackside; unsure ones wait for you.
+  A lap is added only where nothing in the timing can be that crossing (LapRF
+  may fire anywhere from the start/finish gate to the gate after it, up to
+  2.5 s later), and never where FPVTrackside wouldn't count one: shorter than
+  the event's minimum lap time, on a crossing FPVTrackside discounted, after
+  the pilot's target laps in a race, or in a time trial after the race time
+  ran out. Those are shown for you to check instead.
 - **The heat (right):** the 2×2 video with each pilot's channel, name and lap;
   a timeline per pilot (white = LapRF laps, green = laps seen in the video,
   orange = things to check, blue = your marks); and per pilot a table of laps

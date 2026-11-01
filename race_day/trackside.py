@@ -59,6 +59,15 @@ def parse_time(s: Optional[str]) -> Optional[float]:
     return local.timestamp() + (whole - int(whole))
 
 
+def parse_span(s: Optional[str]) -> Optional[float]:
+    """FPVTrackside's time span ('00:02:00', '00:00:00.5000000') → seconds."""
+    try:
+        h, m, sec = (s or "").split(":")
+        return int(h) * 3600 + int(m) * 60 + float(sec)
+    except ValueError:
+        return None
+
+
 def _iso_time(s: str) -> float:
     """recordinfo's '2026-10-09T12:05:31.74954+03:00' → epoch seconds (the
     wall clock FPVTrackside shows, the same frame as parse_time)."""
@@ -108,6 +117,8 @@ class Heat:
     quads: List[Quad]
     number: int = 0                # order in the day (1 = first heat flown)
     sig: tuple = ()                # file signature it was read with
+    race_type: str = ""            # the round's EventType: Race, TimeTrial, Practice…
+    target_laps: Optional[int] = None
 
     @property
     def short(self) -> str:        # stable short id for file names
@@ -176,6 +187,8 @@ class Event:
         self.pilot_names: Dict[str, str] = {}    # pilot ID → name
         self.rounds: Dict[str, dict] = {}
         self.stages: Dict[str, str] = {}
+        # the event's race rules (Event.json): min_lap, race_length (s), holeshot (the first crossing isn't a lap)
+        self.rules: Dict[str, object] = {"min_lap": None, "race_length": None, "holeshot": True}
         self._frames: Dict[Tuple[str, str], tuple] = {}
         self._timing: Dict[str, tuple] = {}             # heat id → (sig, timing)
         self._channel_db = self._load_channel_db()
@@ -208,6 +221,8 @@ class Event:
         if not isinstance(ev, dict):
             return
         self.name = ev.get("Name") or self.dir.name
+        self.rules = {"min_lap": parse_span(ev.get("MinLapTime")), "race_length": parse_span(ev.get("RaceLength")),
+                      "holeshot": (ev.get("PrimaryTimingSystemLocation") or "Holeshot") == "Holeshot"}
         ids, names = ev.get("Channels") or [], ev.get("ChannelDisplayNames") or []
         self.channels = {i: (names[k] if k < len(names) and names[k] else
                              self._channel_db.get(i, {}).get("DisplayName", i[:8]))
@@ -328,7 +343,8 @@ class Event:
             return None
         return Heat(id=name, dir=d, start=start, end=end, stage=self.stages.get(rnd.get("Stage"), ""),
                     round=rnd.get("RoundNumber"), race=race.get("RaceNumber"), pilots=pilots, quads=quads,
-                    sig=self._folders[name].sig)
+                    sig=self._folders[name].sig, race_type=rnd.get("EventType") or "",
+                    target_laps=race.get("TargetLaps"))
 
     def _read_bounds(self, xml: Path, video: Path) -> List[Quad]:
         """Channel → quadrant from the head of a recordinfo.xml (before its frame list).
@@ -401,6 +417,16 @@ class Event:
             v.sort(key=lambda d: d["t"])
         self._timing[heat.id] = (heat.sig, out)
         return out
+
+    def rejected(self, heat: Heat) -> Dict[str, List[float]]:
+        """Per channel: the crossings FPVTrackside doesn't count (a lap under the
+        minimum lap time, after the race, one a marshal disqualified) — clock s."""
+        out: Dict[str, List[float]] = {}
+        for det in (self.race_json(heat) or {}).get("Detections") or []:
+            t = parse_time(det.get("Time"))
+            if not det.get("Valid") and t is not None:
+                out.setdefault(self.channel_name(det.get("Channel", "")), []).append(t)
+        return {c: sorted(v) for c, v in out.items()}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -604,6 +630,9 @@ class VideoFolder:
 
     # no timing system and no clock: video time is the time
     def timing(self, heat, race=None):
+        return {}
+
+    def rejected(self, heat):
         return {}
 
     def race_json(self, heat):

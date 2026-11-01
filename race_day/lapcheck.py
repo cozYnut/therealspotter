@@ -23,21 +23,30 @@ Only disagreements are reported, each with a confidence:
 Only "missed" and "false" are high confidence, and those are the only ones
 Auto mode writes. On 2027Race1 every looser rule (e.g. "the video shows
 the pilot mid-lap") produced wrong corrections, so the rules stay strict.
+A lap is never added where FPVTrackside wouldn't count one (see rules in
+check_pilot): Training 1 2027 had 31 wrong additions, all of them a second
+copy of a crossing the timing already had, or a lap after the pilot's race.
 
 Times: video passes are converted to the clock with the heat's frame times,
-plus a fixed offset (the timing antenna isn't exactly at the visual gate),
-measured as the median difference over matched laps.
+plus an offset (the timing antenna isn't exactly at the visual gate),
+measured per heat (heat_offset). The antenna can fire anywhere from the
+start/finish gate to the gate after it (Training 1 2027: up to 1.6 s after
+G1), so a timing crossing from EARLY_S before to LATE_S after the video's
+crossing is the same crossing.
 """
 
 from statistics import median
 from typing import List, Optional
 
-TOL_S = 1.0           # slack around a boundary window when matching a detection
-PAIR_S = 2.5          # wider window used only to measure the offset
+TOL_S = 1.0           # a marshal's mark this close to a timing crossing is that crossing
+EARLY_S = 0.7         # a timing crossing this much before the video's start/finish crossing…
+LATE_S = 2.5          # …or this much after it is the same crossing
+PAIR_S = 2.5          # window used to measure the offset
 MAX_GAP_S = 6.0       # an inferred boundary (G1 not seen) wider than this isn't trusted
 MIN_GATES = 0.6       # a lap in the video needs this share of the gates
 SHORT = 0.5           # a lap shorter than this × the usual lap is impossible
-SAME_G1_S = 2.0       # two G1 passes this close are the same crossing
+EXACT_G1_S = 2.0      # G1 passes this close are one exact crossing
+SAME_G1_S = 5.0       # G1 passes one after another (no other gate between) this close are one crossing
 
 
 def g1_passes(race: dict) -> List[dict]:
@@ -57,21 +66,33 @@ def pairs_offset(det_times: List[float], video_clock: List[float]) -> List[float
 
 def boundaries(passes: List[dict], n_gates: int) -> List[dict]:
     """Start/finish crossings in the video: {"a", "b" (video s), "exact",
-    "gates": distinct gates seen since the previous crossing}."""
+    "sure", "gates": distinct gates seen since the previous crossing}.
+    G1 passes one after another a few seconds apart are one crossing (the
+    gate before G1 taken for G1, or G1 seen twice); it's exact when they're
+    close. A G1 is "sure" when the pass before it is the track's last gate
+    (or there's none): a G1 right after a middle gate may be the last gate
+    mislabelled."""
     ps = sorted((p for p in passes if p.get("gate_id", -1) >= 1), key=lambda p: p["t"])
+    top = max((p["gate_id"] for p in ps), default=n_gates)
     out, seen = [], set()
     prev = None
     for p in ps:
         g = p["gate_id"]
         if g == 1:
-            if out and out[-1]["exact"] and p["t"] - out[-1]["b"] < SAME_G1_S:
+            if out and out[-1]["g1"] and prev is not None and prev["gate_id"] == 1 \
+                    and p["t"] - out[-1]["a"] < SAME_G1_S:
+                b = out[-1]
+                b["b"] = p["t"]
+                b["exact"] = b["exact"] and p["t"] - b["a"] < EXACT_G1_S
                 prev = p
                 continue                                  # the same crossing seen twice
-            out.append({"a": p["t"], "b": p["t"], "exact": True, "gates": len(seen)})
+            out.append({"a": p["t"], "b": p["t"], "exact": True, "g1": True, "gates": len(seen),
+                        "sure": prev is None or prev["gate_id"] == top})
             seen = set()
         elif prev is not None and prev["gate_id"] != 1 and g < prev["gate_id"]:
             # the sequence wrapped (… G13, G14 → G2 …): the line was crossed in between
-            out.append({"a": prev["t"], "b": p["t"], "exact": False, "gates": len(seen)})
+            out.append({"a": prev["t"], "b": p["t"], "exact": False, "g1": False, "gates": len(seen),
+                        "sure": False})
             seen = set()
         seen.add(g)
         prev = p
@@ -99,11 +120,18 @@ def _share(intervals, a: float, b: float) -> float:
 
 def check_pilot(race: dict, dets: List[dict], to_clock, n_gates: int, offset: float,
                 start: float, end: float, lap_ref: Optional[float], low_quality: bool = False,
-                gray: Optional[List[List[float]]] = None, race_video: Optional[tuple] = None) -> dict:
+                gray: Optional[List[List[float]]] = None, race_video: Optional[tuple] = None,
+                rejected: Optional[List[float]] = None, rules: Optional[dict] = None) -> dict:
     """race: the pilot's labelled race_data; dets: the timing system's valid
     detections for this channel ({"t", "holeshot", "id"}); to_clock: video
     seconds → clock seconds. gray: video intervals with no picture (a flat
     gray feed); race_video: the race's start and end in video seconds.
+    rejected: clock times of this channel's crossings FPVTrackside doesn't
+    count (a crossing there is taken: no lap is added on it). rules: what
+    FPVTrackside counts as a lap — {"min_lap", "race_length" (s), "race_type"
+    (Race, TimeTrial…), "target_laps", "holeshot"}; a lap it wouldn't count is
+    never added: shorter than min_lap (either side of it), in a Race after the
+    pilot's target laps, in a time trial started after the race length.
     Returns laps from both sides, the findings, and `confirmed`: the timing
     crossings the video showed (a crossing neither confirmed nor in a finding
     wasn't checked — e.g. while there was no picture). With no picture for most
@@ -122,10 +150,16 @@ def check_pilot(race: dict, dets: List[dict], to_clock, n_gates: int, offset: fl
             bnd.append(dict(b, ca=ca, cb=cb, video_t=b["b"] if b["exact"] else (b["a"] + b["b"]) / 2))
     det = [d for d in dets if lo <= d["t"] <= hi]
 
+    rules = rules or {}
+    rejected = [t for t in (rejected or []) if lo <= t <= hi]
+
+    def near(t, b):                              # the timing crossing at t is the video's crossing b
+        return b["ca"] - EARLY_S <= t <= b["cb"] + LATE_S
+
     # match detections to boundary windows (closest first, one to one)
     def dist(d, b):
         return 0.0 if b["ca"] <= d["t"] <= b["cb"] else min(abs(d["t"] - b["ca"]), abs(d["t"] - b["cb"]))
-    cand = sorted((dist(d, b), i, j) for i, d in enumerate(det) for j, b in enumerate(bnd) if dist(d, b) <= TOL_S)
+    cand = sorted((dist(d, b), i, j) for i, d in enumerate(det) for j, b in enumerate(bnd) if near(d["t"], b))
     md, mb = {}, {}
     for _, i, j in cand:
         if i not in md and j not in mb:
@@ -169,13 +203,18 @@ def check_pilot(race: dict, dets: List[dict], to_clock, n_gates: int, offset: fl
                      [x["cb"] for x in bnd[:j]], default=None)
         lap = b["cb"] - prev_t if prev_t is not None else None
         holeshot = not det or b["cb"] < det[0]["t"] - TOL_S
-        f = {"kind": "missed", "t": b["cb"] if b["exact"] else (b["ca"] + b["cb"]) / 2, "video_t": b["video_t"],
+        t_add = b["ca"] if b["exact"] else (b["ca"] + b["cb"]) / 2      # a repeated G1: its first pass
+        f = {"kind": "missed", "t": t_add, "video_t": b["video_t"],
              "lap_time": lap, "holeshot": holeshot, "gates_seen": b["gates"], "exact": b["exact"]}
-        good = (b["exact"] and j > 0 and b["gates"] >= MIN_GATES * n_gates and ref and lap is not None
-                and 0.75 * ref <= lap <= 1.6 * ref)
+        good = (b["exact"] and b["sure"] and j > 0 and b["gates"] >= MIN_GATES * n_gates and ref
+                and lap is not None and 0.75 * ref <= lap <= 1.6 * ref)
         flies_on = len({p["gate_id"] for p in passes
                         if b["b"] < p["t"] <= b["b"] + 10.0 and p["gate_id"] != 1}) >= 2
-        if good and flies_on and not low_quality:
+        refused = _not_a_lap(t_add, b, det, rejected, bnd[j + 1:], rules, start, near)
+        if refused:
+            f.update(kind="unsure", confidence="low",
+                     reason=f"a start/finish crossing the timing doesn't have, but {refused} — check it")
+        elif good and flies_on and not low_quality:
             f.update(confidence="high", reason=f"lap completed in the video ({b['gates']}/{n_gates} gates, "
                                                 f"{lap:.1f}s) and the pilot flies on, but not in the timing")
         elif good:
@@ -195,5 +234,32 @@ def check_pilot(race: dict, dets: List[dict], to_clock, n_gates: int, offset: fl
             "confirmed": [det[i]["id"] for i in md]}        # the timing crossings the video showed
 
 
-def heat_offset(per_pilot_diffs: List[float]) -> Optional[float]:
-    return round(median(per_pilot_diffs), 3) if len(per_pilot_diffs) >= 3 else None
+def _not_a_lap(t: float, b: dict, det: List[dict], rejected: List[float], later: List[dict], rules: dict,
+               start: float, near) -> Optional[str]:
+    """Why FPVTrackside wouldn't count a lap added at t (the video's crossing
+    b), or None."""
+    if any(near(r, b) for r in rejected):
+        return "FPVTrackside discounted a timing crossing there"
+    min_lap = rules.get("min_lap")
+    before = [d["t"] for d in det if d["t"] < t]
+    after = [d["t"] for d in det if d["t"] > t] + [x["ca"] for x in later]
+    if min_lap and ((before and t - before[-1] < min_lap) or (after and min(after) - t < min_lap)):
+        return f"a lap there would be shorter than the minimum lap time ({min_lap:.0f} s)"
+    kind, target = rules.get("race_type"), rules.get("target_laps")
+    laps_done = len(before) - (1 if rules.get("holeshot", True) and before else 0)
+    if kind == "Race" and target and laps_done >= target:
+        return f"the pilot had already finished the race ({target} laps)"
+    length = rules.get("race_length")
+    if kind == "TimeTrial" and length and before and before[-1] - start > length:
+        return "the lap starts after the race time ran out"
+    return None
+
+
+def heat_offset(diffs: List[float]) -> Optional[float]:
+    """Timing − video at the start/finish, from the heat's paired crossings:
+    the lower quartile — the antenna fires at the gate or (often) after it, so
+    the early pairs are the gate's own time."""
+    if len(diffs) < 3:
+        return None
+    xs = sorted(diffs)
+    return round(xs[(len(xs) - 1) // 4], 3)
