@@ -450,6 +450,10 @@ class EventPage(QWidget):
         self.fril_btn.setToolTip("Send the race on now and the races to come to fril.co.il/live\n"
                                  "(its live ingest address, the same one FPVTrackside sends to)")
         self.fril_btn.clicked.connect(lambda: win.set_fril())
+        self.ann_btn = QPushButton("Announcer…")
+        self.ann_btn.setToolTip("The app speaks the race calls in place of FPVTrackside, from its live events\n"
+                                "(which it passes on to fril)")
+        self.ann_btn.clicked.connect(lambda: win.set_announcer())
         stop = QPushButton("Close")
         stop.clicked.connect(lambda: win.stop_event())
         for w in (self.title, self.learn_btn, self.auto, self.pause_race):
@@ -457,6 +461,7 @@ class EventPage(QWidget):
         top.addWidget(self.status, 1)
         top.addWidget(self.ft_btn)
         top.addWidget(self.fril_btn)
+        top.addWidget(self.ann_btn)
         top.addWidget(stop)
         v.addLayout(top)
         self.banner = QLabel("")
@@ -607,6 +612,7 @@ class EventPage(QWidget):
             b.setVisible(timing)
         self.ft_btn.setVisible(timing and day.mode != "capture")
         self.fril_btn.setVisible(timing and day.mode == "live")
+        self.ann_btn.setVisible(timing and day.mode == "live")
         self.b_review.setVisible(True)
         self.legend.setVisible(timing)
         self._asked = set()
@@ -647,6 +653,14 @@ class EventPage(QWidget):
             bits.append("fril live: ⚠ " + fr["error"] if fr["error"] else
                         f"fril live: sent {time.strftime('%H:%M:%S', time.localtime(fr['last_ok']))}"
                         if fr["last_ok"] else "fril live: sending…")
+        relay, ann = getattr(self.win, "relay", None), getattr(self.win, "announcer", None)
+        if relay and st["mode"] == "live" and self.day.event.has_timing:
+            rs = relay.status()
+            if rs["received"]:
+                bits.append(f"FPVTrackside events: {rs['received']}" + (f" (⚠ fril: {rs['forward_error']})"
+                                                                         if rs["forward_error"] else ""))
+            if ann and ann.enabled:
+                bits.append("🗣 announcer on")
         self.status.setText("   ·   ".join(bits))
         racing_on = st["race_running"] and not st["paused"] and st["mode"] != "capture"
         self.banner.setVisible(st["paused"] or racing_on)

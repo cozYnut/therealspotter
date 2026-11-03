@@ -452,6 +452,7 @@ class Main(QMainWindow):
         for p in (self.start, self.live_setup, self.event_page, self.live_page, self.replays_page):
             self.stack.addWidget(p)
         self._start_dashboard()
+        self._start_announcer()
 
     def show_page(self, page):
         self.stack.setCurrentWidget(page)
@@ -470,6 +471,71 @@ class Main(QMainWindow):
         for page in (self.event_page, self.live_page, self.replays_page):
             page.dash_url = url
         self.start.dash.setText(f"Browser (every event of the data folder): <b>{url}</b>" if self.dash else url)
+
+    def _start_announcer(self):
+        """FPVTrackside's live events, for the whole session (race_day/ftevents.py): passed on to fril, and
+        heard by the announcer (race_day/announcer.py), which speaks when it's switched on, in its club's
+        words (clubs/<club>/). With an FPVTrackside event open, the live video (race_day/livevideo.py) adds
+        where each pilot is mid-lap."""
+        from race_day.announcer import Announcer
+        from race_day.clubstyle import clubs
+        from race_day.ftevents import EventRelay
+        from race_day.livevideo import LiveVideo
+        st = _app_settings()
+        club = st.get("announcer_club")
+        if club not in clubs():                  # a club of its own if this Mac has one, else the example
+            club = next((c for c in clubs() if c != "example"), "example" if clubs() else None)
+        self.announcer = Announcer(self._log, st.get("announcer_voice"), st.get("announcer_rate"),
+                                   bool(st.get("announcer_on")), club, st.get("announcer_track"))
+        self.live = LiveVideo(self.announcer.on_video, self._log)
+        self.announcer.on_race = self.live.set_race
+        self.replay = None
+        try:
+            self.relay = EventRelay(st.get("fril_live_url"), log=self._log).start()
+            self.relay.subscribe(self.announcer.on_event)
+        except OSError as e:                     # port in use: the app works without it
+            self.relay = None
+            self._log(f"FPVTrackside events: can't listen ({e})")
+
+    def set_announcer(self):
+        from race_day.announcer_ui import AnnouncerDialog
+        AnnouncerDialog(self, self.announcer, self.relay, _save_app_settings, _app_settings).exec()
+
+    def start_live_video(self) -> Optional[str]:
+        """The live video on FPVTrackside's capture card, for the open FPVTrackside event (when it's switched
+        on in the Announcer window). None, or why it doesn't run."""
+        from race_day import trackside
+        from race_day.heatreplay import start_live
+        st = _app_settings()
+        self.live.stop()
+        if not st.get("live_video_on"):
+            return "switched off"
+        if not self.event_day or not isinstance(self.event_day.event, trackside.Event):
+            return "open the FPVTrackside event first"
+        why = start_live(self.live, self.announcer, self.event_day.event, self.event_day.tp,
+                         int(st.get("live_video_device") or 0), float(st.get("live_video_fps") or 15))
+        if why:
+            self._log(f"live video: {why}")
+        return why
+
+    def replay_heat(self) -> Optional[str]:
+        """The heat selected on the FPVTrackside screen, played to the announcer as if it were being raced: its
+        video for the capture card, its crossings for FPVTrackside's events. None, or why it can't."""
+        from race_day.heatreplay import HeatReplay
+        if self.replay:
+            self.replay.stop()
+            self.replay = None
+            return "stopped"
+        hid = self.event_page.heat_id
+        if not self.event_day or not hid:
+            return "pick a heat on the FPVTrackside screen first"
+        self.live.stop()
+        self.replay = HeatReplay(self.announcer, self.live, str(self.event_day.event.dir), hid,
+                                 float(_app_settings().get("live_video_fps") or 15), self._log)
+        why = self.replay.start()
+        if why:
+            self.replay = None
+        return why
 
     # ── live capture ──────────────────────────────────────────
 
@@ -549,6 +615,8 @@ class Main(QMainWindow):
                                         st.get("fpvtrackside_token") or os.environ.get("FPV_API_TOKEN"))
         self.event_day.set_fril(st.get("fril_live_url"))
         self.event_page.open(self.event_day)
+        if st.get("live_video_on"):
+            self.start_live_video()
         self.show_page(self.event_page)
 
     def set_fril(self):
@@ -569,6 +637,8 @@ class Main(QMainWindow):
         _save_app_settings(fril_live_url=url)
         if self.event_day:
             self.event_day.set_fril(url)
+        if self.relay:                                # FPVTrackside's own events go there too
+            self.relay.set_forward(url)
 
     def set_fpvtrackside(self):
         """Where FPVTrackside's web server is, and its API token (only needed
@@ -606,6 +676,10 @@ class Main(QMainWindow):
 
     def _close(self):
         """Close the open event (the dashboard keeps running: it shows every event)."""
+        if self.replay:
+            self.replay.stop()
+            self.replay = None
+        self.live.stop()
         for page in (self.event_page, self.live_page, self.replays_page):
             page.close_day()
         if self.event_day:
@@ -616,6 +690,8 @@ class Main(QMainWindow):
         self._close()
         if self.dash:
             self.dash.stop()
+        if self.relay:
+            self.relay.stop()
         super().closeEvent(e)
 
 

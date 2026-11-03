@@ -1,0 +1,10 @@
+# A track: what to call its gates, in the order they're flown (1 = the start/finish gate, as the
+# event's learned track numbers them). A gate with no name is just not named in a call.
+name: Park field
+expected_lap: 28                   # seconds; a pilot unseen for ¾ of this is "down"
+gates:
+  1: {say: "the start gate"}
+  4: {say: "the dive gate", crash_spot: true}
+  7: {say: "the hairpin"}
+  9: {say: "the ladder", crash_spot: true}
+  12: {say: "the last split"}

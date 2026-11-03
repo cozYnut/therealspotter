@@ -215,6 +215,81 @@ The race being run is never read from disk; its laps show when it ends — or li
 FPVTrackside's web server is on (*Menu → Application Settings → Web → Auto start HTTP
 Server*, at <http://localhost:8080>).
 
+### 🗣 The announcer
+
+The app can speak the race in place of FPVTrackside, in English and in your club's own
+words: **Announcer…** in the top bar of the FPVTrackside screen. No call is written by a
+model: every one is a line from the club's files, so it's instant and never says
+anything the club didn't write.
+
+- **What it says.**
+  - From FPVTrackside's live events: "Arm your quads…" the moment FPVTrackside
+    announces the start, who takes the holeshot, every lap with its time and place,
+    who takes the lead, the fastest lap of the race, the last lap, who finishes where
+    and by how much, a kind word for the last one home, a pilot out, "Race over".
+  - From the live video (below): who takes the lead mid-lap and at which gate, the gap
+    between the first two through a gate ("Can Slow catch Pennz? 4 tenths in it!"),
+    who is down (and so who moves up), who is back in it.
+  - Everything else FPVTrackside decides to say (next up, results, hurry up…) is read
+    from its log and said as it is. A sound switched off in FPVTrackside isn't said.
+  - **Safety first:** FPVTrackside's emergency stop or stand-down is said at once and
+    alone, and the race calls stop until the next race.
+- **FPVTrackside → the app.** In FPVTrackside, *Menu → Application Settings → Gate / LED
+  POST notifications*: **Notifier enabled / mode = ExtensionMode**, **NotificationURL =
+  `http://localhost:8766/`**, then restart FPVTrackside. The app passes every event on to
+  fril (the **fril live…** address), unchanged, so fril's live board works as before —
+  but only while the app is open. The top bar counts the events.
+- **FPVTrackside's own voice off**, so you don't hear both: *Turn it off* in the
+  Announcer window, with FPVTrackside closed (it sets FPVTrackside's speech volume to 0;
+  it writes its settings back when it exits). The start tone and the horn still play.
+- **Voice and speed:** any English voice of the Mac (`say`); *Test* says a lap call.
+
+#### Mid-lap positions from the video
+
+Tick **Mid-lap positions from the video** and pick FPVTrackside's capture card (macOS
+lets two apps read it). With the FPVTrackside event open and its track learned, a process
+of its own reads the card, cuts the 2×2 picture into the pilots' pictures as the event's
+last heat recorded them, and names each pilot's gates as they're flown: YOLO on the
+Neural Engine → tracker → pass detector → CLIP → the live gate decoder
+(`online_decoder.py`, from gilboash/therealspotter) on the learned track.
+
+- It analyses the newest frame each time (15 a second per pilot by default): a slower
+  Mac names a gate a little later, but never falls further behind. The window shows its
+  frames a second, the share dropped, and how far behind it is.
+- Where a pilot is = LapRF's lap + the video's gate in it. A gate counts only a few
+  gates on from the last one and only if there was time to fly there (the learned
+  gate-to-gate times); a new leader must be a gate (or half a second) ahead and pass
+  one more gate first. Nothing from the video is called in the first 6 seconds or
+  once the winner is home.
+- Tested on two heats of Race 1 (replayed, graded against the full analysis): the
+  video's lead and gap calls were right every time; "moves up to second" only about
+  half the time, so it's off unless a club turns it on (`video_places: true`).
+- About 1.5 GB of memory (its own YOLO and CLIP).
+- **▶ Replay the selected heat** plays the heat picked on the FPVTrackside screen to
+  the announcer as if it were being raced — its video for the capture card, its
+  crossings for FPVTrackside's events — to try it all at home. Nothing goes to fril.
+  The same from the command line, printing the calls:
+  `venv/bin/python -m race_day.heatreplay <event folder> <heat> --club <club> --track <track>`
+  (add `--speak` to hear them). `race_day.ftreplay` plays only the crossings, through the
+  app's port.
+
+#### Your club's announcer (clubs/)
+
+Each club has a folder in `clubs/`, picked in the Announcer window. `clubs/example/` (a
+made-up club) shows every file; copy it to `clubs/<your club>/` and make it yours. Your
+club's folder stays on your computer: git ignores everything in `clubs/` but the example,
+so pilots' names and details aren't shared.
+
+| File | What it holds |
+|---|---|
+| `club.yaml` | the club's name, the announcer's name, how lap times are read (`natural`: "twenty-one point nine six", or `digits`: "twenty-one ninety-six"), the safety line, `video_places` |
+| `lines.yaml` | the calls: for each kind (`lap`, `lap_lead`, `holeshot`, `finish_win`, `gap`, `down`, `kind`, …), several ways to say it. One is picked at random, never the one said last. Words in braces are filled in: `{pilot} {lap} {time} {place} {gate} {margin} {ahead} {behind} {next}`; a line whose words aren't known for that call is skipped for another (so "{pilot} is down at {gate}" is only said when the gate is). Missing kinds fall back to plain defaults. |
+| `pilots.yaml` | pilot cards: `callsign` exactly as in FPVTrackside, `say_it_like` (how the voice should say it — try it with *Test*), `new: true` for a new or young pilot (kinder lines, `kind_new`) |
+| `tracks/<track>.yaml` | a track: what to call its gates (`4: {say: "the dive gate", crash_spot: true}`, numbered as the event's learned track numbers them, 1 = start/finish) and the expected lap time. Pick it in the window before the race. |
+
+Keep race calls short (3–8 words, present tense): they're said while the race is flown.
+A `persona.md` next to them is a good place for the style notes the lines follow.
+
 ---
 
 ## Where the data is
@@ -288,11 +363,13 @@ therealspotter/
 ├── pass_detector.py         # pass candidates
 ├── pass_scorer.py           # two-stage pass detection   (+ pass_scorer.json, the trained scorer)
 ├── gate_decoder.py          # gate numbers and laps
+├── online_decoder.py        # gate numbers while the race is flown (the announcer's live video)
 ├── learn_track.py           # learning a track
 ├── extract_motion.py        # camera motion (for the pass scorer)
 ├── gate_db.py               # gate memory
 ├── pipeline_cfg.py          # pipeline settings (debug_ui_defaults.json)
 ├── score.py                 # measures the system against the reviews
 ├── dataset_paths.py         # where the data is
+├── clubs/                   # each club's announcer words (only clubs/example/ is in git)
 └── cyn_current-20261021_best.pt   # the gate detector
 ```

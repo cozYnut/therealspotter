@@ -1,0 +1,11 @@
+# Pilot cards. callsign: exactly as in FPVTrackside. Every field but callsign is optional.
+#   say_it_like  how the voice should say the callsign (try it with the Announcer window's Test)
+#   new          a new or young pilot: kinder lines (lines.yaml: kind_new)
+- callsign: Skyhawk
+  say_it_like: Sky hawk
+- callsign: Zer0G
+  say_it_like: Zero G
+- callsign: MothFPV
+  say_it_like: Moth F P V
+  new: true
+- callsign: Rotorhead

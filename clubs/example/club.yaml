@@ -1,0 +1,8 @@
+# An example club (made up): copy this folder to clubs/<your club>/ and make it yours.
+# Everything the announcer says comes from these files; nothing is written by a model.
+name: Example FPV Racing Club
+announcer: RaceBOT                 # the announcer's name
+language: en                       # English only for now
+lap_times: natural                 # natural: 21.96 → "twenty-one point nine six"; digits: "twenty-one ninety-six"
+safety_line: "Stop. Pilots, land now."   # said alone, at once, on an emergency stop
+video_places: false               # "X moves up to second" from the live video (right only about half the time in tests)

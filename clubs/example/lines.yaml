@@ -1,0 +1,26 @@
+# The calls. For each kind, several ways to say it: one is picked at random, never the one said last.
+# Words in braces are filled in; a line whose words aren't known for a call is skipped for another.
+#   {pilot} {lap} {time} {place} {gate} {margin} {ahead} {behind} {next}
+# Keep race calls short (3–8 words): they're said while the race is flown.
+start:            ["Arm your quads. Starting on the tone in less than {time}"]
+holeshot:         ["{pilot} takes the holeshot!", "Holeshot to {pilot}!"]
+lap:              ["{pilot}, lap {lap}, {time}, in {place}", "{pilot} in {place}, {time}"]
+lap_lead:         ["{pilot} takes the lead! {time}", "{pilot} hits the front!"]
+lap_leader:       ["{pilot} still out front, {time}", "{pilot} leads, lap {lap}, {time}"]
+last_lap:         ["Last lap for {pilot}!", "{pilot} on the final lap!"]
+fastest:          ["Fastest lap so far, {pilot}, {time}"]
+finish_win:       ["{pilot} wins it!", "{pilot} takes the win!"]
+finish:           ["{pilot} home in {place}"]
+finish_close:     ["{pilot} in {place}, just {margin} behind {ahead}!"]
+kind:             ["{pilot} brings it home. Well flown.", "{pilot} gets it home. Lots to build on."]
+kind_new:         ["{pilot} brings it home. Great flying, keep at it!"]
+race_over:        ["Race over"]
+video_lead:       ["{pilot} takes the lead at {gate}!", "{pilot} goes in front!"]
+video_place:      ["{pilot} moves up to {place}"]
+gap:              ["{margin} between {ahead} and {behind} at {gate}!", "Can {behind} catch {ahead}? {margin} in it!"]
+down:             ["{pilot} is down at {gate}, so {next} moves up to {place}", "{pilot} is down, {next} into {place}",
+                   "{pilot} is down. Still in it!"]
+back:             ["{pilot} is back in it!", "And {pilot} is flying again!"]
+out:              ["{pilot} is out"]
+practice_lap:     ["{pilot}, {time}"]
+practice_fastest: ["{pilot}, {time}, fastest lap so far"]
