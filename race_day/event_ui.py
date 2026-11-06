@@ -234,7 +234,12 @@ class HeatPlayer(QWidget):
         fb.clicked.connect(self.frame_back)
         ff.clicked.connect(self.frame_forward)
         self.time_lbl = QLabel("")
-        for w in (self.which, self.play_btn, back, fb, ff, fwd, self.time_lbl):
+        self.live_btn = QPushButton("⟲ Back to live")
+        self.live_btn.setToolTip("Back in step with the heat being replayed to the announcer: the frame the live video\n"
+                                 "is reading right now, as on race day")
+        self.live_btn.clicked.connect(self._sync)
+        self.live_btn.hide()
+        for w in (self.which, self.play_btn, self.live_btn, back, fb, ff, fwd, self.time_lbl):
             row.addWidget(w)
         row.addStretch()
         v.addLayout(row)
@@ -250,9 +255,41 @@ class HeatPlayer(QWidget):
         self.colors: Dict[str, QColor] = {}      # channel → its colour (the timeline row's)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
+        self.clock = None                        # a heat replayed to the announcer: {"video": s, "wall": clock time}
+
+    def follow(self, path: str, clock: dict) -> bool:
+        """Play `path` in step with a heat replayed to the announcer: at each moment the frame that the live
+        video is reading then (clock: video second `video` plays at clock time `wall`). False if this heat's
+        videos aren't the ones loaded."""
+        if self.path != path:
+            idx = self.which.findData(path)
+            if idx < 0:
+                return False
+            self.which.setCurrentIndex(idx)
+        self.clock = clock
+        self.live_btn.show()
+        self._sync()
+        return True
+
+    def unfollow(self):
+        self.clock = None
+        self.live_btn.hide()
+
+    def _sync(self):
+        """Back in step with the replay's clock."""
+        if not self.clock or not self.cap:
+            return
+        c = self.clock
+        self.stop()
+        self.seek(max(0.0, c["video"] + (time.time() - c["wall"])))
+        self.playing = True
+        self._t0, self._p0 = c["wall"], c["video"]      # before the video's first frame: it waits on it
+        self.play_btn.setText("❚❚")
+        self.timer.start(15)
 
     def load(self, videos: List[str], quads: Dict[str, List[dict]], laps_at: Dict[str, List[float]]):
         self.stop()
+        self.unfollow()
         self.videos, self.quads, self.laps_at = videos, quads, laps_at
         self.which.blockSignals(True)
         self.which.clear()
@@ -429,6 +466,10 @@ class EventPage(QWidget):
         self.title.setFont(f)
         self.learn_btn = QPushButton("Learn track")
         self.learn_btn.clicked.connect(self._learn)
+        self.setup_btn = QPushButton("Event setup…")
+        self.setup_btn.setToolTip("The event's classes (Open, Beginners…): their pilots, the track layout each flies,\n"
+                                  "qualifying, the brackets and points — made in FPVTrackside through its API")
+        self.setup_btn.clicked.connect(self._setup)
         self.auto = QCheckBox("Auto")
         self.auto.setToolTip("New heats are analysed and checked by themselves, and confident lap corrections\n"
                              "are written to FPVTrackside's files. Uncertain ones wait for you.\n"
@@ -456,7 +497,7 @@ class EventPage(QWidget):
         self.ann_btn.clicked.connect(lambda: win.set_announcer())
         stop = QPushButton("Close")
         stop.clicked.connect(lambda: win.stop_event())
-        for w in (self.title, self.learn_btn, self.auto, self.pause_race):
+        for w in (self.title, self.setup_btn, self.learn_btn, self.auto, self.pause_race):
             top.addWidget(w)
         top.addWidget(self.status, 1)
         top.addWidget(self.ft_btn)
@@ -632,9 +673,14 @@ class EventPage(QWidget):
         st = self.day.status()
         self.title.setText(f"{ {'live': 'LIVE', 'capture': 'TRACK'}.get(st['mode'], 'REPLAYS')} — {st['event']}")
         self.learn_btn.setText("Relearn track" if st["learned"] else "Learn track")
-        bits = [f"learned · {st['n_gates']} gates" if st["learned"] else "not learned yet"]
+        lays = st.get("layouts") or {}
+        if len(lays) > 1:                                     # one track layout per class (Event setup)
+            bits = [" · ".join(f"{n}: {'learned' if l['learned'] else 'not learned'} ({l['n_gates']} gates)"
+                               for n, l in lays.items())]
+        else:
+            bits = [f"learned · {st['n_gates']} gates" if st["learned"] else "not learned yet"]
         if st["learning"] or st["learn_waiting"]:
-            bits.append("learning…")
+            bits.append("learning" + (f" {st['learning_layout']}" if len(lays) > 1 else "") + "…")
         if st["analysing"]:
             bits.append(f"analysing {st['analysing']} pilots")
         if st["labelling"]:
@@ -646,6 +692,8 @@ class EventPage(QWidget):
                                             else "REST API, another event open" if ft["level"] == "rest"
                                             else "web server only — changes go to its files" if ft["level"] == "web"
                                             else "not reachable — changes go to its files"))
+        if st.get("finals"):
+            bits.append(st["finals"])
         if self.dash_url:
             bits.append(f"dashboard {self.dash_url}")
         fr = st.get("fril")
@@ -1087,6 +1135,7 @@ class EventPage(QWidget):
     def _review(self):
         """Review the selected pilot's run here: their quadrant enlarged, the
         marks on the timeline, the review panel in place of the table."""
+        from dataset_paths import TrackPaths
         from race_day.review import Review
         s = self._selected()
         d = self.day.heat_detail(self.heat_id) if self.heat_id else None
@@ -1096,13 +1145,15 @@ class EventPage(QWidget):
         p = d["pilots"][ch]
         if not Path(p["race_data"]).exists():
             return QMessageBox.information(self, "Review", "Analyse this heat first.")
-        if not self.day.tp.gate_memory.exists():
-            return QMessageBox.information(self, "Review", "Learn the track first.")
+        tp = TrackPaths(Path(p["track_dir"])) if p.get("track_dir") else self.day.tp   # the pilot's layout
+        if not tp.gate_memory.exists():
+            return QMessageBox.information(self, "Review", "Learn the track first"
+                                           + (f" ({p.get('layout')} layout)." if p.get("layout") not in (None, "main") else "."))
         q = p["quad"]
         rect = tuple(q["rect"])
         full = rect == (0.0, 0.0, 1.0, 1.0)
         try:
-            r = Review(self.day.tp, p["stem"], q["video"], None if full else rect, track_name=self.day.event.name)
+            r = Review(tp, p["stem"], q["video"], None if full else rect, track_name=self.day.event.name)
         except Exception as e:
             return QMessageBox.critical(self, "Review", f"Can't open the review: {e}")
         if self.player.path != q["video"]:
@@ -1189,10 +1240,33 @@ class EventPage(QWidget):
                  + (f" — {heats[h]['timing_laps'].get(ch, '?')} laps" if timing else "") for h, ch in runs if h in heats]
         few = [l for l, (h, ch) in zip(lines, runs)
                if timing and (heats.get(h, {}).get("timing_laps", {}).get(ch) or 0) < 1]
+        by_layout: Dict[str, int] = {}
+        for h, ch in runs:
+            hh = self.day.event.heats.get(h)
+            if hh:
+                lay = self.day.layout_of(hh, ch)
+                by_layout[lay] = by_layout.get(lay, 0) + 1
+        others = {lay: k for lay, k in by_layout.items() if lay != "main"}
+        if others:                                           # layouts of their own: each learned from its runs
+            lines.append("")
+            lines += [f"{k} of them are on the {lay} layout ({self.day._n_gates(lay)} gates, Event setup): "
+                      f"learned on their own" for lay, k in others.items()]
+        if "main" not in by_layout:
+            if QMessageBox.question(self, "Learn the track", f"Learning from {len(runs)} pilot runs:\n  "
+                                    + "\n  ".join(lines) + "\n\nLearn?") == QMessageBox.StandardButton.Yes:
+                self.day.learn(int(self.day.state.get("n_gates") or 10))
+            return
         n, ok = QInputDialog.getInt(self, "Learn the track",
                                     f"Learning from {len(runs)} pilot runs:\n  " + "\n  ".join(lines) +
                                     (f"\n\n⚠ {len(few)} of them have no full lap — they add little." if few else "") +
-                                    "\n\nNumber of gates on the track:",
-                                    int(self.day.state.get("n_gates") or 10), 3, 40)
+                                    "\n\nNumber of gates on the track" + (" (main layout)" if others else "") + ":",
+                                    int(self.day._n_gates("main") or 10), 3, 40)
         if ok:
             self.day.learn(n)
+
+    def _setup(self):
+        from race_day.setup_ui import SetupDialog
+        SetupDialog(self, self.day).exec()
+        self.day._lay_at = 0
+        if self.heat_id:
+            self._show_heat()

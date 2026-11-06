@@ -78,8 +78,11 @@ class HeatReplay:
             self.event.refresh()
             time.sleep(0.3)
         self.heat, self.events = ftreplay.events(event_dir, heat_id)
-        self.tp = TrackPaths(self.event.data_dir)
+        from race_day.eventsetup import EventSetup
+        setup = EventSetup(TrackPaths(self.event.data_dir).dir)
+        self.tp = setup.layout_paths(setup.layout_of(self.heat))   # the heat's class's track layout
         self.fps = fps
+        self.video, self.clock = None, None       # the heat's 2×2 video and the replay's clock, once started
         self._stop = threading.Event()
         self.done = threading.Event()
 
@@ -96,8 +99,9 @@ class HeatReplay:
         t0 = time.time() + LEAD_IN_S              # the race starts then, on the clock
         v0 = float(self.event.to_video(video, h.start))
         self.announcer.set_track(n, lap, legs)
-        self.live.start(str(video), layout(self.event, h), _model(), str(self.tp.gate_memory), str(self.tp.learned_timing),
-                        fps=self.fps, clock={"from": max(0.0, v0 - 5.0), "video": v0, "wall": t0})
+        self.video, self.clock = str(video), {"from": max(0.0, v0 - 5.0), "video": v0, "wall": t0}
+        self.live.start(self.video, layout(self.event, h), _model(), str(self.tp.gate_memory), str(self.tp.learned_timing),
+                        fps=self.fps, clock=self.clock)
         threading.Thread(target=self._play, args=(t0,), daemon=True).start()
         return None
 
@@ -109,10 +113,14 @@ class HeatReplay:
                 break
             e = {"type": e["type"], "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds")
                  .replace("+00:00", "Z"), "seq": seq, **e}
+            if e["type"] == "RaceLoaded":
+                e["heatId"] = self.heat.id                  # the announcer's heat_info finds the heat by it
             for p in e.get("pilots") or []:          # the replay's roster gets its channels from the heat
                 if isinstance(p, dict) and "channel" not in p:
                     ch = next((c for c, name in self.heat.pilots.items() if name == p.get("name")), None)
                     p["channel"] = {"displayName": ch} if ch else None
+            if e["type"] == "RaceStart":
+                self.announcer.play_sound("RaceStart")     # FPVTrackside's start tone: on race day it plays it itself
             self.announcer.on_event(e)
         self._stop.wait(5)
         self.live.stop()

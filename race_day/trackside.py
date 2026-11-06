@@ -119,6 +119,7 @@ class Heat:
     sig: tuple = ()                # file signature it was read with
     race_type: str = ""            # the round's EventType: Race, TimeTrial, Practice…
     target_laps: Optional[int] = None
+    round_name: str = ""           # the round's own name, if it has one ("Open Qualifying 2", "Winners Round 1")
 
     @property
     def short(self) -> str:        # stable short id for file names
@@ -344,7 +345,7 @@ class Event:
         return Heat(id=name, dir=d, start=start, end=end, stage=self.stages.get(rnd.get("Stage"), ""),
                     round=rnd.get("RoundNumber"), race=race.get("RaceNumber"), pilots=pilots, quads=quads,
                     sig=self._folders[name].sig, race_type=rnd.get("EventType") or "",
-                    target_laps=race.get("TargetLaps"))
+                    target_laps=race.get("TargetLaps"), round_name=rnd.get("Name") or "")
 
     def _read_bounds(self, xml: Path, video: Path) -> List[Quad]:
         """Channel → quadrant from the head of a recordinfo.xml (before its frame list).

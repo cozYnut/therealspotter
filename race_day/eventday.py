@@ -39,9 +39,11 @@ from typing import Callable, Dict, List, Optional
 
 from dataset_paths import TrackPaths
 from race_day import labeling, lapcheck, stats as rstats, trackside
+from race_day.eventsetup import MAIN, EventSetup
 from race_day.models import DEFAULT_DET_MODEL
 
 REFRESH_S = 3.0            # look at the event folder (stat only) this often between races
+FINALS_S = 6.0            # the finals rounds: looked at this often between races (and as a race's file is saved)
 RACE_REFRESH_S = 5.0       # while a race runs: only to see it end
 DEFAULT_GATES = 10         # gate count used for analysis before the track is learned
 
@@ -64,12 +66,15 @@ class EventDay:
         self.tp = TrackPaths(self.event.data_dir)
         self.tp.dir.mkdir(exist_ok=True)
         self.tp.runs_dir.mkdir(exist_ok=True)
+        self.setup = EventSetup(self.tp.dir)              # classes and their track layouts (race_day/eventsetup.py)
+        self._layout_tps: Dict[str, TrackPaths] = {}
         self.workers, self.det_model, self.clip_device, self.log = workers, det_model, clip_device, log
         self.use_coreml = use_coreml                      # the detector on the Neural Engine (race_day/models.py)
         self.lock = threading.RLock()
         self.cmds: "queue.Queue" = queue.Queue()
         self.state = {"event": self.event.name, "n_gates": None, "learned_from": [], "learned_at": None,
-                      "auto": False, "pause_in_race": True, "offset": None, "heats": {}, "runs": {}}
+                      "auto": False, "pause_in_race": True, "offset": None, "heats": {}, "runs": {},
+                      "layouts": {}}                  # layout (not main) → {n_gates, learned_from, learned_at}
         if self.tp.race_day_state.exists():
             try:
                 saved = json.loads(self.tp.race_day_state.read_text(encoding="utf-8"))
@@ -91,10 +96,13 @@ class EventDay:
         self.error: Optional[str] = None
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._stop = threading.Event()
-        self._learn_wait: Optional[dict] = None           # learn requested, waiting for analyses
+        self._learn_wait: List[dict] = []                 # layouts to learn, waiting for analyses
+        self._learn_layout = MAIN                         # the layout being learned
         self.ft = None                                    # ftapi.FPVTrackside (FPVTrackside events)
         self.fril = None                                  # fril.FrilLive: the running order on fril.co.il/live
         self.ft_state = {"level": "none", "serves": False, "race": None, "running": False, "error": None}
+        self.finals = None                                # race_day/finals.py: the finals rounds, filled after each race
+        self._fin_at, self._fin_err = 0.0, None
 
     # ── lifecycle ──────────────────────────────────────────────
 
@@ -124,9 +132,63 @@ class EventDay:
     def analyse(self, heat_ids: List[str]):
         self.cmds.put(("analyse", list(heat_ids)))
 
-    def learn(self, n_gates: int):
-        """Learn the track from the pilot runs ticked for learning."""
-        self.cmds.put(("learn", self.learn_runs(), int(n_gates)))
+    def learn(self, n_gates: int, gates: Optional[Dict[str, int]] = None):
+        """Learn the track from the pilot runs ticked for learning: each layout from its own runs. n_gates: the
+        main layout's; gates: other layouts' (else their setup's, else n_gates)."""
+        self.cmds.put(("learn", self.learn_runs(), int(n_gates), dict(gates or {})))
+
+    # ── track layouts (race_day/eventsetup.py) ────────────────
+
+    def layout_tp(self, name: Optional[str]) -> TrackPaths:
+        """A layout's track folder: the event's own for main."""
+        if not name or name == MAIN:
+            return self.tp
+        tp = self._layout_tps.get(name)
+        if tp is None:
+            tp = self.setup.layout_paths(name)
+            tp.runs_dir.mkdir(parents=True, exist_ok=True)
+            self._layout_tps[name] = tp
+        return tp
+
+    def layout_of(self, h, channel: Optional[str] = None) -> str:
+        return self.setup.layout_of(h, channel)
+
+    def tp_for(self, h, channel: str) -> TrackPaths:
+        """The track folder of one pilot's run: their class's layout."""
+        return self.layout_tp(self.layout_of(h, channel))
+
+    def tp_of_stem(self, stem: str) -> TrackPaths:
+        for h in list(self.event.heats.values()):
+            if stem.startswith(h.short + "_"):
+                ch = stem[len(h.short) + 1:]
+                if ch in h.pilots:
+                    return self.tp_for(h, ch)
+        return self.tp
+
+    def layouts_used(self) -> List[str]:
+        """Main, then every other layout a heat's pilot flies."""
+        used = {self.layout_of(h, c) for h in list(self.event.heats.values()) for c in h.pilots}
+        return [MAIN] + sorted(used - {MAIN})
+
+    def learned(self, layout: str = MAIN) -> bool:
+        return labeling.is_learned(self.layout_tp(layout))
+
+    def _adopt(self, tp: TrackPaths, stem: str):
+        """A run analysed in the main folder before its layout was set: its analysis (passes, embeddings) is
+        the same on any layout, so it's copied over rather than analysed again (labelled there)."""
+        if tp is self.tp or tp.race_data(stem).exists() or not self.tp.race_data(stem).exists():
+            return
+        import shutil
+        shutil.copy2(self.tp.race_data(stem), tp.race_data(stem))
+        pic = self.tp.runs_dir / f"{stem}.picture.json"
+        if pic.exists():
+            shutil.copy2(pic, tp.runs_dir / pic.name)
+        q = self.tp.race_query_dir(stem)
+        if q.exists() and not tp.race_query_dir(stem).exists():
+            try:
+                os.symlink(q, tp.race_query_dir(stem))
+            except OSError:
+                pass
 
     def set_auto(self, on: bool):
         self.cmds.put(("auto", bool(on) and self.mode == "live"))
@@ -214,6 +276,8 @@ class EventDay:
         from race_day import ftapi
         if isinstance(self.event, trackside.Event):
             self.ft = ftapi.FPVTrackside(url or ftapi.DEFAULT_URL, token)
+            from race_day.finals import Finals
+            self.finals = Finals(self.setup, self.ft, self.log)
             self.cmds.put(("ft",))
 
     def set_fril(self, url: Optional[str]):
@@ -238,13 +302,23 @@ class EventDay:
                     "paused": self.paused, "pause_in_race": self.state.get("pause_in_race", True),
                     "learned": labeling.is_learned(self.tp),
                     "n_gates": self.state["n_gates"], "learning": self.learning is not None,
-                    "learn_waiting": self._learn_wait is not None,
+                    "learn_waiting": bool(self._learn_wait), "learning_layout": self._learn_layout,
+                    "layouts": {n: {"learned": self.learned(n), "n_gates": self._n_gates(n)}
+                                for n in self._layouts_cached()},
                     "analysing": kinds.count("analyse"), "labelling": kinds.count("label"),
                     "auto": self.state["auto"], "offset": self.state["offset"], "error": self.error,
                     "heats": len(self.event.heats), "timing": self.event.has_timing,
                     "fpvtrackside": dict(self.ft_state, url=self.ft.url if self.ft else None),
                     "fril": self.fril.status() if self.fril else None,
+                    "finals": self.finals.status if self.finals else "",
                     "unconfigured": list(getattr(self.event, "unconfigured", []))}
+
+    def _layouts_cached(self) -> List[str]:
+        now = _now()
+        if now - getattr(self, "_lay_at", 0) > 10 or not getattr(self, "_lay", None):
+            self.setup.reload()
+            self._lay, self._lay_at = self.layouts_used(), now
+        return self._lay
 
     def dashboard_status(self) -> dict:
         """/api/status in the dashboard's shape."""
@@ -284,7 +358,7 @@ class EventDay:
                             "learn": "all" if sel and sel >= set(h.pilots) else ("some" if sel else "none"),
                             "learn_pilots": sorted(sel),
                             "timing_laps": {c: max(0, len(v) - 1) for c, v in timing.items()},
-                            "reviewed": [c for c in h.pilots if self.tp.gt(h.stem(c)).exists()],
+                            "reviewed": [c for c in h.pilots if self.tp_for(h, c).gt(h.stem(c)).exists()],
                             "no_video": [c for c, v in hs.get("check", {}).items() if v.get("no_video")],
                             "open": self._open_findings(h.id), "written": bool(hs.get("written"))})
         return out
@@ -303,7 +377,8 @@ class EventDay:
             ch = q.channel
             dets = timing.get(ch, [])
             check = hs.get("check", {}).get(ch, {})
-            race = self._race(h.stem(ch))
+            tp = self.tp_for(h, ch)
+            race = self._race(h.stem(ch), tp)
             pilots[ch] = {
                 "pilot": h.pilots[ch], "quad": {"video": str(q.video), "rect": q.rect, "kind": q.kind},
                 "timing": [{"t": d["t"], "video_t": float(self.event.to_video(q.video, d["t"] - self._offset(heat_id))),
@@ -312,21 +387,23 @@ class EventDay:
                 "video_g1": [p["t"] for p in lapcheck.g1_passes(race)] if race else [],
                 "passes": [{"t": p["t"], "gate": p.get("gate_id", -1)} for p in (race or {}).get("passes", [])],
                 "laps": [{"lap": l.get("lap"), "t0": l["t0"], "t1": l["t1"]} for l in (race or {}).get("laps", [])],
-                "stem": h.stem(ch), "race_data": str(self.tp.race_data(h.stem(ch))),
-                "gt": str(self.tp.gt(h.stem(ch))), "reviewed": self.tp.gt(h.stem(ch)).exists(),
+                "stem": h.stem(ch), "race_data": str(tp.race_data(h.stem(ch))),
+                "gt": str(tp.gt(h.stem(ch))), "reviewed": tp.gt(h.stem(ch)).exists(),
+                "layout": self.layout_of(h, ch), "track_dir": str(tp.dir),
                 "review": (race or {}).get("review"),
                 "findings": [dict(f, race_t=f["t"] - h.start) for f in check.get("findings", [])],
                 "run": hs.get("runs", {}).get(ch, {}),
                 "checked": bool(check), "no_video": bool(check.get("no_video")),
                 "no_video_findings": check.get("no_video_findings", 0),
                 "confirmed": check.get("confirmed"),          # None: checked before this was recorded
-                "gray": self._gray(h.stem(ch)),
+                "gray": self._gray(h.stem(ch), tp),
             }
         return {"id": h.id, "number": h.number, "label": h.label, "start": h.start, "end": h.end,
                 "status": hs.get("status", "new"), "pilots": pilots, "decisions": hs.get("decisions", {}),
                 "marks": hs.get("marks", []), "written": hs.get("written", []),
                 "learn_pilots": hs.get("learn_pilots", []),
-                "changes": self.changes(heat_id), "todo": self.marshal_todo(heat_id), "n_gates": self._n_gates(),
+                "changes": self.changes(heat_id), "todo": self.marshal_todo(heat_id),
+                "n_gates": self._n_gates(self.layout_of(h)), "layout": self.layout_of(h),
                 "done_in_fpvtrackside": hs.get("done_in_fpvtrackside", 0), "overwritten": hs.get("overwritten"),
                 "api_error": hs.get("api_error"), "api": bool(self.ft_state["serves"]),
                 "api_writes": sum(1 for w in hs.get("written", []) if w.get("via") == "api" and not w.get("undone")
@@ -411,16 +488,16 @@ class EventDay:
     def _quad(h, channel):
         return next((q for q in (h.quads if h else []) if q.channel == channel), None)
 
-    def _race(self, stem: str) -> Optional[dict]:
-        p = self.tp.race_data(stem)
+    def _race(self, stem: str, tp: Optional[TrackPaths] = None) -> Optional[dict]:
+        p = (tp or self.tp_of_stem(stem)).race_data(stem)
         try:
             return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
         except ValueError:
             return None
 
-    def _gray(self, stem: str) -> List[list]:
+    def _gray(self, stem: str, tp: Optional[TrackPaths] = None) -> List[list]:
         """A run's stretches with no picture (video seconds), from its picture.json."""
-        p = self.tp.runs_dir / f"{stem}.picture.json"
+        p = (tp or self.tp_of_stem(stem)).runs_dir / f"{stem}.picture.json"
         try:
             return json.loads(p.read_text(encoding="utf-8")).get("gray", []) if p.exists() else []
         except (OSError, ValueError):
@@ -432,13 +509,20 @@ class EventDay:
         return sum(1 for ch, c in hs.get("check", {}).items() for f in c.get("findings", [])
                    if f"{ch}|{lapcheck_key(f)}" not in dec)
 
-    def _n_gates(self) -> int:
-        """The track's gate count: as set (setup / learning), else the learned
-        gates' (a track learned before it was opened here), else a default."""
-        if self.state["n_gates"]:
+    def _n_gates(self, layout: str = MAIN) -> int:
+        """A layout's gate count: as set (learning, the event setup), else the learned gates' (a track learned
+        before it was opened here), else a default."""
+        if layout and layout != MAIN:
+            g = (self.state["layouts"].get(layout) or {}).get("n_gates") or \
+                (self.setup.layouts.get(layout) or {}).get("gates")
+            if g:
+                return int(g)
+        elif self.state["n_gates"]:
             return int(self.state["n_gates"])
+        elif (self.setup.layouts.get(MAIN) or {}).get("gates"):
+            return int(self.setup.layouts[MAIN]["gates"])
         try:
-            n = len(json.loads(self.tp.gate_memory.read_text(encoding="utf-8")).get("memory", []))
+            n = len(json.loads(self.layout_tp(layout).gate_memory.read_text(encoding="utf-8")).get("memory", []))
         except (OSError, ValueError):
             n = 0
         return n or DEFAULT_GATES
@@ -477,9 +561,28 @@ class EventDay:
                 st["error"] = str(e)
         self.ft_state = st
 
+    def _fill_finals(self, force: bool = False):
+        """The finals rounds in FPVTrackside (race_day/finals.py): the results of the races just flown to the
+        Seeder, the races whose line-ups are now known into the next rounds. Between races only."""
+        from race_day import ftapi
+        st = self.ft_state
+        if not self.finals or not st["serves"] or st["running"]:
+            return
+        if not force and _now() - self._fin_at < FINALS_S:
+            return
+        self._fin_at = _now()
+        try:
+            self.finals.tick()
+            self._fin_err = None
+        except (ftapi.ApiError, ValueError, KeyError, TypeError) as e:
+            if str(e) != self._fin_err:
+                self.log(f"finals: {e}")
+            self._fin_err = str(e)
+
     def _refresh(self):
         r = self.event.refresh()
         self._poll_fpvtrackside()
+        self._fill_finals(force=bool(r["new"] or r["changed"]))
         if self.fril:                                 # the running order on fril.co.il/live (sent on a change)
             self.fril.update(self.race_day())
         if self.ft_state["running"]:                  # FPVTrackside's own race control says so
@@ -522,7 +625,7 @@ class EventDay:
         """A heat analysed but never checked (its check was waiting for a race
         when the app closed, or its labelling failed) is labelled — and so
         checked — again, once per session."""
-        if self.learning is not None or not labeling.is_learned(self.tp):
+        if self.learning is not None:
             return
         busy = {j[1] for j in self.jobs.values()} | set(self._after_race)
         with self.lock:
@@ -554,7 +657,7 @@ class EventDay:
                 for hid in cmd[1]:
                     self._submit_heat(hid, force=True)
             elif kind == "learn":
-                self._start_learn(cmd[1], cmd[2])
+                self._start_learn(cmd[1], cmd[2], cmd[3] if len(cmd) > 3 else {})
             elif kind == "save":
                 pass
             elif kind == "auto":
@@ -576,8 +679,8 @@ class EventDay:
                 h = self.event.heats.get(cmd[1])
                 if h:
                     for c in h.pilots:
-                        if self.tp.race_data(h.stem(c)).exists():
-                            labeling.apply_review(self.tp, h.stem(c))
+                        if self.tp_for(h, c).race_data(h.stem(c)).exists():
+                            labeling.apply_review(self.tp_for(h, c), h.stem(c))
                     self._check(cmd[1])
             self._save()
 
@@ -609,13 +712,18 @@ class EventDay:
                 if q.channel not in channels or q.channel not in h.pilots:
                     continue
                 stem = h.stem(q.channel)
-                if f"a:{stem}" in self.jobs or (not force and self.tp.race_data(stem).exists()):
+                lay = self.layout_of(h, q.channel)
+                tp = self.layout_tp(lay)
+                if not force:
+                    self._adopt(tp, stem)
+                if f"a:{stem}" in self.jobs or (not force and tp.race_data(stem).exists()):
                     continue
-                by_video.setdefault(str(q.video), []).append(q)
-            for video, quads in by_video.items():
-                runs = [{"stem": h.stem(q.channel), "rect": q.rect, "out_json": self.tp.race_data(h.stem(q.channel))}
+                by_video.setdefault((str(q.video), lay), []).append(q)
+            for (video, lay), quads in by_video.items():   # a video's pilots together, per layout (its gates)
+                tp = self.layout_tp(lay)
+                runs = [{"stem": h.stem(q.channel), "rect": q.rect, "out_json": tp.race_data(h.stem(q.channel))}
                         for q in quads]
-                fut = self.pool.submit_heat(video, runs, self._n_gates(), self._race_window(h, quads[0].video))
+                fut = self.pool.submit_heat(video, runs, self._n_gates(lay), self._race_window(h, quads[0].video))
                 for q in quads:
                     stem = h.stem(q.channel)
                     self.jobs[f"a:{stem}"] = ("analyse", h.id, fut, {"stem": stem, "channel": q.channel})
@@ -665,13 +773,14 @@ class EventDay:
             elif kind == "label":
                 if err:
                     self.log(f"heat {hid[:8]}: labelling failed — {err}")
-                self._check(hid)
-                self._auto_write(hid)
+                if not any(j[0] == "label" and j[1] == hid for j in self.jobs.values()):   # every layout's
+                    self._check(hid)
+                    self._auto_write(hid)
         if self.learning is not None and self.learning.done():
             self._learned()
-        if self._learn_wait and not any(j[0] == "analyse" for j in self.jobs.values()):
-            w, self._learn_wait = self._learn_wait, None
-            self._run_learn(w["runs"], w["n_gates"])
+        if self._learn_wait and self.learning is None and not any(j[0] == "analyse" for j in self.jobs.values()):
+            w = self._learn_wait.pop(0)                   # one layout at a time
+            self._run_learn(w["runs"], w["n_gates"], w["layout"])
         if done:
             self._save()
 
@@ -683,42 +792,63 @@ class EventDay:
             hs = self._heat(hid)
             if hs.get("status") == "analysing":
                 hs["status"] = "analysed"
-        if labeling.is_learned(self.tp) and self.learning is None:
+        if self.learning is None:
             self._submit_label(hid)
 
     def _submit_label(self, hid: str):
+        """Label a heat's analysed runs: one job per layout whose track is learned."""
         h = self.event.heats.get(hid)
         if not h:
             return
-        stems = [h.stem(c) for c in h.pilots if self.tp.race_data(h.stem(c)).exists()]
-        quads = {h.stem(q.channel): (str(q.video), tuple(q.rect)) for q in h.quads if h.stem(q.channel) in stems}
-        if stems:
-            self.jobs[f"l:{hid}"] = ("label", hid, self.pool.submit_label(self.tp.dir, stems, quads), {})
+        by_layout: Dict[str, List[str]] = {}
+        for c in h.pilots:
+            lay = self.layout_of(h, c)
+            if self.layout_tp(lay).race_data(h.stem(c)).exists():
+                by_layout.setdefault(lay, []).append(h.stem(c))
+        for lay, stems in by_layout.items():
+            tp = self.layout_tp(lay)
+            if not labeling.is_learned(tp):
+                continue
+            quads = {h.stem(q.channel): (str(q.video), tuple(q.rect)) for q in h.quads if h.stem(q.channel) in stems}
+            self.jobs[f"l:{hid}:{lay}"] = ("label", hid, self.pool.submit_label(tp.dir, stems, quads), {"layout": lay})
 
     # learning ------------------------------------------------------
 
-    def _start_learn(self, runs: List[tuple], n_gates: int):
+    def _start_learn(self, runs: List[tuple], n_gates: int, gates: Optional[Dict[str, int]] = None):
         """runs: (heat id, channel) chosen by the user. Only those pilots are
-        analysed first (if they aren't yet), then learned from."""
-        with self.lock:
-            self.state["n_gates"] = n_gates
+        analysed first (if they aren't yet), then learned from — each layout
+        from its own runs, one after the other."""
+        by_layout: Dict[str, List[tuple]] = {}
+        for hid, ch in runs:
+            h = self.event.heats.get(hid)
+            if h:
+                by_layout.setdefault(self.layout_of(h, ch), []).append((hid, ch))
         by_heat: Dict[str, List[str]] = {}
         for hid, ch in runs:
             by_heat.setdefault(hid, []).append(ch)
         for hid, chs in by_heat.items():                 # a heat's chosen pilots analysed together
             if hid in self.event.heats:
                 self._submit_runs(self.event.heats[hid], chs)
-        self._learn_wait = {"runs": runs, "n_gates": n_gates}
-        self.log(f"Learning the track ({n_gates} gates) from {len(runs)} pilot runs…")
+        self._learn_wait = []
+        for lay, lruns in by_layout.items():
+            n = n_gates if lay == MAIN else int((gates or {}).get(lay) or self._n_gates(lay) or n_gates)
+            with self.lock:
+                if lay == MAIN:
+                    self.state["n_gates"] = n
+                else:
+                    self.state["layouts"].setdefault(lay, {})["n_gates"] = n
+            self._learn_wait.append({"runs": lruns, "n_gates": n, "layout": lay})
+            self.log(f"Learning the track{'' if lay == MAIN else f' ({lay})'} ({n} gates) from {len(lruns)} pilot runs…")
 
-    def _run_learn(self, runs: List[tuple], n_gates: int):
+    def _run_learn(self, runs: List[tuple], n_gates: int, layout: str = MAIN):
         """Learn from the chosen runs. With FPVTrackside's timing, each run's
         lap crossings are passed in as known G1 moments (any run with one
         full lap is enough, and learning is much faster)."""
         stems, g1 = [], {}
+        tp = self.layout_tp(layout)
         for hid, ch in runs:
             h = self.event.heats.get(hid)
-            if not h or not self.tp.race_data(h.stem(ch)).exists():
+            if not h or not tp.race_data(h.stem(ch)).exists():
                 continue
             stems.append(h.stem(ch))
             q = self._quad(h, ch)
@@ -728,8 +858,8 @@ class EventDay:
         if not stems:
             self.log("Nothing analysed to learn from")
             return
-        self._learn_stems = stems
-        self.learning = self.pool.submit_learn(self.tp.dir, stems, n_gates, g1_times=g1 or None)
+        self._learn_stems, self._learn_layout = stems, layout
+        self.learning = self.pool.submit_learn(tp.dir, stems, n_gates, g1_times=g1 or None)
 
     def _learned(self):
         fut, self.learning = self.learning, None
@@ -739,11 +869,16 @@ class EventDay:
             self.error = f"learning failed: {e}"
             self.log(self.error)
             return
+        lay = self._learn_layout
         with self.lock:
-            self.state.update(learned_from=self._learn_stems, learned_at=_now())
-        self.log(f"Track learned from {res['runs']} runs ({res['laps']} laps) in {res.get('seconds')}s")
-        for hid, h in list(self.event.heats.items()):        # label every analysed heat (again)
-            if any(self.tp.race_data(h.stem(c)).exists() for c in h.pilots) \
+            if lay == MAIN:
+                self.state.update(learned_from=self._learn_stems, learned_at=_now())
+            else:
+                self.state["layouts"].setdefault(lay, {}).update(learned_from=self._learn_stems, learned_at=_now())
+        self.log(f"Track{'' if lay == MAIN else f' ({lay})'} learned from {res['runs']} runs ({res['laps']} laps) "
+                 f"in {res.get('seconds')}s")
+        for hid, h in list(self.event.heats.items()):        # label every analysed heat of that layout (again)
+            if any(self.layout_of(h, c) == lay and self.layout_tp(lay).race_data(h.stem(c)).exists() for c in h.pilots) \
                     and not any(j[1] == hid and j[0] == "analyse" for j in self.jobs.values()):
                 with self.lock:
                     hs = self._heat(hid)
@@ -753,9 +888,9 @@ class EventDay:
 
     # lap check & writing --------------------------------------------
 
-    def _lap_ref(self) -> Optional[float]:
+    def _lap_ref(self, layout: str = MAIN) -> Optional[float]:
         try:
-            tim = json.loads(self.tp.learned_timing.read_text(encoding="utf-8"))
+            tim = json.loads(self.layout_tp(layout).learned_timing.read_text(encoding="utf-8"))
             return float(sum(tim.get("leg_seconds", {}).values())) or None
         except (OSError, ValueError):
             return None
@@ -777,7 +912,7 @@ class EventDay:
         if external:
             self._marks_done(hid, timing)
             self._overwritten(hid, timing)
-        races = {c: self._race(h.stem(c)) for c in h.pilots}
+        races = {c: self._race(h.stem(c), self.tp_for(h, c)) for c in h.pilots}
         q_of = {q.channel: q for q in h.quads}
         diffs = []                                            # the timing antenna vs the visual gate, this heat
         for c, race in races.items():
@@ -801,10 +936,11 @@ class EventDay:
             if not self.event.has_timing:                     # no timing system: the video's own laps
                 out[c] = {"timing_laps": None, "video_laps": len(race.get("laps", [])), "findings": []}
                 continue
-            pic = self.tp.runs_dir / f"{h.stem(c)}.picture.json"
+            lay = self.layout_of(h, c)
+            pic = self.layout_tp(lay).runs_dir / f"{h.stem(c)}.picture.json"
             gray = json.loads(pic.read_text(encoding="utf-8")).get("gray", []) if pic.exists() else []
             res = lapcheck.check_pilot(race, timing.get(c, []), lambda t, v=q.video: self.event.to_clock(v, t),
-                                       self._n_gates(), offset, h.start, h.end, self._lap_ref(),
+                                       self._n_gates(lay), offset, h.start, h.end, self._lap_ref(lay),
                                        low_quality=q.kind == "dji", gray=gray,
                                        race_video=(float(self.event.to_video(q.video, h.start)),
                                                    float(self.event.to_video(q.video, h.end))),
@@ -886,10 +1022,11 @@ class EventDay:
             off = self._offset(h.id)
             official = [float(self.event.to_video(q.video, d["t"] - off))
                         for d in self.event.timing(h).get(q.channel, [])]
-        st = rstats.run_stats(race, meta, self._n_gates(), official=official)
+        lay = self.layout_of(h, q.channel)
+        st = rstats.run_stats(race, meta, self._n_gates(lay), official=official)
         st.update(stem=stem, pilot=h.pilots.get(q.channel, "?"), heat=h.number, channel=q.channel,
                   stage=h.stage, round=h.round, race=h.race, reviewed=(race.get("review") or {}).get("status"))
-        labeling._write_json(self.tp.runs_dir / f"{stem}.stats.json", st)
+        labeling._write_json(self.layout_tp(lay).runs_dir / f"{stem}.stats.json", st)
         with self.lock:
             self.state["runs"][stem] = {
                 "stem": stem, "status": "labelled", "heat": h.number, "channel": q.channel,

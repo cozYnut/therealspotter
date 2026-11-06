@@ -167,6 +167,7 @@ class Sounds:
 
     def __init__(self, path: Optional[Path]):
         self.enabled: Dict[str, bool] = {}
+        self.files: Dict[str, str] = {}          # key → its sound file, relative to FPVTrackside's folder
         self.matchers = []                       # (literal characters, key, regex)
         if not path or not path.exists():
             return
@@ -177,6 +178,8 @@ class Sounds:
         for s in root:
             key, text = s.findtext("Key") or "", (s.findtext("TextToSpeech") or "").strip().rstrip(". ")
             self.enabled[key] = (s.findtext("Enabled") or "").lower() == "true"
+            if (s.findtext("Filename") or "").strip():
+                self.files[key] = s.findtext("Filename").strip()
             if not text:
                 continue
             literal = sum(len(p) for p in re.split(r"\{\w+\}", text))
@@ -291,6 +294,7 @@ class Announcer:
         self.legs: List[float] = []               # its learned seconds from each gate to the next
         self.follower: Optional[LogFollower] = None
         self.on_race: Optional[Callable[[bool], None]] = None
+        self.heat_info: Optional[Callable[[dict], dict]] = None   # RaceLoaded → the heat's setup (lazy_spotter_v2)
         self.lock = threading.RLock()
         self.calls: List[str] = []               # the last calls made (for the screen)
         self._new_race({})
@@ -325,6 +329,16 @@ class Announcer:
             return 0.0
         return sum(self.legs[(g0 - 1 + k) % self.n_gates] for k in range(d))
 
+    def play_sound(self, key: str):
+        """Play one of FPVTrackside's own sound files (RaceStart: its start tone), as FPVTrackside would.
+        For a replayed heat only: on race day FPVTrackside plays them itself, also with its voice off."""
+        f = self.sounds.files.get(key)
+        if not (self.enabled and f and self.sounds.on(key)):
+            return
+        path = Path(f) if os.path.isabs(f) else FT_HOME / f
+        if path.exists():
+            subprocess.Popen(["afplay", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
     def test(self):
         self.speaker.say(self.style.line("lap_lead", pilot="Pennz", lap=2, time=self.style.lap_time(21.96))
                          or "Pennz, lap 2, 21.96, takes the lead", P_LAP)
@@ -353,7 +367,10 @@ class Announcer:
             return self.style.pilot(callsign, (pilot.get("phonetic") or "").strip(" '\"") or None)
         return self.style.pilot(pilot, self.race["say"].get(pilot))
 
-    def _new_race(self, e: dict):
+    def _new_race(self, e: dict, info: Optional[dict] = None):
+        """info (heat_info): the heat's class, kind (qualifying / finals), call style (times / places / both),
+        and in a bracket its group (Winners / Losers / Chase the Ace) and how many go through."""
+        info = info or {}
         pilots, chans = {}, {}
         for p in e.get("pilots") or []:
             p = p.get("pilot", p) if isinstance(p, dict) else {"name": p}
@@ -364,7 +381,9 @@ class Announcer:
                     chans[lab] = p["name"]
         self.race = {"label": f"Round {e.get('round')} race {e.get('race')}" if e else None,
                      "type": e.get("raceType") or "Race", "target": e.get("targetLaps") or 0, "say": pilots,
-                     "channels": chans}
+                     "channels": chans, "style": info.get("style") or "both", "kind": info.get("kind"),
+                     "group": info.get("group"), "advance": info.get("advance"), "class": info.get("class"),
+                     "ace_wins": info.get("ace_wins")}
         self.running = False
         self.silenced = False
         self.leader: Optional[str] = None         # who leads, as last called
@@ -381,11 +400,17 @@ class Announcer:
 
     def on_event(self, e: dict):
         kind = e.get("type")
+        info = None
+        if kind == "RaceLoaded" and self.heat_info:          # asked outside the lock: it may ask FPVTrackside
+            try:
+                info = self.heat_info(e)
+            except Exception as ex:              # noqa: BLE001
+                self.log(f"announcer: the heat's setup: {ex}")
         with self.lock:
             if kind == "Hello":
                 self._hello(e)
             elif kind == "RaceLoaded":
-                self._new_race(e)
+                self._new_race(e, info)
             elif kind == "RaceStartAnnouncement":
                 if self.sounds.on("StartRaceIn") and self._fresh(e):
                     secs = e.get("delaySeconds")
@@ -466,15 +491,29 @@ class Announcer:
         if not self.sounds.on("RaceLap"):
             self.leader = self.leader or leader
             return
+        style = self.race.get("style") or "both"
         words = dict(pilot=name, lap=n, time=t, place=self.style.place(pos) if isinstance(pos, int) else None)
+        if style == "times":                     # the club calls this heat by lap times: no places
+            self._say("lap_time", P_LAP, **dict(words, place=None))
+            if fastest:
+                self._say("fastest", P_PLACE, pilot=name, time=t)
+            if pos == 1 and self.race["target"] and n == self.race["target"] - 1:
+                self._say("last_lap", P_LAP, pilot=name)
+            self.leader = self.leader or leader
+            return
+        alt = "_place" if style == "places" else ""   # places only: the lines without a lap time
+        if alt:
+            words["time"] = None
         if pos == 1 and leader == pilot and self.leader not in (None, pilot):
-            self._say("lap_lead", P_LAP, **words) or self._say("lap", P_LAP, **words)
+            self._say("lap_lead" + alt, P_LAP, **words) or self._say("lap_lead", P_LAP, **words) or \
+                self._say("lap" + alt, P_LAP, **words)
             self.called["lead"], self.leader = time.time(), pilot
         elif pos == 1:
-            self._say("lap_leader", P_LAP, **words) or self._say("lap", P_LAP, **words)
+            self._say("lap_leader" + alt, P_LAP, **words) or self._say("lap_leader", P_LAP, **words) or \
+                self._say("lap" + alt, P_LAP, **words)
         else:
-            self._say("lap", P_LAP, **words)
-        if fastest:
+            self._say("lap" + alt, P_LAP, **words) or self._say("lap", P_LAP, **words)
+        if fastest and style != "places":
             self._say("fastest", P_PLACE, pilot=name, time=t)
         if pos == 1 and self.race["target"] and n == self.race["target"] - 1:
             self._say("last_lap", P_LAP, pilot=name)
@@ -497,9 +536,33 @@ class Announcer:
                       ahead=self._name(prev[0])) or self._say("finish", P_LAP, pilot=name, place=self.style.place(k))
         else:
             self._say("finish", P_LAP, pilot=name, place=self.style.place(k))
+        self._bracket_call(pilot, name, k)
         if k == len(self.race["say"]) and k > 1:   # the last one home gets a kind word
             self._say("kind_new" if self.style.is_new(pilot) else "kind", P_INFO, pilot=name) or \
                 self._say("kind", P_INFO, pilot=name)
+
+    def _bracket_call(self, pilot: str, name: str, k: int):
+        """In a bracket (Event setup): what this finishing place means — through, to the losers bracket, out, or
+        a chase the ace win."""
+        group = (self.race.get("group") or "").lower()
+        adv = self.race.get("advance")
+        if not group or self.race.get("kind") != "finals":
+            return
+        if "chase" in group:
+            if k == 1:                             # a final of one race (the other mains) or a chase the ace win
+                if self.race.get("ace_wins") == 1:
+                    self._say("final_win", P_INFO, pilot=name) or self._say("ace_win", P_INFO, pilot=name)
+                else:
+                    self._say("ace_win", P_INFO, pilot=name)
+            return
+        if not isinstance(adv, int) or adv <= 0:
+            return
+        if k <= adv:
+            self._say("through", P_INFO, pilot=name)
+        elif "winner" in group:
+            self._say("to_losers", P_INFO, pilot=name)
+        elif "loser" in group:
+            self._say("eliminated", P_INFO, pilot=name)
 
     def _logged(self, text: str):
         """A line FPVTrackside spoke (into its log): said here unless it's a call made from the events."""

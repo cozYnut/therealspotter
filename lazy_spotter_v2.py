@@ -489,6 +489,7 @@ class Main(QMainWindow):
                                    bool(st.get("announcer_on")), club, st.get("announcer_track"))
         self.live = LiveVideo(self.announcer.on_video, self._log)
         self.announcer.on_race = self.live.set_race
+        self.announcer.heat_info = self._heat_info
         self.replay = None
         try:
             self.relay = EventRelay(st.get("fril_live_url"), log=self._log).start()
@@ -496,6 +497,47 @@ class Main(QMainWindow):
         except OSError as e:                     # port in use: the app works without it
             self.relay = None
             self._log(f"FPVTrackside events: can't listen ({e})")
+
+    def _heat_info(self, e: dict) -> dict:
+        """What the announcer needs about the race FPVTrackside just loaded (race_day/eventsetup.py): its class,
+        qualifying or finals, the class's call style for it, and in a bracket its group (Winners / Losers / Chase
+        the Ace) and how many go through. From the event's files for a replayed heat, else FPVTrackside's API."""
+        from types import SimpleNamespace
+        from race_day.ftapi import ApiError
+        day = self.event_day
+        if not day or not hasattr(day, "setup"):
+            return {}
+        setup = day.setup
+        setup.reload()
+        rtype, round_name, stage, group, advance = e.get("raceType") or "", "", "", None, None
+        pilots = {i: (p.get("pilot", p) if isinstance(p, dict) else {"name": p}).get("name")
+                  for i, p in enumerate(e.get("pilots") or [])}
+        h = day.event.heats.get(e.get("heatId") or "")
+        rid = (e.get("heatId") or "").lower()
+        if h:                                            # a replay: the heat's own round
+            round_name, stage, pilots, rtype = h.round_name, h.stage, h.pilots, h.race_type or rtype
+        elif day.ft and day.ft_state.get("serves"):
+            try:
+                cur = (day.ft.get("/race-control") or {}).get("currentRace") or {}
+                rnd = day.ft.get(f"/rounds/{cur['roundId']}") if cur.get("roundId") else {}
+                round_name, stage = (rnd or {}).get("name") or "", (rnd or {}).get("stage") or ""
+                rid = (cur.get("id") or "").lower()
+                if cur.get("bracket") not in (None, "", "None"):
+                    group = cur["bracket"]
+            except (ApiError, KeyError, TypeError) as ex:
+                self._log(f"announcer: FPVTrackside's race: {ex}")
+        fin = day.finals.by_fpv(rid) if getattr(day, "finals", None) else None
+        if fin:                                          # a finals race the app put in (race_day/finals.py)
+            cls = setup.cls(fin.get("class") or "")
+            style = ((cls or {}).get("style") or {}).get("finals")
+            return {"class": fin.get("class"), "kind": "finals", "style": style or "both",
+                    "group": fin.get("group"), "advance": fin.get("advance"), "main": fin.get("main"),
+                    "ace_wins": fin.get("ace_wins")}
+        cls = setup.class_of_heat(SimpleNamespace(round_name=round_name, stage=stage, pilots=pilots))
+        kind = setup.heat_kind(race_type=rtype, round_name=round_name)
+        style = ((cls or {}).get("style") or {}).get("qualifying" if kind == "qualifying" else "finals")
+        return {"class": (cls or {}).get("name"), "kind": kind, "style": style if cls else "both",
+                "group": group, "advance": advance}
 
     def set_announcer(self):
         from race_day.announcer_ui import AnnouncerDialog
@@ -522,9 +564,12 @@ class Main(QMainWindow):
         """The heat selected on the FPVTrackside screen, played to the announcer as if it were being raced: its
         video for the capture card, its crossings for FPVTrackside's events. None, or why it can't."""
         from race_day.heatreplay import HeatReplay
-        if self.replay:
+        player = self.event_page.player
+        if self.replay and not self.replay.done.is_set():
             self.replay.stop()
             self.replay = None
+            player.unfollow()
+            player.stop()
             return "stopped"
         hid = self.event_page.heat_id
         if not self.event_day or not hid:
@@ -535,6 +580,9 @@ class Main(QMainWindow):
         why = self.replay.start()
         if why:
             self.replay = None
+        else:
+            if not player.follow(self.replay.video, self.replay.clock):    # the main window's video, in step with it
+                self._log("replay: the main window shows another heat's video, so it doesn't follow the replay")
         return why
 
     # ── live capture ──────────────────────────────────────────

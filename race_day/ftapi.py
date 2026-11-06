@@ -19,6 +19,17 @@ What the app uses:
                                               earlier one of the pilot to measure from
   PATCH /api/v1/races/{race}/detections/{id} {valid, validityType}: undo (restore)
 
+For the event setup (race_day/eventsetup.py):
+
+  GET   /api/v1/pilots, /rounds, /races      the event as FPVTrackside has it now
+  POST  /api/v1/meeting/sync                 {pilots, rounds, removeMissing, dryRun}: the qualifying
+                                              rounds and races, matched by externalId (sending the
+                                              same plan again changes nothing; dryRun changes nothing)
+  GET   /api/v1/stages/seeding?round=…&laps= the qualifying order (best consecutive laps)
+  GET   /api/v1/stages, /stages/{id}         the Seeder's stages: races, groups, results, standings
+  POST  /api/v1/stages                       {name, format, setup, pilots, seatChannels, autoSend}
+  POST  /api/v1/stages/{id}/send             every race whose line-up is known, to FPVTrackside
+
 Reads are open to anyone; changes are allowed from the FPVTrackside machine
 itself, or with a token (a web user's API key or FPV_API_TOKEN) from another
 one. The API sends camelCase keys and ISO times with an offset.
@@ -131,7 +142,41 @@ class FPVTrackside:
         d = self._call("GET", f"/api/v1/races/{race_id}") or {}
         return [_lap(l) for l in _key(d, "laps") or []]
 
+    def get(self, path: str):
+        """Any read of the API: path after /api/v1 ("/rounds", "/stages/3"…)."""
+        return self._call("GET", "/api/v1" + path)
+
+    def info(self) -> dict:
+        return self._call("GET", "/api/v1") or {}
+
+    def pilots(self) -> List[dict]:
+        return self.get("/pilots") or []
+
+    def rounds(self) -> List[dict]:
+        return self.get("/rounds") or []
+
+    def seeding(self, round_ids: List[str], laps: Optional[int] = None) -> List[dict]:
+        """[{seed, name, bestSeconds, races}], fastest first; every event pilot (no time: last)."""
+        q = [("pilots", "all")] + [("round", r) for r in round_ids] + ([("laps", str(int(laps)))] if laps else [])
+        return self.get("/stages/seeding?" + "&".join(f"{k}={urllib.request.quote(v)}" for k, v in q)) or []
+
+    def stages(self) -> List[dict]:
+        return self.get("/stages") or []
+
+    def stage(self, stage_id) -> dict:
+        return self.get(f"/stages/{stage_id}") or {}
+
     # ── changing ───────────────────────────────────────────────
+
+    def meeting_sync(self, plan: dict, dry_run: bool = True) -> dict:
+        """Create (or bring up to date) rounds and races from a plan; dry_run: only say what would change."""
+        return self._call("POST", "/api/v1/meeting/sync", dict(plan, dryRun=bool(dry_run)), timeout=20.0) or {}
+
+    def create_stage(self, request: dict) -> dict:
+        return self._call("POST", "/api/v1/stages", request, timeout=20.0) or {}
+
+    def send_stage(self, stage_id) -> dict:
+        return self._call("POST", f"/api/v1/stages/{stage_id}/send", {"makeCurrent": False}, timeout=20.0) or {}
 
     def lap_corrections(self, race_id: str, pilot_id: str, invalidate: List[str],
                         add: List[Dict[str, object]]) -> List[dict]:

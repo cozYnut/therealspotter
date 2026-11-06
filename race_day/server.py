@@ -65,6 +65,11 @@ class DataView:
     def tp(self):
         return self.day.tp
 
+    def _tpx(self, stem: str):
+        """A run's track folder: its class's layout (race_day/eventsetup.py)."""
+        f = getattr(self.day, "tp_of_stem", None)
+        return f(stem) if f else self.day.tp
+
     def _json(self, path: Path) -> Optional[dict]:
         try:
             mt = path.stat().st_mtime
@@ -95,7 +100,7 @@ class DataView:
         out = []
         for r in runs:
             if r["status"] == "labelled":
-                st = self._json(self.tp.runs_dir / f"{r['stem']}.stats.json")
+                st = self._json(self._tpx(r['stem']).runs_dir / f"{r['stem']}.stats.json")
                 if st:
                     out.append(st)
         return out
@@ -123,8 +128,8 @@ class DataView:
         r = next((x for x in self.visible_runs() if x["stem"] == stem), None)
         if not r:
             return None
-        st = self._json(self.tp.runs_dir / f"{stem}.stats.json")
-        race = self._json(self.tp.race_data(stem)) or {}
+        st = self._json(self._tpx(stem).runs_dir / f"{stem}.stats.json")
+        race = self._json(self._tpx(stem).race_data(stem)) or {}
         field = self.field()
         r["stats"] = st
         r["compare"] = rstats.compare(st, field) if st else None
@@ -162,8 +167,8 @@ class DataView:
             heat = dict(self.day.state["heats"].get(str(n)) or {})
         out = []
         for r in sorted(runs, key=lambda r: r["quad"]):
-            race = self._json(self.tp.race_data(r["stem"])) or {}
-            st = self._json(self.tp.runs_dir / f"{r['stem']}.stats.json")
+            race = self._json(self._tpx(r["stem"]).race_data(r["stem"])) or {}
+            st = self._json(self._tpx(r["stem"]).runs_dir / f"{r['stem']}.stats.json")
             w = r.get("window") or [float("-inf"), float("inf")]
             off = max(r["live_start_s"], w[0]) if r.get("window") else r["live_start_s"]
             r["passes"] = [{"t": p["t"] - off, "gate": p["gate_id"]} for p in race.get("passes", [])

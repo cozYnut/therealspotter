@@ -36,6 +36,17 @@ DEFAULT_LINES: Dict[str, List[str]] = {
     "lap": ["{pilot}, lap {lap}, {time}, in {place}"],
     "lap_lead": ["{pilot}, lap {lap}, {time}, takes the lead"],
     "lap_leader": ["{pilot}, lap {lap}, {time}, still out front"],
+    # a heat called by places only (brackets: the club's "finals" style), and by lap times only (qualifying)
+    "lap_place": ["{pilot}, lap {lap}, in {place}", "{pilot} in {place}"],
+    "lap_lead_place": ["{pilot} takes the lead on lap {lap}", "{pilot} takes the lead"],
+    "lap_leader_place": ["{pilot}, lap {lap}, still out front", "{pilot} still leads"],
+    "lap_time": ["{pilot}, lap {lap}, {time}", "{pilot}, {time}"],
+    # brackets (Event setup: FPVTrackside's Seeder)
+    "through": ["{pilot} goes through", "{pilot} is through to the next round"],
+    "to_losers": ["{pilot} drops to the losers bracket", "{pilot} goes to the losers bracket, still in it"],
+    "eliminated": ["That's the end of the day for {pilot}", "{pilot} is out of the bracket"],
+    "ace_win": ["{pilot} takes a chase the ace win", "That's a win in the chase for {pilot}"],
+    "final_win": ["{pilot} wins the main", "And {pilot} takes the final"],
     "last_lap": ["Last lap for {pilot}"],
     "fastest": ["{pilot}, fastest lap of the race, {time}"],
     "finish_win": ["{pilot} wins it"],

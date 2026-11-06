@@ -83,7 +83,7 @@ the video.
 - **Racing now · Next** (above the heat list): the race FPVTrackside is on and the
   next one, with their pilots.
 
-#### With FPVTrackside's REST API (the FPVTrackside alpha)
+#### With FPVTrackside's REST API (FPVTrackside 2.79 and the alpha)
 
 **FPVTrackside…** (top bar) sets where FPVTrackside's web server is (default
 `http://localhost:8080`; switch it on in FPVTrackside: *Menu → Application Settings → Web →
@@ -121,6 +121,79 @@ accepted change as a step to make in FPVTrackside itself — it shows there at o
   FPVTrackside, and don't edit those heats there before you do. Auto mode writes the same way.
 - While FPVTrackside runs a race, the app pauses completely so FPVTrackside has
   the computer; it continues when the race ends.
+
+#### Event setup: classes, track layouts, qualifying, brackets, points
+
+**Event setup…** (top bar) is done at the start of an event. It is kept with the event's
+data (`event_setup.json`) and needs FPVTrackside's REST API, with the event open there, for
+the three steps that make things in FPVTrackside.
+
+- **Track layouts.** `main` is the event's own track, the one the app always used.
+  **+ Layout** adds one for a class that flies other gates, or the same gates in another
+  order, for example `beginners`, 10 gates. Each layout is a track of its own: learned
+  from its own runs (**Learn track** learns each layout from the ticked runs on it), and a
+  run is analysed, labelled and checked on its pilot's class's layout. The top bar shows
+  each layout. Runs analysed before their class got a layout are copied over and labelled
+  again, not analysed again.
+- **Classes** (**+ Class**: Open, Beginners…): the class's pilots (☑), its track layout,
+  and a pilot's **Main**: *auto* (by qualifying) or a letter, to put a pilot in that main
+  whatever their time (their level).
+- **Create qualifying in FPVTrackside…** (top of the window) makes the time-trial rounds
+  "Qualifying 1"…, **every class in each round**, in the order of the class tabs (Open's
+  races, then Beginners'). Each class's pilots fly in races of up to its *Races* pilots (as
+  even as possible, the same races every round). Each pilot sits on their own channel
+  in the event when it's free in that race (a DJI pilot keeps DR8), else on the next free
+  **Seats** channel.
+  FPVTrackside first says what it would create (a dry run); nothing changes until you
+  agree. Doing it again only adds or changes what's missing; a race already flown is
+  never touched.
+- **Finals → Make the brackets…** takes the class's qualifying order from FPVTrackside:
+  the best *Seeded by* consecutive laps over the class's qualifying rounds, with pilots
+  without a time last. It cuts that order into mains, A being the fastest:
+  - mains of *Mains* pilots;
+  - a remainder of at least *Own bracket from* pilots gets a main of its own;
+  - a smaller remainder follows *Leftover*: a **series main** that races *Series main*
+    times for points (3 pilots or more; fewer join the last main), **join the last
+    main**, or **spread** the pilots so the mains are about equal;
+  - pinned pilots keep their main, and the rest fill up around them in qualifying order.
+
+  The window shows every main and every seed. *Move to* moves a pilot to another main,
+  and that's kept as their level. **Create in FPVTrackside** then makes each main a stage
+  in FPVTrackside's own bracket builder, its **Seeder** (`http://localhost:8080/seeder/`):
+  - a bracket main is a double elimination, *Races* a race and *Through* going on;
+  - the *Chase the ace in* main ends in a chase the ace to *Chase the ace to* wins;
+  - the other mains have the same bracket and end in *Other mains end in*: **one final
+    race** (the club's way), a chase the ace too, or the Seeder's classic grand final (a
+    2-pilot winners final and more rounds).
+
+  The Seeder would put each stage's races in a round of its own, so the app places them
+  itself (`race_day/finals.py`). Once every class has its brackets, the races whose
+  line-up is known go into shared rounds **"Finals 1", "Finals 2"…**, one race per main
+  in turn: A, B, C, D, then the next class's mains, then back to A. A race goes in the
+  Finals round of its own round in its bracket (a chase the ace's 2nd, 3rd… race in the
+  rounds after), and a main with no race left in a round is skipped there.
+
+  The next round appears as soon as one pilot is known for it (only the round after the
+  one being flown): all of its races at once, in turn, each with the pilots known so far.
+  For example, when W2-1 is flown its 3rd and 4th are put in L2-1 at once, and its other
+  two pilots join after L1-1. All at once because FPVTrackside keeps races in the order
+  they're made. A race that isn't full yet is named in the top bar ("not full yet, don't
+  start"). A chase the ace race the bracket no longer needs is deleted from FPVTrackside,
+  unless it has been flown. After each race, by itself, the app gives the race's finishing order
+  to its stage, so the Seeder moves the pilots on, and the races that are now known go
+  into the next rounds. A marshal's later change in FPVTrackside is sent again while the
+  Seeder still accepts it. The top bar shows how far the finals are.
+- **Places & points…**: where each pilot finished, A's pilots first, then B's.
+  - **In a bracket main:** the champion first, then by the last race each pilot flew
+    (a later race is better), and within it by place.
+  - **In a chase the ace:** by wins, then best place.
+  - **FRIL points:** place N of TOTAL pilots in the class earns TOTAL+1−N, plus
+    ceil(TOTAL/5), ceil(TOTAL/8) and ceil(TOTAL/13) for 1st, 2nd and 3rd.
+  - **Copy** puts the table on the clipboard for a spreadsheet.
+- **The announcer** follows the setup:
+  - each class's *Qualifying calls* and *Finals calls* are lap times, places or both;
+  - in a bracket it says who goes through, who drops to the losers bracket, who is out,
+    and a chase the ace win.
 
 ### ● Live capture
 
@@ -283,7 +356,7 @@ so pilots' names and details aren't shared.
 | File | What it holds |
 |---|---|
 | `club.yaml` | the club's name, the announcer's name, how lap times are read (`natural`: "twenty-one point nine six", or `digits`: "twenty-one ninety-six"), the safety line, `video_places` |
-| `lines.yaml` | the calls: for each kind (`lap`, `lap_lead`, `holeshot`, `finish_win`, `gap`, `down`, `kind`, …), several ways to say it. One is picked at random, never the one said last. Words in braces are filled in: `{pilot} {lap} {time} {place} {gate} {margin} {ahead} {behind} {next}`; a line whose words aren't known for that call is skipped for another (so "{pilot} is down at {gate}" is only said when the gate is). Missing kinds fall back to plain defaults. |
+| `lines.yaml` | the calls: for each kind (`lap`, `lap_lead`, `holeshot`, `finish_win`, `gap`, `down`, `kind`, …), several ways to say it. Heats called by places only use `lap_place`, `lap_lead_place` and `lap_leader_place` (no `{time}`), and by lap times only `lap_time`; brackets add `through`, `to_losers`, `eliminated` and `ace_win` (Event setup). One is picked at random, never the one said last. Words in braces are filled in: `{pilot} {lap} {time} {place} {gate} {margin} {ahead} {behind} {next}`; a line whose words aren't known for that call is skipped for another (so "{pilot} is down at {gate}" is only said when the gate is). Missing kinds fall back to plain defaults. |
 | `pilots.yaml` | pilot cards: `callsign` exactly as in FPVTrackside, `say_it_like` (how the voice should say it — try it with *Test*), `new: true` for a new or young pilot (kinder lines, `kind_new`) |
 | `tracks/<track>.yaml` | a track: what to call its gates (`4: {say: "the dive gate", crash_spot: true}`, numbered as the event's learned track numbers them, 1 = start/finish) and the expected lap time. Pick it in the window before the race. |
 
