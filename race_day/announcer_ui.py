@@ -128,6 +128,30 @@ class AnnouncerDialog(QDialog):
         self.video_state.setStyleSheet("color:#888")
         v.addWidget(self.video_state)
 
+        talk = self.a.talk
+        row = QHBoxLayout()
+        self.talk_on = QCheckBox("Talk between races")
+        self.talk_on.setChecked(bool(talk and talk.enabled))
+        self.talk_on.setToolTip("Fill the gaps (clubs/<club>/talk.yaml): each race's preview and wrap, the qualifying\n"
+                                "results, the bracket explained, the final walk-out, the champion, and filler in a quiet\n"
+                                "gap. Never during a race: it stops at the start call.")
+        self.talk_on.toggled.connect(self._talk_on)
+        row.addWidget(self.talk_on)
+        self.open_btn = QPushButton("▶ Opening (about 10 min)")
+        self.open_btn.setToolTip("The welcome, the day's plan, safety, the track gate by gate, the rules of qualifying\n"
+                                 "and the brackets, the points, the season so far and who to watch — one after another.\n"
+                                 "The closing comes by itself when Places & points shows final results.")
+        self.open_btn.clicked.connect(lambda: talk and talk.opening())
+        row.addWidget(self.open_btn)
+        stop = QPushButton("■ Stop talking")
+        stop.clicked.connect(lambda: talk and talk.stop())
+        row.addWidget(stop)
+        v.addLayout(row)
+        self.talk_state = QLabel("")
+        self.talk_state.setStyleSheet("color:#888")
+        self.talk_state.setWordWrap(True)
+        v.addWidget(self.talk_state)
+
         self.replay_btn = QPushButton("▶ Replay the selected heat")
         self.replay_btn.setToolTip("The heat picked on the FPVTrackside screen, played to the announcer as if it were being\n"
                                    "raced: its video for the capture card, its crossings for FPVTrackside's events.\n"
@@ -193,6 +217,13 @@ class AnnouncerDialog(QDialog):
         if why and self.video.isChecked():
             self.video_state.setText(f"live video: {why}")
 
+    def _talk_on(self, on: bool):
+        if self.a.talk:
+            self.a.talk.enabled = bool(on)
+            if not on:
+                self.a.talk.stop()
+        self.save(talk_on=bool(on))
+
     def _replay(self):
         why = self.win.replay_heat()
         if why and why != "stopped":
@@ -222,6 +253,11 @@ class AnnouncerDialog(QDialog):
                 if s.get("racing") else "waiting for the race to start" if live.get("ready") else "loading…"))
         elif not self.video.isChecked():
             self.video_state.setText("")
+        t = self.a.talk
+        if t:
+            self.talk_state.setText(f"talking ({t.what_job}): “{t.what}”" if t.busy and t.what else
+                                    "talk: off" if not t.enabled else
+                                    "talk: no lines (clubs/<club>/talk.yaml)" if not self.a.style.talk else "")
         if self.relay:
             s = self.relay.status()
             bits = [f"{s['received']} events from FPVTrackside" + (f" (last {time.strftime('%H:%M:%S', time.localtime(s['last_at']))})"

@@ -136,6 +136,13 @@ SETTINGS = ".lazy_spotter_v2.json"
 OLD_SETTINGS = ".race_day_app.json"       # before the app was renamed: read until the new file exists
 
 
+def _stage_round(fin: dict) -> int:
+    """A finals race recorded before the stage round was kept: its round from its title ("Winners Round 2")."""
+    import re
+    m = re.search(r"Round (\d+)", fin.get("title") or "")
+    return int(m.group(1)) if m else 0
+
+
 def _app_settings() -> dict:
     for name in (SETTINGS, OLD_SETTINGS):
         try:
@@ -490,6 +497,9 @@ class Main(QMainWindow):
         self.live = LiveVideo(self.announcer.on_video, self._log)
         self.announcer.on_race = self.live.set_race
         self.announcer.heat_info = self._heat_info
+        from race_day.talk import Talk
+        self.announcer.talk = Talk(self.announcer, self._talk_facts, self._log)
+        self.announcer.talk.enabled = bool(st.get("talk_on", True))
         self.replay = None
         try:
             self.relay = EventRelay(st.get("fril_live_url"), log=self._log).start()
@@ -529,15 +539,46 @@ class Main(QMainWindow):
         fin = day.finals.by_fpv(rid) if getattr(day, "finals", None) else None
         if fin:                                          # a finals race the app put in (race_day/finals.py)
             cls = setup.cls(fin.get("class") or "")
+            try:
+                self.announcer.style.set_sections(setup.sections((cls or {}).get("layout") or "main"))
+            except Exception:                            # noqa: BLE001
+                pass
             style = ((cls or {}).get("style") or {}).get("finals")
             return {"class": fin.get("class"), "kind": "finals", "style": style or "both",
                     "group": fin.get("group"), "advance": fin.get("advance"), "main": fin.get("main"),
-                    "ace_wins": fin.get("ace_wins")}
+                    "ace_wins": fin.get("ace_wins"), "semi": fin.get("semi"),
+                    "stage_round": fin.get("stage_round") or _stage_round(fin)}
         cls = setup.class_of_heat(SimpleNamespace(round_name=round_name, stage=stage, pilots=pilots))
+        try:                                             # the live calls name the event's sections ("down at the dive")
+            self.announcer.style.set_sections(setup.sections((cls or {}).get("layout") or "main"))
+        except Exception:                                # noqa: BLE001
+            pass
         kind = setup.heat_kind(race_type=rtype, round_name=round_name)
         style = ((cls or {}).get("style") or {}).get("qualifying" if kind == "qualifying" else "finals")
-        return {"class": (cls or {}).get("name"), "kind": kind, "style": style if cls else "both",
-                "group": group, "advance": advance}
+        out = {"class": (cls or {}).get("name"), "kind": kind, "style": style if cls else "both",
+               "group": group, "advance": advance}
+        if kind == "qualifying":                         # the standings before this heat: who moves up with a PB
+            from race_day.eventsetup import qualifying_bests
+            n = int(((cls or {}).get("qualifying") or {}).get("laps") or 3)
+            try:
+                bests = qualifying_bests(day.event, n, before=h.start if h else time.time(),
+                                         exclude=(e.get("heatId") or rid or ""),
+                                         pilots=(cls or {}).get("pilots") or None)
+                out["qual"] = {"laps": n, "best": bests}
+            except Exception as ex:                      # noqa: BLE001
+                self._log(f"announcer: the qualifying standings: {ex}")
+        return out
+
+    def _talk_facts(self):
+        """What the talk between races knows (race_day/talkfacts.py), for the open event."""
+        from race_day.talkfacts import Facts
+        day = self.event_day
+        if not day or not hasattr(day, "setup"):
+            return None
+        if getattr(self, "_facts", None) is None or self._facts.day is not day or \
+                self._facts.style is not self.announcer.style:
+            self._facts = Facts(day, self.announcer.style, self._log)
+        return self._facts
 
     def set_announcer(self):
         from race_day.announcer_ui import AnnouncerDialog
@@ -743,7 +784,23 @@ class Main(QMainWindow):
         super().closeEvent(e)
 
 
+def _excepthook(kind, value, tb):
+    """A Python error in a button or a timer: shown and written to the terminal, never the app closing (PyQt
+    aborts the whole app on an error in a slot unless this is set)."""
+    import traceback
+    text = "".join(traceback.format_exception(kind, value, tb))
+    sys.stderr.write(text)
+    try:
+        from PyQt6.QtWidgets import QMessageBox
+        QMessageBox.warning(None, "Something went wrong",
+                            f"{kind.__name__}: {value}\n\nThe app carries on. The details are in the terminal:\n\n"
+                            + "".join(traceback.format_exception(kind, value, tb)[-3:]))
+    except Exception:                                    # noqa: BLE001
+        pass
+
+
 def main():
+    sys.excepthook = _excepthook
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     if not setup_data_root():

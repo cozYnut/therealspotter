@@ -85,7 +85,11 @@ class SetupDialog(QDialog):
         gates = QPushButton("Gates…")
         gates.setToolTip("How many gates each layout has")
         gates.clicked.connect(self._gates)
-        for b in (gates, add_l, del_l):
+        secs = QPushButton("Sections…")
+        secs.setToolTip("Name the parts of each layout's lap (\"the dive\", from gate 5 to gate 8): the announcer\n"
+                        "walks the track by them and tells a pilot where they can find time")
+        secs.clicked.connect(self._sections)
+        for b in (gates, secs, add_l, del_l):
             row.addWidget(b)
         top.addRow("Track layouts", row)
         self.seats = QLineEdit(" ".join(self.setup.data.get("channels") or []))
@@ -105,6 +109,14 @@ class SetupDialog(QDialog):
         self.q_lbl.setWordWrap(True)
         row.addWidget(self.q_lbl, 1)
         top.addRow("Qualifying", row)
+        row = QHBoxLayout()
+        bb_ = QPushButton("Make the brackets…")
+        bb_.setToolTip("When qualifying is done: every class's qualifying order cut into mains (A = fastest), shown\n"
+                       "first, one tab per class; then they're all made Seeder stages and the first Finals round goes in")
+        bb_.clicked.connect(self._brackets)
+        row.addWidget(bb_)
+        row.addStretch()
+        top.addRow("Brackets", row)
         self.fin_lbl = QLabel("")
         self.fin_lbl.setWordWrap(True)
         top.addRow("Finals", self.fin_lbl)
@@ -219,6 +231,10 @@ class SetupDialog(QDialog):
             self.setup.layouts[name]["gates"] = n
         self._save()
         self._layouts_text()
+
+    def _sections(self):
+        SectionsDialog(self, self.day, self.setup).exec()
+        self._save()
 
     def _seats(self):
         self.setup.data["channels"] = self.seats.text().replace(",", " ").split()
@@ -342,6 +358,25 @@ class SetupDialog(QDialog):
             QMessageBox.information(self, "Pilots", "\n\n".join(msg))
         self._fill()
 
+    def _brackets(self):
+        cs = [c for c in self.setup.classes if c["pilots"]]
+        if not cs:
+            return QMessageBox.information(self, "Brackets", "Make the classes and tick their pilots first.")
+        api = self._api()
+        if not api:
+            return
+        classes = []
+        try:
+            rounds = api.rounds()
+            for c in cs:
+                ids = self.setup.qualifying_round_ids(c, rounds)
+                seeding = api.seeding(ids, int(c["qualifying"]["laps"])) if ids else []
+                classes.append((c, self.setup.seeded(c, seeding), len(ids)))
+        except ApiError as e:
+            return QMessageBox.warning(self, "Brackets", f"FPVTrackside's qualifying order: {e}")
+        BracketsDialog(self, api, self.setup, classes).exec()
+        self._fill()                              # pins changed there
+
     def _add_class(self):
         name, ok = QInputDialog.getText(self, "New class", "Name of the class (for example: Open, Beginners):")
         name = name.strip()
@@ -459,11 +494,6 @@ class ClassPage(QWidget):
         f.addRow("Chase the ace in", self.f_chase)
         f.addRow("Chase the ace to", self.f_wins)
         f.addRow("Other mains end in", self.f_final)
-        b = QPushButton("Make the brackets…")
-        b.setToolTip("The qualifying order cut into mains (A = fastest), shown first; then each main is made a\n"
-                     "Seeder stage. Its races go into the shared Finals rounds once every class's brackets are made")
-        b.clicked.connect(self._brackets)
-        f.addRow(b)
         right.addWidget(g)
 
         g = QGroupBox("Points and the announcer")
@@ -588,21 +618,6 @@ class ClassPage(QWidget):
 
     # ── into FPVTrackside ──────────────────────────────────────
 
-    def _brackets(self):
-        if not self.cls["pilots"]:
-            return QMessageBox.information(self, "Brackets", "Tick the class's pilots first.")
-        api = self.dlg._api()
-        if not api:
-            return
-        try:
-            ids = self.setup.qualifying_round_ids(self.cls, api.rounds())
-            seeding = api.seeding(ids, int(self.cls["qualifying"]["laps"])) if ids else []
-        except ApiError as e:
-            return QMessageBox.warning(self, "Brackets", f"FPVTrackside's qualifying order: {e}")
-        BracketDialog(self, api, self.setup, self.cls, self.setup.seeded(self.cls, seeding), len(ids)).exec()
-        self._fill_pilots()                       # pins changed there
-        self.dlg._order_text()
-
     def _places(self):
         made = self.setup.data["made"]["stages"].get(self.cls["name"]) or {}
         if not made:
@@ -614,18 +629,31 @@ class ClassPage(QWidget):
             stages = {m: api.stage(sid) for m, sid in made.items()}
         except ApiError as e:
             return QMessageBox.warning(self, "Places & points", f"FPVTrackside's stages: {e}")
-        PlacesDialog(self, self.cls, self.setup.places(self.cls, stages)).exec()
+        rows = self.setup.places(self.cls, stages)
+        if rows and all(r["final"] for r in rows):         # the event's over: the closing, every class's results
+            talk = getattr(getattr(self.dlg.win, "win", self.dlg.win), "announcer", None)
+            talk = getattr(talk, "talk", None)
+            if talk and talk.enabled:
+                results = {}
+                for c in self.setup.classes:
+                    m = self.setup.data["made"]["stages"].get(c["name"]) or {}
+                    try:
+                        st = {k: api.stage(sid) for k, sid in m.items()}
+                    except ApiError:
+                        continue
+                    r = self.setup.places(c, st) if st else []
+                    if r and all(x["final"] for x in r):
+                        results[c["name"]] = r
+                talk.closing(results)
+        PlacesDialog(self, self.cls, rows, self.dlg.day).exec()
 
 
-class BracketDialog(QDialog):
-    """The mains as the qualifying order makes them; a pilot can be moved to another main (pinned); then each
-    main is made a Seeder stage in FPVTrackside."""
+class BracketPanel(QWidget):
+    """One class's mains as its qualifying order makes them; a pilot can be moved to another main (pinned)."""
 
-    def __init__(self, page: ClassPage, api, setup: es.EventSetup, cls: dict, seeded: List[dict], n_rounds: int):
-        super().__init__(page)
-        self.setWindowTitle(f"Make the brackets — {cls['name']}")
-        self.resize(820, 680)
-        self.page, self.api, self.setup, self.cls, self.seeded = page, api, setup, cls, seeded
+    def __init__(self, dlg, setup: es.EventSetup, cls: dict, seeded: List[dict], n_rounds: int, pin):
+        super().__init__()
+        self.dlg, self.setup, self.cls, self.seeded, self.pin = dlg, setup, cls, seeded, pin
         v = QVBoxLayout(self)
         timed = sum(1 for s in seeded if s["best"] is not None)
         f = cls["finals"]
@@ -646,13 +674,13 @@ class BracketDialog(QDialog):
         self.summary = QLabel("")
         self.summary.setWordWrap(True)
         v.addWidget(self.summary)
-        bb = QDialogButtonBox()
-        self.make = bb.addButton("Create in FPVTrackside", QDialogButtonBox.ButtonRole.AcceptRole)
-        bb.addButton(QDialogButtonBox.StandardButton.Cancel)
-        self.make.clicked.connect(self._create)
-        bb.rejected.connect(self.reject)
-        v.addWidget(bb)
         self._fill()
+
+    def made(self) -> dict:
+        return self.setup.data["made"]["stages"].get(self.cls["name"]) or {}
+
+    def todo(self) -> List[dict]:
+        return [m for m in self.plan if m["main"] not in self.made()]
 
     def _fill(self):
         self.plan = self.setup.mains_plan(self.cls, self.seeded)
@@ -674,50 +702,84 @@ class BracketDialog(QDialog):
             mv.setCurrentIndex(max(0, mv.findData(m["main"] if p["pinned"] else "")))
             mv.currentIndexChanged.connect(lambda _, n=p["name"], mv=mv: self._move(n, mv.currentData()))
             self.table.setCellWidget(r, 4, mv)
-        made = self.setup.data["made"]["stages"].get(self.cls["name"]) or {}
         lines = []
         for m in self.plan:
             req = self.setup.stage_request(self.cls, m)
             s = req["setup"]
-            fin = ("a grand final" if s["finalsFormat"] == "grand-final" else "one final race"
-                   if s.get("aceWinsRequired") == 1 else f"chase the ace to {s.get('aceWinsRequired')} wins")
-            what = (f"a series: {s['rounds']} races for points" if m["kind"] == "series" else
-                    f"double elimination, {s['pilotsPerRace']} a race, {s['pilotsToAdvance']} through, {fin}")
+            if m["kind"] == "series":
+                what = f"a series: {s.get('rounds')} races for points"
+            else:
+                fin = ("a grand final" if s.get("finalsFormat") == "grand-final" else "one final race"
+                       if s.get("aceWinsRequired") == 1 else f"chase the ace to {s.get('aceWinsRequired')} wins")
+                what = f"double elimination, {s.get('pilotsPerRace')} a race, {s.get('pilotsToAdvance')} through, {fin}"
             lines.append(f"<b>{req['name']}</b> — {len(m['pilots'])} pilots, {what}"
-                         + (" <i>(already made: skipped)</i>" if m["main"] in made else ""))
+                         + (" <i>(already made: skipped)</i>" if m["main"] in self.made() else ""))
         self.summary.setText("<br>".join(lines) or "No pilots.")
-        self.make.setEnabled(any(m["main"] not in made for m in self.plan))
+        self.dlg._enable()
 
     def _move(self, name: str, main: str):
-        self.page._pin(name, main)
+        self.pin(self.cls, name, main)
         self._fill()
 
+
+class BracketsDialog(QDialog):
+    """Every class's mains, one tab each, from the qualifying order; Create makes them all Seeder stages in
+    FPVTrackside at once, and the first Finals round goes in (race_day/finals.py)."""
+
+    def __init__(self, sdlg, api, setup: es.EventSetup, classes: List[tuple]):
+        super().__init__(sdlg)
+        self.setWindowTitle("Make the brackets")
+        self.resize(860, 720)
+        self.sdlg, self.api, self.setup = sdlg, api, setup
+        v = QVBoxLayout(self)
+        self.tabs = QTabWidget()
+        self.panels: List[BracketPanel] = []
+        v.addWidget(self.tabs, 1)
+        bb = QDialogButtonBox()
+        self.make = bb.addButton("Create in FPVTrackside", QDialogButtonBox.ButtonRole.AcceptRole)
+        bb.addButton(QDialogButtonBox.StandardButton.Cancel)
+        self.make.clicked.connect(self._create)
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+        for cls, seeded, n in classes:
+            p = BracketPanel(self, setup, cls, seeded, n, self._pin)
+            self.panels.append(p)
+            self.tabs.addTab(p, cls["name"])
+        self._enable()
+
+    def _pin(self, cls: dict, name: str, main: str):
+        pins = cls.setdefault("pins", {})
+        if main:
+            pins[name] = main
+        else:
+            pins.pop(name, None)
+        self.sdlg._save()
+
+    def _enable(self):
+        if hasattr(self, "make"):
+            self.make.setEnabled(any(p.todo() for p in getattr(self, "panels", [])))
+
     def _create(self):
-        made = self.setup.data["made"]["stages"].setdefault(self.cls["name"], {})
-        todo = [m for m in self.plan if m["main"] not in made]
-        others = [c["name"] for c in self.setup.classes if c is not self.cls and c["pilots"]
-                  and not self.setup.data["made"]["stages"].get(c["name"])]
-        then = (f"The finals races go into FPVTrackside once {', '.join(others)} "
-                f"{'has' if len(others) == 1 else 'have'} its brackets too." if others else
-                "Then the first Finals round goes into FPVTrackside: one race per main in turn, every class.")
+        todo = [(p.cls, m) for p in self.panels for m in p.todo()]
         if not _confirm(self, "Create in FPVTrackside",
-                        f"Make {len(todo)} Seeder stage{'s' if len(todo) != 1 else ''} in FPVTrackside? {then}",
-                        "<br>".join(f"{self.cls['name']} {m['main']} main: "
-                                    + ", ".join(p['name'] for p in m['pilots']) for m in todo),
-                        "Create"):
+                        f"Make {len(todo)} Seeder stage{'s' if len(todo) != 1 else ''} in FPVTrackside, every class? "
+                        "Then the first Finals round goes in: one race per main in turn.",
+                        "<br>".join(f"{c['name']} {m['main']} main: " + ", ".join(p['name'] for p in m['pilots'])
+                                    for c, m in todo), "Create"):
             return
         out = []
-        for m in todo:
+        for cls, m in todo:
+            made = self.setup.data["made"]["stages"].setdefault(cls["name"], {})
             try:
-                st = self.api.create_stage(self.setup.stage_request(self.cls, m))
+                st = self.api.create_stage(self.setup.stage_request(cls, m))
                 made[m["main"]] = st.get("id")
                 self.setup.save()
                 out.append(f"{st.get('name')}: {st.get('raceCount')} races in its bracket")
             except ApiError as e:
-                out.append(f"{self.cls['name']} {m['main']} main: ⚠ {e}")
+                out.append(f"{cls['name']} {m['main']} main: ⚠ {e}")
                 break
-        fin = getattr(self.page.dlg.day, "finals", None)
-        if fin and not others:
+        fin = getattr(self.sdlg.day, "finals", None)
+        if fin and not fin.waiting_for():
             try:
                 fin.tick()
                 out.append(fin.status)
@@ -727,8 +789,133 @@ class BracketDialog(QDialog):
         self.accept()
 
 
+class SectionsDialog(QDialog):
+    """A layout's named sections: name, from gate, to gate — and how long they take (the analysed runs)."""
+
+    def __init__(self, parent, day, setup: es.EventSetup):
+        super().__init__(parent)
+        self.setWindowTitle("Track sections")
+        self.resize(640, 460)
+        self.day, self.setup = day, setup
+        v = QVBoxLayout(self)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Layout"))
+        self.lay = QComboBox()
+        self.lay.addItems(list(setup.layouts))
+        self._cur = self.lay.currentText()
+        self.lay.currentTextChanged.connect(self._switch)
+        row.addWidget(self.lay, 1)
+        v.addLayout(row)
+        hint = QLabel("Name the parts of the lap the way the club talks about them. A section runs from one gate to "
+                      "another (gate 3 → 4, or gate 5 → 8), round the lap if the second is lower. The announcer "
+                      "walks the track by them, says where a pilot can find time, and where pilots go down.")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Name", "From gate", "To gate", "Usual time"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        v.addWidget(self.table, 1)
+        row = QHBoxLayout()
+        add, rem = QPushButton("+ Section"), QPushButton("− Section")
+        add.clicked.connect(self._add)
+        rem.clicked.connect(self._remove)
+        row.addWidget(add)
+        row.addWidget(rem)
+        row.addStretch()
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self._save)
+        bb.rejected.connect(self.reject)
+        row.addWidget(bb)
+        v.addLayout(row)
+        self._fill()
+
+    def _switch(self, name: str):
+        self.setup.set_sections(self._cur, self._rows())          # kept (saved with Save)
+        self._cur = name
+        self._fill()
+
+    def _n(self) -> int:
+        try:
+            return int(self.day._n_gates(self.lay.currentText())) or 14
+        except Exception:                          # noqa: BLE001
+            return 14
+
+    def _times(self) -> Dict[str, float]:
+        """Each section's usual time over the analysed runs (the pilots' medians' median)."""
+        try:
+            from race_day.clubstyle import ClubStyle
+            from race_day.talkfacts import Facts, _span
+            import statistics
+            f = Facts(self.day, ClubStyle(None))
+            n = self._n()
+            med = f.section_medians(f.run_stats(self.lay.currentText()), n)
+            out = {}
+            for r in range(self.table.rowCount()):
+                a, b = self.table.cellWidget(r, 1).value(), self.table.cellWidget(r, 2).value()
+                vals = [x for x in (_span(m, es.section_legs(a, b, n)) for m in med.values()) if x is not None]
+                if len(vals) >= 3:
+                    out[r] = statistics.median(vals)
+            return out
+        except Exception:                          # noqa: BLE001
+            return {}
+
+    def _row(self, name: str, a: int, b: int):
+        n = self._n()
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        self.table.setItem(r, 0, QTableWidgetItem(name))
+        for c, val in ((1, a), (2, b)):
+            sp = _spin(1, n, min(max(1, val), n))
+            sp.valueChanged.connect(lambda _: self._show_times())
+            self.table.setCellWidget(r, c, sp)
+        it = QTableWidgetItem("")
+        it.setFlags(Qt.ItemFlag.ItemIsEnabled)
+        self.table.setItem(r, 3, it)
+
+    def _fill(self):
+        self.table.setRowCount(0)
+        for x in self.setup.sections(self.lay.currentText()):
+            self._row(x["name"], x["from"], x["to"])
+        self._show_times()
+
+    def _show_times(self):
+        t = self._times()
+        for r in range(self.table.rowCount()):
+            it = self.table.item(r, 3)
+            if it:
+                it.setText(f"{t[r]:.2f} s" if r in t else "—")
+
+    def _add(self):
+        n = self._n()
+        last = self.table.cellWidget(self.table.rowCount() - 1, 2).value() if self.table.rowCount() else 1
+        self._row("", last, last % n + 1)
+        self.table.editItem(self.table.item(self.table.rowCount() - 1, 0))
+        self._show_times()
+
+    def _remove(self):
+        r = self.table.currentRow()
+        if r >= 0:
+            self.table.removeRow(r)
+            self._show_times()
+
+    def _rows(self) -> List[dict]:
+        return [{"name": (self.table.item(r, 0).text() if self.table.item(r, 0) else "").strip(),
+                 "from": self.table.cellWidget(r, 1).value(), "to": self.table.cellWidget(r, 2).value()}
+                for r in range(self.table.rowCount())]
+
+    def _save(self):
+        rows = self._rows()
+        bad = [x for x in rows if x["name"] and x["from"] == x["to"]]
+        if bad:
+            return QMessageBox.information(self, "Sections", f"'{bad[0]['name']}' starts and ends at the same gate.")
+        self.setup.set_sections(self.lay.currentText(), rows)
+        self.setup.save()
+        self.accept()
+
+
 class PlacesDialog(QDialog):
-    def __init__(self, parent, cls: dict, rows: List[dict]):
+    def __init__(self, parent, cls: dict, rows: List[dict], day=None):
         super().__init__(parent)
         self.setWindowTitle(f"Places & points — {cls['name']}")
         self.resize(720, 620)
@@ -753,11 +940,38 @@ class PlacesDialog(QDialog):
         cp = QPushButton("Copy (for a spreadsheet)")
         cp.clicked.connect(lambda: QApplication.clipboard().setText("Place\tPilot\tMain\tPoints\n" + self.text))
         row.addWidget(cp)
+        if day is not None and cls.get("points") == "fril" and done:
+            sv = QPushButton("Save to the season…")
+            sv.setToolTip("This event's points go into the club's season standings (clubs/<club>/seasons.yaml),\n"
+                          "which the announcer reads. Only for a real event — never a test.")
+            sv.clicked.connect(lambda: self._save_season(day, cls, rows))
+            row.addWidget(sv)
         row.addStretch()
         close = QPushButton("Close")
         close.clicked.connect(self.accept)
         row.addWidget(close)
         v.addLayout(row)
+
+
+def _save_season(self, day, cls, rows):
+    from race_day import talkfacts
+    win = getattr(self.parent().dlg.win, "win", self.parent().dlg.win)
+    ann = getattr(win, "announcer", None)
+    club = getattr(getattr(ann, "style", None), "club", None)
+    if not club:
+        return QMessageBox.information(self, "Season", "Pick the club in the Announcer window first.")
+    facts = talkfacts.Facts(day, ann.style)
+    ev = facts.event()
+    if QMessageBox.question(self, "Save to the season",
+                            f"Put {day.event.name}'s {cls['name']} points into the {ev['season']} season of "
+                            f"{club}?\n(Saving again replaces them.)") != QMessageBox.StandardButton.Yes:
+        return
+    why = talkfacts.save_event_points(club, ev["season"], day.event.dir.name, day.event.name, ev["start"],
+                                      {r["name"]: r["points"] for r in rows if r.get("points")})
+    QMessageBox.information(self, "Season", why)
+
+
+PlacesDialog._save_season = _save_season
 
 
 def _sync_text(res: dict) -> str:

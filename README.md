@@ -135,6 +135,11 @@ the three steps that make things in FPVTrackside.
   run is analysed, labelled and checked on its pilot's class's layout. The top bar shows
   each layout. Runs analysed before their class got a layout are copied over and labelled
   again, not analysed again.
+- **Sections…** names the parts of each layout's lap the way the club talks about them ("the dive", from
+  gate 5 to gate 8; a section can be one leg or several), with each one's usual time from the analysed
+  runs. The announcer walks the track by them, tells a pilot which section to work on ("if X takes the
+  dive like Pennz, that's half a second a lap"), and names them in the live calls ("down at the dive").
+  The venue's track file (Announcer window → Track) still names single gates.
 - **Classes** (**+ Class**: Open, Beginners…): the class's pilots (☑), its track layout,
   and a pilot's **Main**: *auto* (by qualifying) or a letter, to put a pilot in that main
   whatever their time (their level).
@@ -147,7 +152,8 @@ the three steps that make things in FPVTrackside.
   FPVTrackside first says what it would create (a dry run); nothing changes until you
   agree. Doing it again only adds or changes what's missing; a race already flown is
   never touched.
-- **Finals → Make the brackets…** takes the class's qualifying order from FPVTrackside:
+- **Make the brackets…** (top of the window, once for the whole event, when qualifying is done) takes every
+  class's qualifying order from FPVTrackside, one tab per class:
   the best *Seeded by* consecutive laps over the class's qualifying rounds, with pilots
   without a time last. It cuts that order into mains, A being the fastest:
   - mains of *Mains* pilots;
@@ -158,7 +164,7 @@ the three steps that make things in FPVTrackside.
   - pinned pilots keep their main, and the rest fill up around them in qualifying order.
 
   The window shows every main and every seed. *Move to* moves a pilot to another main,
-  and that's kept as their level. **Create in FPVTrackside** then makes each main a stage
+  and that's kept as their level. **Create in FPVTrackside** then makes every class's mains stages at once
   in FPVTrackside's own bracket builder, its **Seeder** (`http://localhost:8080/seeder/`):
   - a bracket main is a double elimination, *Races* a race and *Through* going on;
   - the *Chase the ace in* main ends in a chase the ace to *Chase the ace to* wins;
@@ -355,10 +361,13 @@ so pilots' names and details aren't shared.
 
 | File | What it holds |
 |---|---|
-| `club.yaml` | the club's name, the announcer's name, how lap times are read (`natural`: "twenty-one point nine six", or `digits`: "twenty-one ninety-six"), the safety line, `video_places` |
+| `club.yaml` | the club's name, the announcer's name, how lap times are read (`natural`: "twenty-one point nine six", or `digits`: "twenty-one ninety-six"), the safety line, `video_places`; for the talk: `crew` (league managers, founders, volunteers), `sponsors`, `spectators` (the safety reminders), `next_event`; `calendar_ics` (the club's iCalendar feed — FRIL's is the Google Calendar behind fril.co.il/calendar): the next race in the closing and filler, and today's venue; a copy is kept in `calendar.ics` for a venue without internet |
 | `lines.yaml` | the calls: for each kind (`lap`, `lap_lead`, `holeshot`, `finish_win`, `gap`, `down`, `kind`, …), several ways to say it. Heats called by places only use `lap_place`, `lap_lead_place` and `lap_leader_place` (no `{time}`), and by lap times only `lap_time`; brackets add `through`, `to_losers`, `eliminated` and `ace_win` (Event setup). One is picked at random, never the one said last. Words in braces are filled in: `{pilot} {lap} {time} {place} {gate} {margin} {ahead} {behind} {next}`; a line whose words aren't known for that call is skipped for another (so "{pilot} is down at {gate}" is only said when the gate is). Missing kinds fall back to plain defaults. |
 | `pilots.yaml` | pilot cards: `callsign` exactly as in FPVTrackside, `say_it_like` (how the voice should say it — try it with *Test*), `new: true` for a new or young pilot (kinder lines, `kind_new`) |
 | `tracks/<track>.yaml` | a track: what to call its gates (`4: {say: "the dive gate", crash_spot: true}`, numbered as the event's learned track numbers them, 1 = start/finish) and the expected lap time. Pick it in the window before the race. |
+| `talk.yaml` | the talk between races (*Talk between races* in the Announcer window): for each moment, several ways to say it, with the facts filled in. A line that uses more of the known facts wins over a shorter one. When it talks: **▶ Opening** (about 10 minutes: welcome, the day's plan, safety, the track from the analysed section times, the rules of qualifying and the brackets with examples, the points, the season, meet the field); each race's preview (standings, a section tip such as "if X takes gate 5 to 6 like Pennz, that's half a second a lap", what's at stake, the pick, the final walk-out) and wrap (standings, the pick's verdict); the qualifying results; the champion; filler in a quiet gap; and the closing when **Places & points** shows final results. Never during a race: it stops at the start call, and every race call and FPVTrackside line goes first. |
+| `seasons.yaml` | the season standings the talk uses: a finished season's table, and this season's events' points (**Places & points → Save to the season** adds an event's; never a test event's) |
+| the countdown | with FPVTrackside's **Auto Runner** on and its **Announce next race in** on, the app follows its countdown ("{time} until the race start", read from FPVTrackside's log) and calls it in the club's words (`start_in`, `start_in_first`, `start_in_last` in `lines.yaml`): every step in the first qualifying round, with the pilots told to the start line and to turn their video on, fewer after it. **20 seconds** before the start, a pilot whose picture the live video doesn't have is hurried up by name (`hurry_video`; else `video_ok`) — the live video has to be on. The talk between races stops 35 seconds before the start. |
 
 Keep race calls short (3–8 words, present tense): they're said while the race is flown.
 A `persona.md` next to them is a good place for the style notes the lines follow.

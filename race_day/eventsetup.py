@@ -177,6 +177,15 @@ class EventSetup:
             return TrackPaths(self.dir)
         return TrackPaths(self.dir / LAYOUTS_DIR / _slug(name))
 
+    def sections(self, layout: str = MAIN) -> List[dict]:
+        """A layout's named parts of the track: [{name, from, to}] (gates; "the dive" from gate 5 to gate 8)."""
+        return list(((self.layouts.get(layout or MAIN) or {}).get("sections")) or [])
+
+    def set_sections(self, layout: str, sections: List[dict]):
+        self.layouts.setdefault(layout or MAIN, {"gates": None})["sections"] = [
+            {"name": str(x["name"]).strip(), "from": int(x["from"]), "to": int(x["to"])}
+            for x in sections if str(x.get("name") or "").strip()]
+
     def add_layout(self, name: str, gates: Optional[int] = None) -> str:
         name = name.strip()
         if name and name not in self.layouts:
@@ -379,6 +388,73 @@ def seat_by_channel(pilots: List[str], own: Dict[str, str], channels: List[dict]
             used.add(freq.get(ch, ch))
         out.append({"pilot": p, **({"channel": ch} if ch else {})})
     return out
+
+
+def section_legs(a: int, b: int, n: int) -> List[int]:
+    """The legs (0-based: leg i = gate i+1 → gate i+2) from gate a to gate b, round the lap if b ≤ a."""
+    if not n or not (1 <= a <= n) or not (1 <= b <= n):
+        return []
+    out, g = [], a
+    while True:
+        out.append(g - 1)
+        g = g % n + 1
+        if g == b or len(out) >= n:
+            return out
+
+
+def best_consecutive(laps: List[float], n: int) -> Optional[float]:
+    """The best `n` laps in a row (their total), or None with fewer laps."""
+    n = max(1, int(n or 1))
+    if len(laps) < n:
+        return None
+    return min(sum(laps[i:i + n]) for i in range(len(laps) - n + 1))
+
+
+def qualifying_bests(event, n: int, before: Optional[float] = None, exclude: str = "",
+                     pilots: Optional[List[str]] = None) -> Dict[str, float]:
+    """Each pilot's best `n` laps in a row over the event's time trials, the way FPVTrackside seeds (within one
+    race), from every race's Race.json (its valid laps; races without video too). Only races started before
+    `before`, without `exclude` (the race being flown or replayed); only `pilots` if given (a class)."""
+    from race_day.trackside import parse_time, read_json
+    mine = {p.lower(): p for p in pilots} if pilots else None
+    rounds = getattr(event, "rounds", {}) or {}
+    names = getattr(event, "pilot_names", {}) or {}
+    out: Dict[str, float] = {}
+    for d in Path(event.dir).iterdir():
+        if d.name == exclude or not (d / "Race.json").is_file():
+            continue
+        race = read_json(d / "Race.json")
+        race = race[0] if isinstance(race, list) and race else race
+        if not isinstance(race, dict) or not race.get("Valid", True):
+            continue
+        if (rounds.get(race.get("Round")) or {}).get("EventType") != "TimeTrial":
+            continue
+        start = parse_time(race.get("Start"))
+        if start is None or (before is not None and start >= before):
+            continue
+        dets = {x.get("ID"): x for x in race.get("Detections") or []}
+        laps: Dict[str, List[Tuple[int, float]]] = {}
+        for lap in race.get("Laps") or []:
+            det = dets.get(lap.get("Detection")) or {}
+            if not det.get("Valid", True) or (lap.get("LapNumber") or 0) < 1:
+                continue
+            laps.setdefault(det.get("Pilot"), []).append((lap["LapNumber"], float(lap.get("LengthSeconds") or 0)))
+        for pid, ls in laps.items():
+            name = names.get(pid)
+            if not name or (mine is not None and name.lower() not in mine):
+                continue
+            name = mine[name.lower()] if mine else name
+            best = best_consecutive([t for _, t in sorted(ls)], n)
+            if best is not None and best < out.get(name, 1e9):
+                out[name] = best
+    return out
+
+
+def standing(bests: Dict[str, float], pilot: str) -> Optional[int]:
+    """A pilot's place in the qualifying order (1 = fastest), None without a time."""
+    if pilot not in bests:
+        return None
+    return 1 + sum(1 for p, t in bests.items() if p != pilot and t < bests[pilot])
 
 
 def fril_points(place: int, total: int) -> int:

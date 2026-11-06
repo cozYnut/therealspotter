@@ -24,6 +24,8 @@ from PyQt6.QtWidgets import (
     QListWidgetItem, QMessageBox, QPushButton, QSplitter, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
+from race_day.flowlayout import FlowLayout
+
 JUMP_FRAMES = 6         # clicking a lap jumps this many frames before its pass
 STATUS_ICON = {"new": "•", "analysing": "⏳", "analysed": "◦", "checked": "✓", "updated": "↻"}
 LANE_COLORS = {"timing": QColor(235, 235, 235), "video": QColor(80, 200, 120), "flag": QColor(255, 160, 40),
@@ -222,8 +224,9 @@ class HeatPlayer(QWidget):
         self.split.setStretchFactor(0, 1)
         self.split.setSizes([400, 110])
         v.addWidget(self.split, 1)
-        row = QHBoxLayout()
         self.which = QComboBox()
+        self.which.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.which.setMinimumContentsLength(18)
         self.which.currentIndexChanged.connect(self._switch)
         self.play_btn = QPushButton("▶")
         self.play_btn.clicked.connect(self.toggle)
@@ -239,10 +242,11 @@ class HeatPlayer(QWidget):
                                  "is reading right now, as on race day")
         self.live_btn.clicked.connect(self._sync)
         self.live_btn.hide()
+        bar = QWidget()                          # the controls wrap onto more lines in a narrow window
+        row = FlowLayout(bar)
         for w in (self.which, self.play_btn, self.live_btn, back, fb, ff, fwd, self.time_lbl):
             row.addWidget(w)
-        row.addStretch()
-        v.addLayout(row)
+        v.addWidget(bar)
         self.cap = None
         self.videos: List[str] = []
         self.quads: Dict[str, List[dict]] = {}    # video → [{"rect", "channel", "pilot"}]
@@ -458,7 +462,6 @@ class EventPage(QWidget):
         self.heat_id: Optional[str] = None
         self._detail_sig = None
         v = QVBoxLayout(self)
-        top = QHBoxLayout()
         self.title = QLabel("")
         f = QFont()
         f.setPointSize(16)
@@ -497,14 +500,16 @@ class EventPage(QWidget):
         self.ann_btn.clicked.connect(lambda: win.set_announcer())
         stop = QPushButton("Close")
         stop.clicked.connect(lambda: win.stop_event())
-        for w in (self.title, self.setup_btn, self.learn_btn, self.auto, self.pause_race):
-            top.addWidget(w)
-        top.addWidget(self.status, 1)
-        top.addWidget(self.ft_btn)
-        top.addWidget(self.fril_btn)
-        top.addWidget(self.ann_btn)
-        top.addWidget(stop)
-        v.addLayout(top)
+        # the title and buttons wrap onto more lines when the window is narrow; the status has a line of its own
+        bar = QWidget()
+        flow = FlowLayout(bar)
+        for w in (self.title, self.setup_btn, self.learn_btn, self.auto, self.pause_race, self.ft_btn,
+                  self.fril_btn, self.ann_btn, stop):
+            flow.addWidget(w)
+        v.addWidget(bar)
+        self.status.setWordWrap(True)
+        self.status.setMinimumWidth(100)
+        v.addWidget(self.status)
         self.banner = QLabel("")
         self.banner.setStyleSheet("background:#7a4b00;color:white;padding:4px")
         self.banner.setVisible(False)
@@ -590,7 +595,8 @@ class EventPage(QWidget):
         vsplit.addWidget(self.review_panel)
         vsplit.setSizes([520, 300, 160, 300])
         rv.addWidget(vsplit, 1)
-        btns = QHBoxLayout()
+        bbar = QWidget()                         # the buttons wrap onto more lines in a narrow window
+        btns = FlowLayout(bbar)
         self.b_analyse = QPushButton("Analyse")
         self.b_accept = QPushButton("✓ Accept")
         self.b_reject = QPushButton("✗ Reject")
@@ -611,13 +617,12 @@ class EventPage(QWidget):
         self.b_remove.clicked.connect(self._remove)
         self.b_write.clicked.connect(self._write)
         self.b_restore.clicked.connect(self._restore)
-        for b in (self.b_analyse, self.b_review, self.b_accept, self.b_reject, self.b_add, self.b_remove):
+        for b in (self.b_analyse, self.b_review, self.b_accept, self.b_reject, self.b_add, self.b_remove,
+                  self.b_restore, self.b_write):
             btns.addWidget(b)
-        btns.addStretch()
-        btns.addWidget(self.b_restore)
-        btns.addWidget(self.b_write)
-        rv.addLayout(btns)
+        rv.addWidget(bbar)
         self.note = QLabel("")
+        self.note.setWordWrap(True)
         self.note.setStyleSheet("color:#888")
         rv.addWidget(self.note)
         split.addWidget(right)

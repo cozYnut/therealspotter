@@ -47,6 +47,27 @@ DEFAULT_LINES: Dict[str, List[str]] = {
     "eliminated": ["That's the end of the day for {pilot}", "{pilot} is out of the bracket"],
     "ace_win": ["{pilot} takes a chase the ace win", "That's a win in the chase for {pilot}"],
     "final_win": ["{pilot} wins the main", "And {pilot} takes the final"],
+    # the finish and what it means in one line (a 4-pilot race: 4 lines after the flag, not 8)
+    "finish_win_through": ["{pilot} wins it and goes through"],
+    "finish_win_ace_win": ["{pilot} wins it, a chase the ace win"],
+    "finish_win_final_win": ["{pilot} wins the final"],
+    "finish_through": ["{pilot} in {place}, goes through"],
+    "finish_close_through": ["{pilot} in {place}, {margin} behind {ahead}, and goes through"],
+    "finish_to_losers": ["{pilot} in {place}, drops to the losers bracket"],
+    "finish_close_to_losers": ["{pilot} in {place}, {margin} behind {ahead}, drops to the losers bracket"],
+    "finish_out": ["{pilot} in {place}, and that's the end of the day. Lots to build on"],
+    "finish_close_out": ["{pilot} in {place}, just {margin} short, and that's the end of the day"],
+    # qualifying: a new best of the class's seeding laps, and what it's worth in the standings
+    "qual_first": ["{pilot} sets {time} for {laps} laps, {place} for now"],
+    "qual_top": ["{pilot} goes top of the standings, {time} for {laps} laps"],
+    "qual_up": ["{pilot}, new best {time}, up {moved} to {place}"],
+    "qual_same": ["{pilot}, new best {time}, still {place}"],
+    # the Auto Runner's countdown to the next race (FPVTrackside's "Announce next race in")
+    "start_in": ["{time} to the next race", "Next race in {time}: {pilots}"],
+    "start_in_first": ["{time} to the next race. {pilots}, to the start line please, video on"],
+    "start_in_last": ["{time}! {pilots}, quads on the line"],
+    "hurry_video": ["Hurry up {pilot}, we can't see your video"],
+    "video_ok": ["{time} to go. Video looks good"],
     "last_lap": ["Last lap for {pilot}"],
     "fastest": ["{pilot}, fastest lap of the race, {time}"],
     "finish_win": ["{pilot} wins it"],
@@ -66,7 +87,18 @@ DEFAULT_LINES: Dict[str, List[str]] = {
     "out": ["{pilot} is out"],
     "safety": ["Stop. Pilots, land now."],
 }
-ORDINAL = ["", "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth"]
+ORDINAL = ["", "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth",
+           "eleventh", "twelfth", "thirteenth", "fourteenth", "fifteenth", "sixteenth", "seventeenth",
+           "eighteenth", "nineteenth", "twentieth", "twenty-first", "twenty-second", "twenty-third",
+           "twenty-fourth", "twenty-fifth", "twenty-sixth", "twenty-seventh", "twenty-eighth", "twenty-ninth",
+           "thirtieth"]
+
+
+def speakable(callsign: str) -> str:
+    """A callsign the voice can say, when nobody wrote how: "Shauli_fpv" → "Shauli F P V", "DeanFpv" → "Dean F P V"."""
+    s = re.sub(r"(?i)[_.\-]?fpv$", " F P V", callsign)
+    s = re.sub(r"[_]+", " ", s)
+    return s.strip() or callsign
 
 
 def clubs() -> List[str]:
@@ -97,10 +129,13 @@ class ClubStyle:
         for p in (_yaml(d / "pilots.yaml") if d else None) or []:
             if isinstance(p, dict) and p.get("callsign"):
                 self.pilots[str(p["callsign"]).lower()] = p
+        talk = (_yaml(d / "talk.yaml") if d else None) or {}     # between races (race_day/talk.py)
+        self.talk = {k: list(v if isinstance(v, list) else [v]) for k, v in talk.items() if v}
         self.tracks = sorted(p.stem for p in (d / "tracks").glob("*.yaml")) if d and (d / "tracks").exists() else []
         self.track_name = track if track in self.tracks else None
         self.track = (_yaml(d / "tracks" / f"{self.track_name}.yaml") if self.track_name else None) or {}
         self._last: Dict[str, str] = {}
+        self.sections: List[dict] = []            # the event's named sections (lazy_spotter_v2 sets them per heat)
 
     # ── what to call things ──
     @property
@@ -109,15 +144,27 @@ class ClubStyle:
 
     def pilot(self, callsign: str, phonetic: Optional[str] = None) -> str:
         card = self.pilots.get(str(callsign).lower()) or {}
-        return card.get("say_it_like") or phonetic or str(callsign)
+        return card.get("say_it_like") or phonetic or speakable(str(callsign))
 
     def is_new(self, callsign: str) -> bool:
         return bool((self.pilots.get(str(callsign).lower()) or {}).get("new"))
 
     def gate(self, n: Optional[int]) -> Optional[str]:
-        """What the track calls gate n (1 = the start/finish gate); None when it has no name for it."""
+        """What the track calls gate n (1 = the start/finish gate): the venue's track file, else the event's
+        named section it's in (Event setup → Sections: set_sections); None when nothing names it."""
         g = (self.track.get("gates") or {}).get(n) if n else None
-        return (g.get("say") if isinstance(g, dict) else g) or None
+        name = (g.get("say") if isinstance(g, dict) else g) or None
+        if name or not n:
+            return name
+        for x in self.sections:
+            a, b = int(x["from"]), int(x["to"])
+            inside = a < n <= b if a < b else (n > a or n <= b)
+            if inside:
+                return x["name"]
+        return None
+
+    def set_sections(self, sections: Optional[List[dict]]):
+        self.sections = list(sections or [])
 
     def crash_spot(self, n: Optional[int]) -> bool:
         g = (self.track.get("gates") or {}).get(n) if n else None
@@ -136,6 +183,19 @@ class ClubStyle:
         return text
 
     @staticmethod
+    def countdown(s: float) -> str:
+        """Seconds to the start, said: 120 → "2 minutes", 90 → "a minute and a half", 45 → "45 seconds"."""
+        s = int(round(s / 5.0) * 5) if s > 15 else int(round(s))
+        if s >= 60:
+            m, r = divmod(s, 60)
+            if r == 30:
+                return "a minute and a half" if m == 1 else f"{m} and a half minutes"
+            if r < 10:
+                return "one minute" if m == 1 else f"{m} minutes"
+            return f"{m} minute{'s' if m > 1 else ''} {r} seconds"
+        return f"{s} seconds"
+
+    @staticmethod
     def margin(s: float) -> str:
         if s < 0.95:
             n = max(1, round(s * 10))
@@ -145,6 +205,22 @@ class ClubStyle:
     @staticmethod
     def place(n) -> str:
         return ORDINAL[n] if isinstance(n, int) and 0 < n < len(ORDINAL) else f"number {n}"
+
+    # ── a call ──
+    def talk_line(self, kind: str, **words) -> Optional[str]:
+        """One of talk.yaml's ways to say `kind` that these words fill, or None."""
+        known = {k: v for k, v in words.items() if v not in (None, "")}
+        fits = [t for t in self.talk.get(kind, []) if set(re.findall(r"\{(\w+)\}", t)) <= set(known)]
+        if not fits:
+            return None
+        most = max(len(set(re.findall(r"\{(\w+)\}", t))) for t in fits)   # the lines that say the most we know
+        fits = [t for t in fits if len(set(re.findall(r"\{(\w+)\}", t))) == most]
+        key = "talk:" + kind
+        if len(fits) > 1 and self._last.get(key) in fits:
+            fits.remove(self._last[key])
+        t = random.choice(fits)
+        self._last[key] = t
+        return t.format(**known)
 
     # ── a call ──
     def line(self, kind: str, **words) -> Optional[str]:

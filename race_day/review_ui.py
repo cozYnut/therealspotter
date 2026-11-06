@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
 )
 
 from race_day.event_ui import REVIEW_COLORS
+from race_day.flowlayout import FlowLayout
 from race_day.review import TAG_LABELS, Review
 
 ICONS = {"pending": "…", "accepted": "✓", "fixed_id": "✎", "added": "+", "skipped": "⤼"}
@@ -62,7 +63,8 @@ class ReviewPanel(QWidget):
         crops.addStretch()
         row.addLayout(crops, 1)
         v.addLayout(row, 1)
-        btns = QHBoxLayout()
+        bar = QWidget()                      # the buttons wrap onto more lines in a narrow window
+        btns = FlowLayout(bar)
         actions = [("✓ Accept  ⏎", self.accept), ("✗ False pass  X", self.reject), ("+ Missed pass  A", lambda: self.add("pass")),
                    ("⤼ Skipped gate  M", lambda: self.add("skipped")), ("Tag  T", self.tag), ("Undo  ⌫", self.undo),
                    ("◀ Prev  ⇧N", lambda: self.step(-1)), ("Next ▶  N", lambda: self.step(+1))]
@@ -70,17 +72,18 @@ class ReviewPanel(QWidget):
             b = QPushButton(text)
             b.clicked.connect(fn)
             btns.addWidget(b)
-        btns.addStretch()
         done = QPushButton("Done reviewing")
         done.setStyleSheet("QPushButton{background:#2b6cb0;color:white;font-weight:bold;padding:6px 12px}")
         done.clicked.connect(self.finished.emit)
         btns.addWidget(done)
-        v.addLayout(btns)
+        v.addWidget(bar)
         self.msg = QLabel("")
+        self.msg.setWordWrap(True)
         self.msg.setStyleSheet("font-weight:600")
         v.addWidget(self.msg)
         help_ = QLabel("Type the gate number (1 then 2 → G12) · Space play · ← → one frame · ⇧← → one second")
         help_.setStyleSheet("color:#888;font-size:11px")
+        help_.setWordWrap(True)
         v.addWidget(help_)
         # keys: only while a review is open
         keys = [("Return", self.accept), ("Enter", self.accept), ("N", lambda: self.step(+1)),

@@ -182,13 +182,17 @@ class Finals:
         for cls, main, sid in mains:
             st = stages[sid]
             fr, kn = self.finals_round(st), self.known(st)
+            last = max([int(r.get("round") or 0) for r in st.get("races") or []
+                        if not any(w in (r.get("group") or "").lower() for w in ("chase", "grand", "final"))] or [0])
             wins = (st.get("setup") or {}).get("aceWinsRequired")
             for sr in st.get("races") or []:
                 key = f"{sid}:{sr.get('id')}"
                 if key in self.races or sr.get("state") in DONE:
                     continue
                 n = max(fr[sr.get("id")], done + 1)        # a race of a round already made: in the next one
-                todo.setdefault(n, []).append((cls, main, sid, dict(sr, _wins=wins, _known=kn.get(sr.get("id")))))
+                todo.setdefault(n, []).append((cls, main, sid, dict(
+                    sr, _wins=wins, _known=kn.get(sr.get("id")),
+                    _semi=int(sr.get("round") or 0) == last and "loser" in (sr.get("group") or "").lower())))
         if not todo:
             return False
         n = min(todo)
@@ -204,7 +208,8 @@ class Finals:
             self.races[f"{sid}:{sr.get('id')}"] = {
                 "ext": FIN_BASE + 1000 + k, "round": n, "fpv": None, "class": cls, "main": main,
                 "group": sr.get("group"), "advance": sr.get("expectedWinners"), "title": sr.get("title"),
-                "ace_wins": sr.get("_wins"), "seats": {}}
+                "ace_wins": sr.get("_wins"), "seats": {}, "rid": sr.get("id"),
+                "stage_round": int(sr.get("round") or 0), "semi": sr.get("_semi")}
         self.log(f"finals: Finals {n} — {len(todo[n])} races, "
                  f"{sum(len(sr['_known']) for *_, sr in todo[n])} pilots known so far")
         return True

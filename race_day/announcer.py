@@ -49,8 +49,8 @@ from xml.etree import ElementTree as ET
 from race_day.clubstyle import ClubStyle
 
 FT_HOME = Path.home() / "Documents" / "FPVTrackside"     # FPVTrackside's working folder on a Mac
-P_START, P_LAP, P_PLACE, P_INFO = 0, 1, 2, 3              # speaking order
-MAX_WAIT = {P_START: 6.0, P_LAP: 4.0, P_PLACE: 3.0, P_INFO: 10.0}   # said this late at most
+P_START, P_LAP, P_PLACE, P_INFO, P_TALK = 0, 1, 2, 3, 4   # speaking order (talk: between races, race_day/talk.py)
+MAX_WAIT = {P_START: 6.0, P_LAP: 4.0, P_PLACE: 3.0, P_INFO: 10.0, P_TALK: 120.0}   # said this late at most
 STALE_S = 5.0            # an event older than this (FPVTrackside's own clock) is history, not news
 LEAD_MARGIN_S = 0.5      # a new leader through the same gate: this far ahead at least (or a gate ahead)
 HOLD_S = 1.5             # a new place from the video: held this long before it's called …
@@ -59,6 +59,14 @@ PLACE_EVERY_S = 3.0      # … any place call at most this often
 GAP_CALL_S = 1.0         # the first two within this at a gate: the margin is called …
 GAP_EVERY_S = 10.0       # … at most this often
 DOWN_MIN_S = 15.0        # no gate seen this long (at least; ¾ of a lap) and the pilot is down
+VIDEO_CHECK_S = 20       # the Auto Runner's countdown: this long before the start, the pictures are checked
+TALK_STOP_S = 35         # … the talk between races stops this long before it
+COUNTDOWN_AT = {         # … and these seconds are called (FPVTrackside announces at its own list; the nearest)
+    "first": [300, 240, 180, 120, 90, 60, 45, 30, 20, 10],
+    "qualifying": [180, 120, 60, 30, 20, 10],
+    "finals": [180, 120, 60, 30, 20, 10],
+}
+QUAL_SAME_TOP = 3        # qualifying: a new best that keeps its place is called only this near the top
 SETTLE_S = 6.0           # no place calls from the video this soon after the start (the pack sorts itself out)
 MAX_STEP = 4             # a gate from the video counts at most this many gates on from the last (missed ones) …
 STEADY = 2               # a pilot's video gates count for a gap or a place only after this many in order
@@ -70,7 +78,24 @@ RACE_TYPES = ("Race", "Endurance", "AggregateLaps")      # places count; otherwi
 OWNED = {"StartRaceIn", "RaceOver", "Holeshot", "RaceLap", "RaceDone", "Sector", "PracticeLap", "TimeTrialEveryLap"}
 START_SOUNDS = {"StartRaceIn8", "StartRaceIn5", "StartRaceIn4", "StartRaceIn3", "StartRaceIn2", "StartRaceIn1",
                 "StaggeredStart", "StaggeredPilot"}
+BRACKET_KINDS = {"through": "through", "to_losers": "to_losers", "out": "eliminated", "ace_win": "ace_win",
+                 "final_win": "final_win"}   # a bracket outcome → its line on its own (a club without combined lines)
 SAFETY_SOUNDS = {"EmergencyStop", "StandDownCancelled", "StandDownTimingSystem"}
+
+
+def countdown_seconds(text: str) -> Optional[float]:
+    """The time in FPVTrackside's "{time} until the race start": "2 minutes", "1 minute 30 seconds", "1:30",
+    "90 seconds", "90"."""
+    t = text.lower()
+    m = re.search(r"(\d+):(\d\d)", t)
+    if m:
+        return int(m.group(1)) * 60 + int(m.group(2))
+    mins = re.search(r"(\d+(?:\.\d+)?)\s*(?:minute|min)", t)
+    secs = re.search(r"(\d+(?:\.\d+)?)\s*(?:second|sec|s\b)", t)
+    if mins or secs:
+        return (float(mins.group(1)) * 60 if mins else 0) + (float(secs.group(1)) if secs else 0)
+    m = re.search(r"(\d+(?:\.\d+)?)", t)
+    return float(m.group(1)) if m else None
 
 
 def _ts(e: dict) -> Optional[float]:
@@ -103,7 +128,8 @@ def english_voices() -> List[str]:
 
 
 class Speaker:
-    """One line at a time, in priority order (the earlier of two the same)."""
+    """One line at a time, in priority order (the earlier of two the same). Talk (between races) waits for every
+    other line, and is cut off mid-sentence when a race starts (cut_talk)."""
 
     def __init__(self, voice: Optional[str] = None, rate: Optional[int] = None):
         self.voice, self.rate = voice, rate
@@ -111,33 +137,80 @@ class Speaker:
         self._n = 0
         self.speaking = False
         self.last: Optional[str] = None
+        self._proc: Optional[subprocess.Popen] = None
+        self._prio: Optional[int] = None
+        self._talk_n = 0                          # talk lines queued or being said
+        self._lock = threading.Lock()
         threading.Thread(target=self._run, daemon=True).start()
 
     def clear(self):
         """Nothing waiting is said (a safety stop)."""
         while True:
             try:
-                self.q.get_nowait()
+                _, _, _, _, rate, prio = self.q.get_nowait()
+                if prio == P_TALK:
+                    with self._lock:
+                        self._talk_n -= 1
             except queue.Empty:
-                return
+                break
+        self.cut_talk()
 
-    def say(self, text: str, prio: int = P_INFO):
+    def say(self, text: str, prio: int = P_INFO, rate_x: float = 1.0):
         self._n += 1
-        self.q.put((prio, self._n, text, time.time() + MAX_WAIT.get(prio, 10.0)))
+        if prio == P_TALK:
+            with self._lock:
+                self._talk_n += 1
+        self.q.put((prio, self._n, text, time.time() + MAX_WAIT.get(prio, 10.0), rate_x, prio))
+
+    def cut_talk(self):
+        """Talk waiting is dropped, talk being said stops (a race starts)."""
+        keep = []
+        while True:
+            try:
+                item = self.q.get_nowait()
+            except queue.Empty:
+                break
+            if item[5] == P_TALK:
+                with self._lock:
+                    self._talk_n -= 1
+            else:
+                keep.append(item)
+        for item in keep:
+            self.q.put(item)
+        proc = self._proc
+        if proc and self._prio == P_TALK and proc.poll() is None:
+            proc.terminate()
+
+    def talk_pending(self) -> bool:
+        return self._talk_n > 0
+
+    def busy(self) -> bool:
+        return self.speaking or not self.q.empty()
 
     def _run(self):
         while True:
-            prio, _, text, until = self.q.get()
-            if time.time() > until:
-                continue
-            cmd = ["say"] + (["-v", self.voice] if self.voice else []) + (["-r", str(self.rate)] if self.rate else [])
-            self.speaking, self.last = True, text
+            prio, _, text, until, rate_x, _ = self.q.get()
             try:
-                subprocess.run(cmd + [text], timeout=20)
-            except (OSError, subprocess.SubprocessError):
-                pass
+                if time.time() > until:
+                    continue
+                rate = self.rate or (180 if rate_x != 1.0 else None)
+                if rate and rate_x != 1.0:
+                    rate = int(rate * rate_x)
+                cmd = ["say"] + (["-v", self.voice] if self.voice else []) + (["-r", str(rate)] if rate else [])
+                self.speaking, self.last = True, text
+                try:
+                    self._prio = prio
+                    self._proc = subprocess.Popen(cmd + [text])
+                    self._proc.wait(timeout=60)
+                except (OSError, subprocess.SubprocessError):
+                    if self._proc and self._proc.poll() is None:
+                        self._proc.kill()
+                finally:
+                    self.speaking, self._proc, self._prio = False, None, None
             finally:
-                self.speaking = False
+                if prio == P_TALK:
+                    with self._lock:
+                        self._talk_n -= 1
 
 
 # ── FPVTrackside's sounds and its log ──────────────────────────
@@ -295,6 +368,11 @@ class Announcer:
         self.follower: Optional[LogFollower] = None
         self.on_race: Optional[Callable[[bool], None]] = None
         self.heat_info: Optional[Callable[[dict], dict]] = None   # RaceLoaded → the heat's setup (lazy_spotter_v2)
+        self.talk = None                          # race_day/talk.py: between races (lazy_spotter_v2 sets it)
+        self.feeds: Dict[str, tuple] = {}         # channel → (picture lost, since): the live video, race or not
+        self.start_at: Optional[float] = None     # when the Auto Runner starts the next race (its countdown)
+        self._said_at: set = set()                # the countdown seconds already called for this race
+        self._video_checked = False
         self.lock = threading.RLock()
         self.calls: List[str] = []               # the last calls made (for the screen)
         self._new_race({})
@@ -383,7 +461,10 @@ class Announcer:
                      "type": e.get("raceType") or "Race", "target": e.get("targetLaps") or 0, "say": pilots,
                      "channels": chans, "style": info.get("style") or "both", "kind": info.get("kind"),
                      "group": info.get("group"), "advance": info.get("advance"), "class": info.get("class"),
-                     "ace_wins": info.get("ace_wins")}
+                     "ace_wins": info.get("ace_wins"), "qual": info.get("qual"), "main": info.get("main"),
+                     "semi": info.get("semi"), "stage_round": info.get("stage_round"),
+                     "round": e.get("round") if e else None}
+        self.lap_list: Dict[str, List[float]] = {}  # each pilot's lap times this race (qualifying: the PB window)
         self.running = False
         self.silenced = False
         self.leader: Optional[str] = None         # who leads, as last called
@@ -399,6 +480,20 @@ class Announcer:
         self.called = {"lead": 0.0, "place": 0.0, "gap": 0.0}
 
     def on_event(self, e: dict):
+        self._on_event(e)
+        if self.talk:                            # between races (race_day/talk.py): after the race calls
+            try:
+                self.talk.on_event(e.get("type"), e, self.race)
+            except Exception as ex:              # noqa: BLE001
+                self.log(f"talk: {ex}")
+
+    def talk_say(self, text: str, rate_x: float = 1.0):
+        """A line of the talk between races: after every other line."""
+        self.calls = (self.calls + [text])[-30:]
+        if self.enabled:
+            self.speaker.say(text, P_TALK, rate_x)
+
+    def _on_event(self, e: dict):
         kind = e.get("type")
         info = None
         if kind == "RaceLoaded" and self.heat_info:          # asked outside the lock: it may ask FPVTrackside
@@ -417,6 +512,7 @@ class Announcer:
                     self._say("start", P_START, time=round(secs) if isinstance(secs, (int, float)) else 5)
             elif kind == "RaceStart":
                 self.running, self.started_at = True, time.time()
+                self.start_at = None
                 self._race_hook(True)
             elif kind in ("RaceEnd", "RaceCancelled"):
                 if kind == "RaceEnd" and self.running and not self.silenced and self.sounds.on("RaceOver"):
@@ -481,6 +577,8 @@ class Announcer:
             if t and self.sounds.on(key):
                 self._say("practice_fastest" if fastest else "practice_lap", P_LAP, pilot=name, time=t) or \
                     self._say("practice_lap", P_LAP, pilot=name, time=t)
+            if isinstance(lap, (int, float)):
+                self._qualifying_pb(pilot, name, lap)
             return
         pos = e.get("position")
         leader = next((s.get("pilotName") for s in e.get("positionSnapshot") or [] if s.get("position") == 1), None)
@@ -519,6 +617,37 @@ class Announcer:
             self._say("last_lap", P_LAP, pilot=name)
         self.leader = self.leader or leader
 
+    def _qualifying_pb(self, pilot: str, name: str, lap: float):
+        """Qualifying: the pilot's last `laps` laps beat their best — the new time, and how many places it's
+        worth in the class's standings (race_day/eventsetup.py: qualifying_bests, from the heats before)."""
+        q = self.race.get("qual")
+        if not q:
+            return
+        from race_day.eventsetup import standing
+        laps = self.lap_list.setdefault(pilot, [])
+        laps.append(lap)
+        n = int(q.get("laps") or 3)
+        if len(laps) < n:
+            return
+        run = sum(laps[-n:])
+        bests = q["best"]
+        old = bests.get(pilot)
+        if old is not None and run >= old - 1e-6:
+            return
+        was = standing(bests, pilot)
+        bests[pilot] = run
+        now = standing(bests, pilot)
+        words = dict(pilot=name, time=self.style.lap_time(run, self.decimals), laps=n, place=self.style.place(now))
+        if now == 1 and was != 1:
+            self._say("qual_top", P_PLACE, **words) or self._say("qual_same", P_PLACE, **words)
+        elif was is None:
+            self._say("qual_first", P_PLACE, **words)
+        elif now < was:
+            d = was - now
+            self._say("qual_up", P_PLACE, **words, moved="one place" if d == 1 else f"{d} places")
+        elif now <= QUAL_SAME_TOP:                # faster but the same place: only worth a word near the top
+            self._say("qual_same", P_PLACE, **words)
+
     def _finish(self, pilot: str, name: str, race_t):
         if pilot in (p for p, _ in self.finished):
             return
@@ -529,49 +658,64 @@ class Announcer:
         prev = self.finished[-2] if k > 1 else None
         margin = race_t - prev[1] if prev and isinstance(race_t, (int, float)) and isinstance(prev[1], (int, float)) \
             else None
-        if k == 1:
-            self._say("finish_win", P_LAP, pilot=name)
-        elif margin is not None and margin < GAP_CALL_S * 1.5:
-            self._say("finish_close", P_LAP, pilot=name, place=self.style.place(k), margin=self.style.margin(margin),
-                      ahead=self._name(prev[0])) or self._say("finish", P_LAP, pilot=name, place=self.style.place(k))
-        else:
-            self._say("finish", P_LAP, pilot=name, place=self.style.place(k))
-        self._bracket_call(pilot, name, k)
-        if k == len(self.race["say"]) and k > 1:   # the last one home gets a kind word
+        out = self._bracket_outcome(k)
+        words = dict(pilot=name, place=self.style.place(k))
+        close = k > 1 and margin is not None and margin < GAP_CALL_S * 1.5
+        if close:
+            words.update(margin=self.style.margin(margin), ahead=self._name(prev[0]))
+        # one line: the place and what it means in the bracket ("Slow in second, goes through")
+        said = bool(out) and (
+            (k == 1 and self._say(f"finish_win_{out}", P_LAP, **words)) or
+            (close and self._say(f"finish_close_{out}", P_LAP, **words)) or
+            (k > 1 and self._say(f"finish_{out}", P_LAP, **words)))
+        if not said:
+            if k == 1:
+                self._say("finish_win", P_LAP, pilot=name)
+            elif close:
+                self._say("finish_close", P_LAP, **words) or self._say("finish", P_LAP, pilot=name, place=words["place"])
+            else:
+                self._say("finish", P_LAP, pilot=name, place=words["place"])
+            if out:                                # the club has no combined line: the bracket call after it
+                self._say(BRACKET_KINDS[out], P_INFO, pilot=name)
+        if k == len(self.race["say"]) and k > 1 and not (said and out == "out"):   # the last one home: a kind word
             self._say("kind_new" if self.style.is_new(pilot) else "kind", P_INFO, pilot=name) or \
                 self._say("kind", P_INFO, pilot=name)
 
-    def _bracket_call(self, pilot: str, name: str, k: int):
-        """In a bracket (Event setup): what this finishing place means — through, to the losers bracket, out, or
-        a chase the ace win."""
+    def _bracket_outcome(self, k: int) -> Optional[str]:
+        """In a bracket (Event setup): what finishing k-th means — through, to_losers, out, ace_win (a chase
+        the ace race won) or final_win (a final of one race won); None outside a bracket."""
         group = (self.race.get("group") or "").lower()
         adv = self.race.get("advance")
         if not group or self.race.get("kind") != "finals":
-            return
+            return None
         if "chase" in group:
-            if k == 1:                             # a final of one race (the other mains) or a chase the ace win
-                if self.race.get("ace_wins") == 1:
-                    self._say("final_win", P_INFO, pilot=name) or self._say("ace_win", P_INFO, pilot=name)
-                else:
-                    self._say("ace_win", P_INFO, pilot=name)
-            return
+            return ("final_win" if self.race.get("ace_wins") == 1 else "ace_win") if k == 1 else None
         if not isinstance(adv, int) or adv <= 0:
-            return
+            return None
         if k <= adv:
-            self._say("through", P_INFO, pilot=name)
-        elif "winner" in group:
-            self._say("to_losers", P_INFO, pilot=name)
-        elif "loser" in group:
-            self._say("eliminated", P_INFO, pilot=name)
+            return "through"
+        if "winner" in group:
+            return "to_losers"
+        if "loser" in group:
+            return "out"
+        return None
 
     def _logged(self, text: str):
         """A line FPVTrackside spoke (into its log): said here unless it's a call made from the events."""
         key = self.sounds.which(text)
         if key in OWNED:
             return
+        if key == "UntilRaceStart":              # the Auto Runner's countdown: the app's own calls, on its clock
+            secs = countdown_seconds(text)
+            if secs is not None:
+                with self.lock:
+                    self._countdown(secs)
+                return
         if key in SAFETY_SOUNDS:                 # safety first: said at once and alone, the race calls stop
             with self.lock:
                 self.silenced = True
+            if self.talk:
+                self.talk.safety()
             self.speaker.clear()
             self.calls = (self.calls + [text])[-30:]
             if self.enabled:
@@ -582,6 +726,55 @@ class Announcer:
             self.speaker.say(text, P_START if key in START_SOUNDS else P_INFO)
 
     # ── the live video: where each pilot is mid-lap ──
+    # ── the Auto Runner's countdown: when the next race starts, and who isn't ready ──
+    def start_in(self) -> Optional[float]:
+        """Seconds to the next race's start (the Auto Runner's countdown), or None when it isn't counting."""
+        if not self.start_at:
+            return None
+        left = self.start_at - time.time()
+        return left if left > -5 else None
+
+    def _stage(self) -> str:
+        """first (the first qualifying round: the most reminders), qualifying, finals."""
+        r = self.race
+        if r.get("kind") == "qualifying" or (r.get("type") == "TimeTrial" and r.get("kind") != "finals"):
+            return "first" if r.get("round") == 1 else "qualifying"
+        return "finals"
+
+    def _countdown(self, secs: float):
+        """FPVTrackside's Auto Runner said "{time} until the race start": the clock, and — at the seconds this
+        stage calls (COUNTDOWN_AT: more of them in the first qualifying round) — a call of the app's own, with
+        the pilots' names near the end. Talk between races stops for the last half minute."""
+        new = self.start_at is None or abs((time.time() + secs) - self.start_at) > 15
+        self.start_at = time.time() + secs
+        if new:
+            self._said_at, self._video_checked = set(), secs < VIDEO_CHECK_S
+        if self.talk and secs <= TALK_STOP_S:
+            self.talk.stop()
+        stage = self._stage()
+        at = min(COUNTDOWN_AT[stage], key=lambda x: abs(x - secs))
+        if abs(at - secs) > 3 or at in self._said_at or self.silenced:
+            return
+        self._said_at.add(at)
+        if at == VIDEO_CHECK_S:                    # the video check says it (or stays quiet)
+            return
+        names = [self._name(p) for p in self.race["say"]]
+        pilots = (", ".join(names[:-1]) + " and " + names[-1]) if len(names) > 1 else "".join(names)
+        words = dict(time=self.style.countdown(secs), pilots=pilots or None)
+        kind = "start_in_last" if secs <= 30 else ("start_in_first" if stage == "first" else "start_in")
+        self._say(kind, P_START, **words) or self._say("start_in", P_START, **words)
+
+    def _video_check(self):
+        """20 seconds to go: a pilot whose picture the live video doesn't have is hurried up by name."""
+        if not self.feeds:
+            return                                 # the live video isn't running: nothing to go on
+        lost = [p for ch, p in self.race["channels"].items() if (self.feeds.get(ch) or (False, 0))[0]]
+        if lost:
+            for p in lost:
+                self._say("hurry_video", P_START, pilot=self._name(p), time=self.style.countdown(VIDEO_CHECK_S))
+        elif self.race["channels"]:
+            self._say("video_ok", P_START, time=self.style.countdown(VIDEO_CHECK_S))
+
     def _v(self, pilot: str) -> dict:
         return self.vid.setdefault(pilot, {"gate": None, "prog": -1, "t": None, "last": time.time(), "down": False,
                                            "gray": False, "anchored": False, "cand": None, "lap": 0, "steady": 0})
@@ -603,6 +796,8 @@ class Announcer:
         names wobble. Two passes in a row that agree with each other count even if they don't fit the last
         one, so a pilot is never stuck; LapRF's crossings put it right each lap."""
         with self.lock:
+            if e.get("type") == "picture" and e.get("channel"):   # kept before the race too: who to hurry up
+                self.feeds[e["channel"]] = (bool(e.get("gray")), time.time())
             pilot = self.race["channels"].get(e.get("channel"))
             if not pilot or not self.running:
                 return
@@ -665,6 +860,10 @@ class Announcer:
                 if self.running and not self.silenced and self.vid:
                     self._downs()
                     self._places()
+                if self.start_at and not self.running and not self.silenced and not self._video_checked \
+                        and self.start_at - time.time() <= VIDEO_CHECK_S:
+                    self._video_checked = True
+                    self._video_check()
 
     def _downs(self):
         now = time.time()
