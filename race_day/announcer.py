@@ -60,6 +60,8 @@ GAP_CALL_S = 1.0         # the first two within this at a gate: the margin is ca
 GAP_EVERY_S = 10.0       # … at most this often
 DOWN_MIN_S = 15.0        # no gate seen this long (at least; ¾ of a lap) and the pilot is down
 VIDEO_CHECK_S = 20       # the Auto Runner's countdown: this long before the start, the pictures are checked
+GO_S = 20                # "here we go", "let's go": only this close to a start
+AUTO_SEEN_S = 15 * 60    # the Auto Runner counted down this recently: it's running (its clock starts at race end)
 TALK_STOP_S = 35         # … the talk between races stops this long before it
 COUNTDOWN_AT = {         # … and these seconds are called (FPVTrackside announces at its own list; the nearest)
     "first": [300, 240, 180, 120, 90, 60, 45, 30, 20, 10],
@@ -96,6 +98,17 @@ def countdown_seconds(text: str) -> Optional[float]:
         return (float(mins.group(1)) * 60 if mins else 0) + (float(secs.group(1)) if secs else 0)
     m = re.search(r"(\d+(?:\.\d+)?)", t)
     return float(m.group(1)) if m else None
+
+
+def auto_runner_config(profile_dir: Path) -> Optional[dict]:
+    """FPVTrackside's Auto Runner times: {results: s the results show, next: s from then to the start}."""
+    try:
+        root = ET.parse(Path(profile_dir) / "AutoRunnerConfig.xml").getroot()
+        cfg = root.find("AutoRunnerConfig") if root.tag != "AutoRunnerConfig" else root
+        return {"results": float(cfg.findtext("SecondsToShowResults") or 0),
+                "next": float(cfg.findtext("SecondsToNextRace") or 0)}
+    except (OSError, ET.ParseError, AttributeError, ValueError):
+        return None
 
 
 def _ts(e: dict) -> Optional[float]:
@@ -373,6 +386,12 @@ class Announcer:
         self.start_at: Optional[float] = None     # when the Auto Runner starts the next race (its countdown)
         self._said_at: set = set()                # the countdown seconds already called for this race
         self._video_checked = False
+        self._talk_stopped = False
+        self.ended = False                        # the race is over: the countdown is to the next one
+        self.auto_seen = 0.0                      # when the Auto Runner last counted down (it's on)
+        self.next_up_fn: Optional[Callable[[int], List[dict]]] = None   # the next races, from FPVTrackside
+        self.up_next: List[str] = []              # the next race's pilots, while the last one's results show
+        self._up_next_at = 0.0
         self.lock = threading.RLock()
         self.calls: List[str] = []               # the last calls made (for the screen)
         self._new_race({})
@@ -430,8 +449,13 @@ class Announcer:
                     "log": str(self.ft_dir / "log" / "Log.txt")}
 
     # ── calls ──
+    def go_now(self) -> bool:
+        """A race is about to start (or flying): the time for "here we go"."""
+        left = self.start_in()
+        return self.running or (left is not None and left <= GO_S + 1)
+
     def _say(self, kind: str, prio: int, **words) -> bool:
-        text = self.style.line(kind, **words)
+        text = self.style.line(kind, go=self.go_now(), **words)
         if not text:
             return False
         self.calls = (self.calls + [text])[-30:]
@@ -463,7 +487,8 @@ class Announcer:
                      "group": info.get("group"), "advance": info.get("advance"), "class": info.get("class"),
                      "ace_wins": info.get("ace_wins"), "qual": info.get("qual"), "main": info.get("main"),
                      "semi": info.get("semi"), "stage_round": info.get("stage_round"),
-                     "round": e.get("round") if e else None}
+                     "round": e.get("round") if e else None, "rid": info.get("rid"), "fpv": info.get("fpv"),
+                     "qual_before": dict((info.get("qual") or {}).get("best") or {})}
         self.lap_list: Dict[str, List[float]] = {}  # each pilot's lap times this race (qualifying: the PB window)
         self.running = False
         self.silenced = False
@@ -506,6 +531,7 @@ class Announcer:
                 self._hello(e)
             elif kind == "RaceLoaded":
                 self._new_race(e, info)
+                self.ended, self.up_next = False, []
             elif kind == "RaceStartAnnouncement":
                 if self.sounds.on("StartRaceIn") and self._fresh(e):
                     secs = e.get("delaySeconds")
@@ -519,6 +545,10 @@ class Announcer:
                     self._say("race_over", P_INFO)
                 self.running = False
                 self._race_hook(False)
+                if kind == "RaceEnd":
+                    self.race["finished"] = list(self.finished)
+                    self.ended, self.up_next, self._up_next_at = True, [], 0.0
+                    self._clock_from_end()
             elif kind == "PilotCrashedOut" and self.running and not self.silenced:
                 p = e.get("pilot") or e.get("name")
                 name = p.get("name") if isinstance(p, dict) else p
@@ -707,6 +737,7 @@ class Announcer:
             return
         if key == "UntilRaceStart":              # the Auto Runner's countdown: the app's own calls, on its clock
             secs = countdown_seconds(text)
+            self.auto_seen = time.time()
             if secs is not None:
                 with self.lock:
                     self._countdown(secs)
@@ -742,23 +773,45 @@ class Announcer:
         return "finals"
 
     def _countdown(self, secs: float):
-        """FPVTrackside's Auto Runner said "{time} until the race start": the clock, and — at the seconds this
-        stage calls (COUNTDOWN_AT: more of them in the first qualifying round) — a call of the app's own, with
-        the pilots' names near the end. Talk between races stops for the last half minute."""
-        new = self.start_at is None or abs((time.time() + secs) - self.start_at) > 15
-        self.start_at = time.time() + secs
-        if new:
-            self._said_at, self._video_checked = set(), secs < VIDEO_CHECK_S
-        if self.talk and secs <= TALK_STOP_S:
+        """FPVTrackside's Auto Runner said "{time} until the race start": the clock (the calls: _countdown_tick)."""
+        self._set_clock(time.time() + secs)
+
+    def _set_clock(self, at: float, quiet_s: float = 0.0):
+        """The next start is at `at`. A new clock (not the same one, said again): its calls start afresh, the
+        ones due in the next `quiet_s` seconds left out (the race just ended: its own calls come first)."""
+        if self.start_at is None or abs(at - self.start_at) > 15:
+            left = at - time.time()
+            self._said_at = {x for x in COUNTDOWN_AT[self._stage()] if x >= left - quiet_s}
+            self._video_checked, self._talk_stopped = left < VIDEO_CHECK_S, left <= TALK_STOP_S
+        self.start_at = at
+
+    def _clock_from_end(self):
+        """The race is over and the Auto Runner is on: the next start is its results time plus its time to the
+        next race (AutoRunnerConfig.xml), so the reminders start now, not when the next race is loaded."""
+        if time.time() - self.auto_seen > AUTO_SEEN_S:
+            return
+        cfg = auto_runner_config(self.profile_dir)
+        if cfg:
+            self._set_clock(time.time() + cfg["results"] + cfg["next"], quiet_s=15)
+
+    def _countdown_tick(self):
+        """The countdown's calls, on the clock: at the seconds this stage calls (COUNTDOWN_AT: more of them in the
+        first qualifying round), the next race's pilots by name. Talk between races stops for the last half
+        minute."""
+        secs = self.start_at - time.time()
+        if self.talk and secs <= TALK_STOP_S and not self._talk_stopped:
+            self._talk_stopped = True
             self.talk.stop()
         stage = self._stage()
-        at = min(COUNTDOWN_AT[stage], key=lambda x: abs(x - secs))
-        if abs(at - secs) > 3 or at in self._said_at or self.silenced:
+        due = [x for x in COUNTDOWN_AT[stage] if x not in self._said_at and secs <= x]
+        if not due:
             return
-        self._said_at.add(at)
-        if at == VIDEO_CHECK_S:                    # the video check says it (or stays quiet)
+        self._said_at.update(due)
+        at = min(due)
+        if at - secs > 3 or at == VIDEO_CHECK_S:   # missed it; or the video check says it (or stays quiet)
             return
-        names = [self._name(p) for p in self.race["say"]]
+        who = self.up_next if self.ended else list(self.race["say"])
+        names = [self._name(p) for p in who]
         pilots = (", ".join(names[:-1]) + " and " + names[-1]) if len(names) > 1 else "".join(names)
         words = dict(time=self.style.countdown(secs), pilots=pilots or None)
         kind = "start_in_last" if secs <= 30 else ("start_in_first" if stage == "first" else "start_in")
@@ -766,8 +819,8 @@ class Announcer:
 
     def _video_check(self):
         """20 seconds to go: a pilot whose picture the live video doesn't have is hurried up by name."""
-        if not self.feeds:
-            return                                 # the live video isn't running: nothing to go on
+        if not self.feeds or self.ended:
+            return                                 # no live video, or the next race isn't loaded: nothing to go on
         lost = [p for ch, p in self.race["channels"].items() if (self.feeds.get(ch) or (False, 0))[0]]
         if lost:
             for p in lost:
@@ -856,7 +909,16 @@ class Announcer:
     def _tick(self):
         while True:
             time.sleep(0.25)
+            if self.ended and self.start_at and self.next_up_fn and time.time() - self._up_next_at > 10:
+                self._up_next_at = time.time()      # who flies next, while the results show (outside the lock)
+                try:
+                    nxt = self.next_up_fn(1)
+                    self.up_next = list(nxt[0]["pilots"]) if nxt else []
+                except Exception as ex:             # noqa: BLE001
+                    self.log(f"announcer: the next race: {ex}")
             with self.lock:
+                if self.start_at and not self.running and not self.silenced and self.start_in() is not None:
+                    self._countdown_tick()
                 if self.running and not self.silenced and self.vid:
                     self._downs()
                     self._places()

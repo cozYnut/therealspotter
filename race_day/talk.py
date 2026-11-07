@@ -16,7 +16,11 @@ FPVTrackside's lines and the race calls always go first):
                          can find time, what's at stake (qualifying / an early
                          round / an elimination race / the last race before
                          the final / the final walk-out / the chase)
-  a race is over         a short wrap: the standings, the verdict on the pick
+  a race is over         a short wrap: who moved up the seeding, or where each
+                         pilot goes in the bracket and when they fly again; the
+                         verdict on the pick; then who's next (and the race
+                         after), with the time to the start when the Auto
+                         Runner is on
   qualifying is over     the seeds, one line per pilot, and the brackets
   the first finals race  the bracket explained (shorter before each losers race)
   a main is decided      its champion, with their day and season
@@ -66,6 +70,7 @@ class Talk:
         self.racing = False
         self.what = ""                            # what it's saying now (the Announcer window)
         self.what_job = ""
+        self.next_said: Dict[str, float] = {}     # FPVTrackside race → when the wrap named its pilots as next up
         threading.Thread(target=self._loop, daemon=True).start()
 
     # ── the outside ────────────────────────────────────────────
@@ -112,7 +117,8 @@ class Talk:
     # ── speaking ───────────────────────────────────────────────
 
     def line(self, kind: str, **words) -> Optional[str]:
-        return self.a.style.talk_line(kind, **words)
+        go = self.what_job in ("opening", "closing") or (hasattr(self.a, "go_now") and self.a.go_now())
+        return self.a.style.talk_line(kind, go=go, **words)
 
     def _say(self, gen: int, lines: List[Optional[str]], energy: int = 3) -> bool:
         """Lines one after another, waiting for each (so a race call or FPVTrackside's line can come between
@@ -395,15 +401,17 @@ class Talk:
         if not names:
             return
         left = self.a.start_in() if hasattr(self.a, "start_in") else None
-        if left and left > TALK_QUIET_S + 10:              # the Auto Runner's clock: when this one goes
+        named = time.time() - self.next_said.get(race.get("fpv") or "", 0) < 300   # the wrap said who's next
+        if left and left > TALK_QUIET_S + 10 and not named:   # the Auto Runner's clock: when this one goes
             if not self._say(gen, [self.line("pre_start_in", time=f.style.countdown(left))], 3):
                 return
         kind = race.get("kind")
         if kind == "qualifying" or (race.get("type") == "TimeTrial"):
-            return self._say(gen, self._preview_qual(f, race, names), 3)
+            return self._say(gen, self._preview_qual(f, race, names)[1 if named else 0:], 3)
         if kind == "finals" and race.get("group"):
             return self._preview_finals(gen, f, race, names)
-        self._say(gen, [self.line("pre_plain", pilots=self._list([self._p(f, n) for n in names]))], 3)
+        if not named:
+            self._say(gen, [self.line("pre_plain", pilots=self._list([self._p(f, n) for n in names]))], 3)
 
     def _preview_qual(self, f, race, names) -> List[Optional[str]]:
         cls = f.setup.cls(race.get("class") or "") or f.class_of(names[0])
@@ -496,6 +504,7 @@ class Talk:
         out = []
         if race.get("kind") == "qualifying" or race.get("type") == "TimeTrial":
             cls = f.setup.cls(race.get("class") or "") or f.class_of(names[0])
+            out += self._wrap_seeding(f, race, names)
             st = f.standings(cls) if cls else []
             if len(st) >= 3:
                 out.append(self.line("wrap_qual_top", p1=self._p(f, st[0][0]), t1=self._t(f, st[0][1]),
@@ -504,16 +513,81 @@ class Talk:
                 self.did["qual_results"] = True
                 self._say(gen, out, 3)
                 return self._qualifying_results(gen, f)
-        elif race.get("kind") == "finals" and self.pick and race.get("finished"):
-            won = race["finished"][0][0]
-            if won == self.pick["fav"]:
-                out.append(self.line("wrap_pick_right", pilot=self._p(f, won)))
-            else:
-                out.append(self.line("wrap_pick_wrong", pilot=self._p(f, won), fav=self._p(f, self.pick["fav"])))
+        elif race.get("kind") == "finals":
+            order = f.results(race.get("fpv")) or [p for p, _ in race.get("finished") or []]
+            if self.pick and order:
+                won = order[0]
+                if won == self.pick["fav"]:
+                    out.append(self.line("wrap_pick_right", pilot=self._p(f, won)))
+                else:
+                    out.append(self.line("wrap_pick_wrong", pilot=self._p(f, won), fav=self._p(f, self.pick["fav"])))
             self.pick = None
             if "chase" in (race.get("group") or "").lower():
-                return self._say(gen, out, 4) and self._crowning(gen, f, race)
-        self._say(gen, out, 3)
+                if not (self._say(gen, out, 4) and self._crowning(gen, f, race)):
+                    return
+                out = []
+            elif race.get("group"):
+                out += self._wrap_bracket(f, race, order)
+        if self._say(gen, out, 3):
+            self._say(gen, self._next_up(f), 3)
+
+    def _wrap_seeding(self, f, race, names) -> List[Optional[str]]:
+        """Qualifying: who moved up the seeding in this race (the live calls' standings, before and after)."""
+        before, after = race.get("qual_before") or {}, (race.get("qual") or {}).get("best") or {}
+        out = []
+        for n in names:
+            a, b = standing(after, n), standing(before, n)
+            if a is None or (b is not None and a >= b):
+                continue
+            if b is None:
+                out.append(self.line("wrap_qual_in", pilot=self._p(f, n), place=f.style.place(a)))
+            else:
+                d = b - a
+                out.append(self.line("wrap_qual_move", pilot=self._p(f, n), place=f.style.place(a),
+                                     moved="one place" if d == 1 else f"{d} places"))
+        return out[:4]
+
+    def _when(self, nxt: dict) -> Optional[str]:
+        """When a pilot flies again: "the next race", "3 races", or "Finals 4" (not made in FPVTrackside yet)."""
+        if nxt.get("ahead") == 0:
+            return "the next race"
+        if isinstance(nxt.get("ahead"), int):
+            return f"{nxt['ahead'] + 1} races"
+        return f"Finals {nxt['round']}" if nxt.get("round") else None
+
+    def _wrap_bracket(self, f, race, order) -> List[Optional[str]]:
+        """A bracket race: where its pilots go (winners side, losers bracket, the final) and when they fly again;
+        those knocked out heard it in the finish call."""
+        nxt = f.bracket_next(race.get("class") or "", race.get("main") or "", race.get("rid"), order)
+        groups: Dict[tuple, List[str]] = {}
+        for p in order:
+            x = nxt.get(p)
+            if x and x["kind"] != "out":
+                groups.setdefault((x["kind"], x.get("to")), []).append(p)
+        loser = "loser" in (race.get("group") or "").lower()
+        out = []
+        for (kind, _), ps in groups.items():
+            k = "survive" if kind == "losers" and loser else kind
+            out.append(self.line(f"wrap_bracket_{k}", pilots=self._list([self._p(f, p) for p in ps]),
+                                 when=self._when(nxt[ps[0]])))
+        return out
+
+    def _next_up(self, f) -> List[Optional[str]]:
+        """Who flies next, and the race after: the pilots get ready in time (with the Auto Runner's clock)."""
+        ups = f.up_next(2)
+        if not ups:
+            return []
+        left = self.a.start_in() if hasattr(self.a, "start_in") else None
+        first = ups[0]
+        self.next_said[first["id"]] = time.time()
+        if hasattr(self.a, "up_next"):
+            self.a.up_next = list(first["pilots"])
+        what = f"the {first['cls']} {first['main']} main" if first.get("cls") and first.get("main") else None
+        out = [self.line("next_up", pilots=self._list([self._p(f, p) for p in first["pilots"]]), what=what,
+                         time=f.style.countdown(left) if left and left > TALK_QUIET_S else None)]
+        if len(ups) > 1:
+            out.append(self.line("on_deck", pilots=self._list([self._p(f, p) for p in ups[1]["pilots"]])))
+        return out
 
     def _qualifying_results(self, gen, f):
         for c in [c for c in f.setup.classes if c["pilots"]]:

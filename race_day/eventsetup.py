@@ -265,7 +265,9 @@ class EventSetup:
         f = cls["finals"]
         sizes = main_sizes(len(seeded), int(f["main_size"]), int(f["min_bracket"]), f["leftover"])
         kinds = ["bracket"] * len(sizes)
-        if f["leftover"] == "series" and len(sizes) > 1 and MIN_SERIES <= sizes[-1] < int(f["min_bracket"]):
+        if len(sizes) == 1 and sizes[0] < int(f["min_bracket"]):
+            kinds[0] = "series"                             # the whole class is too small for a bracket: points
+        elif f["leftover"] == "series" and len(sizes) > 1 and MIN_SERIES <= sizes[-1] < int(f["min_bracket"]):
             kinds[-1] = "series"
         letters = list(string.ascii_uppercase[:len(sizes)])
         pins = {p.lower(): m for p, m in (cls.get("pins") or {}).items() if m}

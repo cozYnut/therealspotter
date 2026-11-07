@@ -116,6 +116,23 @@ def _yaml(path: Path):
         return None
 
 
+
+GO = re.compile(r"\b(here we go|let'?s go(?!\s+(?:through|over|to)\b)|let'?s do this|let'?s start|let'?s race|"
+                r"go go go)\b", re.I)
+
+
+def _go_ok(lines: List[str], go: bool) -> List[str]:
+    """Without a start in a moment: the lines with no "here we go" — or, if every line has one, the lines with
+    that sentence taken out."""
+    if go:
+        return lines
+    plain = [t for t in lines if not GO.search(t)]
+    if plain:
+        return plain
+    cut = [re.sub(r"\s+", " ", re.sub(r"[^.!?]*" + GO.pattern + r"[^.!?]*[.!?]*", "", t, flags=re.I)).strip()
+           for t in lines]
+    return [t for t in cut if re.search(r"\w", t)]
+
 class ClubStyle:
     def __init__(self, club: Optional[str] = None, track: Optional[str] = None):
         self.club = club
@@ -207,10 +224,11 @@ class ClubStyle:
         return ORDINAL[n] if isinstance(n, int) and 0 < n < len(ORDINAL) else f"number {n}"
 
     # ── a call ──
-    def talk_line(self, kind: str, **words) -> Optional[str]:
-        """One of talk.yaml's ways to say `kind` that these words fill, or None."""
+    def talk_line(self, kind: str, go: bool = True, **words) -> Optional[str]:
+        """One of talk.yaml's ways to say `kind` that these words fill, or None. go: something starts now (else
+        no "here we go")."""
         known = {k: v for k, v in words.items() if v not in (None, "")}
-        fits = [t for t in self.talk.get(kind, []) if set(re.findall(r"\{(\w+)\}", t)) <= set(known)]
+        fits = _go_ok([t for t in self.talk.get(kind, []) if set(re.findall(r"\{(\w+)\}", t)) <= set(known)], go)
         if not fits:
             return None
         most = max(len(set(re.findall(r"\{(\w+)\}", t))) for t in fits)   # the lines that say the most we know
@@ -223,10 +241,11 @@ class ClubStyle:
         return t.format(**known)
 
     # ── a call ──
-    def line(self, kind: str, **words) -> Optional[str]:
-        """One way to say `kind` with these words, or None (no line of that kind fits them)."""
+    def line(self, kind: str, go: bool = True, **words) -> Optional[str]:
+        """One way to say `kind` with these words, or None (no line of that kind fits them). go: a race starts
+        in a moment (else no "here we go")."""
         known = {k: v for k, v in words.items() if v not in (None, "")}
-        fits = [t for t in self.lines.get(kind, []) if set(re.findall(r"\{(\w+)\}", t)) <= set(known)]
+        fits = _go_ok([t for t in self.lines.get(kind, []) if set(re.findall(r"\{(\w+)\}", t)) <= set(known)], go)
         if not fits:
             return None
         if len(fits) > 1 and self._last.get(kind) in fits:

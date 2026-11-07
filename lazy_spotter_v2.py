@@ -2,7 +2,7 @@
 """
 Race-day desktop app (operator) — see docs/RACE_DAY_PLAN.md.
 
-    python lazy_spotter_v2.py
+    venv/bin/python lazy_spotter_v2.py      (from the project folder; same as the README's Run)
 
 Start screen: FPVTrackside event, Live capture or Replays.
 Events are chosen from the data folder (race_day/picker.py), never browsed for.
@@ -499,6 +499,7 @@ class Main(QMainWindow):
         self.announcer.heat_info = self._heat_info
         from race_day.talk import Talk
         self.announcer.talk = Talk(self.announcer, self._talk_facts, self._log)
+        self.announcer.next_up_fn = lambda n: (self._talk_facts().up_next(n) if self._talk_facts() else [])
         self.announcer.talk.enabled = bool(st.get("talk_on", True))
         self.replay = None
         try:
@@ -547,7 +548,7 @@ class Main(QMainWindow):
             return {"class": fin.get("class"), "kind": "finals", "style": style or "both",
                     "group": fin.get("group"), "advance": fin.get("advance"), "main": fin.get("main"),
                     "ace_wins": fin.get("ace_wins"), "semi": fin.get("semi"),
-                    "stage_round": fin.get("stage_round") or _stage_round(fin)}
+                    "stage_round": fin.get("stage_round") or _stage_round(fin), "rid": fin.get("rid"), "fpv": rid}
         cls = setup.class_of_heat(SimpleNamespace(round_name=round_name, stage=stage, pilots=pilots))
         try:                                             # the live calls name the event's sections ("down at the dive")
             self.announcer.style.set_sections(setup.sections((cls or {}).get("layout") or "main"))
@@ -556,7 +557,7 @@ class Main(QMainWindow):
         kind = setup.heat_kind(race_type=rtype, round_name=round_name)
         style = ((cls or {}).get("style") or {}).get("qualifying" if kind == "qualifying" else "finals")
         out = {"class": (cls or {}).get("name"), "kind": kind, "style": style if cls else "both",
-               "group": group, "advance": advance}
+               "group": group, "advance": advance, "fpv": rid}
         if kind == "qualifying":                         # the standings before this heat: who moves up with a PB
             from race_day.eventsetup import qualifying_bests
             n = int(((cls or {}).get("qualifying") or {}).get("laps") or 3)

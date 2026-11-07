@@ -458,6 +458,80 @@ class Facts:
         except Exception:                                  # noqa: BLE001
             return None
 
+    # ── what's next: FPVTrackside's running order ──────────────
+
+    def _ft(self):
+        ft = getattr(self.day, "ft", None)
+        return ft if ft and self.day.ft_state.get("serves") else None
+
+    def pending(self) -> List[dict]:
+        """The races not flown yet, in FPVTrackside's running order (the one loaded first)."""
+        ft = self._ft()
+        if not ft:
+            return []
+        try:
+            return ft.get("/races?state=pending") or []
+        except Exception:                                  # noqa: BLE001
+            return []
+
+    def up_next(self, n: int = 2) -> List[dict]:
+        """The next `n` races with pilots in them: [{id, name, pilots, cls, main}] (cls/main: a finals race)."""
+        fin = getattr(self.day, "finals", None)
+        out = []
+        for r in self.pending():
+            pilots = [(p.get("pilot", p) if isinstance(p, dict) else {"name": p}).get("name")
+                      for p in r.get("pilots") or []]
+            pilots = [p for p in pilots if p]
+            if not pilots:
+                continue                                   # a finals race nobody is known for yet
+            rec = fin.by_fpv(r.get("id")) if fin else None
+            out.append({"id": (r.get("id") or "").lower(), "name": r.get("name"), "pilots": pilots,
+                        "cls": (rec or {}).get("class"), "main": (rec or {}).get("main")})
+            if len(out) >= n:
+                break
+        return out
+
+    def results(self, fpv_id: Optional[str]) -> List[str]:
+        """A flown race's pilots by FPVTrackside's result, first first."""
+        ft = self._ft()
+        if not ft or not fpv_id:
+            return []
+        try:
+            res = sorted(ft.get(f"/races/{fpv_id}/results") or [], key=lambda x: x.get("position") or 99)
+        except Exception:                                  # noqa: BLE001
+            return []
+        return [x.get("name") for x in res if x.get("name")]
+
+    def bracket_next(self, cls_name: str, main: str, rid: Optional[str], order: List[str]) -> Dict[str, dict]:
+        """Where each pilot of a bracket race goes, by their place in it (the Seeder's diagram):
+        pilot → {to: stage race, kind: winners|losers|final|out, round: its Finals round, ahead: races before
+        it in FPVTrackside (None: not made yet)}."""
+        st = self.stage(cls_name, main) if rid else None
+        if not st:
+            return {}
+        from race_day.finals import Finals
+        edges = [e for g in st.get("diagrams") or [] for e in g.get("edges") or [] if e.get("from") == rid]
+        group = {r.get("id"): (r.get("group") or "").lower() for r in st.get("races") or []}
+        fr = Finals.finals_round(st)
+        fin = getattr(self.day, "finals", None)
+        recs = {r.get("rid"): r for r in (fin.races.values() if fin else [])
+                if r.get("class") == cls_name and r.get("main") == main and not r.get("void")}
+        pend = [(r.get("id") or "").lower() for r in self.pending()]
+        out = {}
+        for k, pilot in enumerate(order, 1):
+            e = next((e for e in edges if k in (e.get("ranks") or [])), None)   # a chase: its first race
+            if not e:
+                out[pilot] = {"kind": "out"}
+                continue
+            to, g = e.get("to"), group.get(e.get("to"), "")
+            kind = "final" if any(w in g for w in ("chase", "final", "grand")) else \
+                "losers" if "loser" in g else "winners"
+            rec = recs.get(to) or {}
+            fpv = (rec.get("fpv") or "").lower()
+            out[pilot] = {"to": to, "kind": kind, "round": rec.get("round") or fr.get(to),
+                          "ahead": pend.index(fpv) if fpv in pend else None}
+        return out
+
     def mains(self) -> List[Tuple[str, str]]:
         made = self.setup.data["made"]["stages"]
         return [(c["name"], m) for c in self.setup.classes for m in sorted(made.get(c["name"]) or {})]

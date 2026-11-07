@@ -17,7 +17,7 @@ python3 -m venv venv
 source venv/bin/activate
 pip install torch torchvision          # first: the right build for your machine (Apple MPS is included on macOS)
 pip install -r requirements.txt
-brew install ffmpeg                    # recommended: makes recordings stream in phone browsers
+pip install ffmpeg                    # recommended: makes recordings stream in phone browsers
 ```
 
 The first run downloads the CLIP model (once, ~350 MB) into the Hugging Face
@@ -28,6 +28,12 @@ cache; after that the app works without internet.
 ```bash
 source venv/bin/activate
 python lazy_spotter_v2.py
+```
+
+Or in one line, from the project folder (no need to activate first):
+
+```bash
+venv/bin/python lazy_spotter_v2.py
 ```
 
 **The first time**, the app asks for the **data folder**: the folder that holds
@@ -161,6 +167,8 @@ the three steps that make things in FPVTrackside.
   - a smaller remainder follows *Leftover*: a **series main** that races *Series main*
     times for points (3 pilots or more; fewer join the last main), **join the last
     main**, or **spread** the pilots so the mains are about equal;
+  - a whole class smaller than *Own bracket from* (2 pilots, say) races a **series main**, whatever the
+    *Leftover* rule: a bracket needs more pilots than that;
   - pinned pilots keep their main, and the rest fill up around them in qualifying order.
 
   The window shows every main and every seed. *Move to* moves a pilot to another main,
@@ -365,9 +373,9 @@ so pilots' names and details aren't shared.
 | `lines.yaml` | the calls: for each kind (`lap`, `lap_lead`, `holeshot`, `finish_win`, `gap`, `down`, `kind`, …), several ways to say it. Heats called by places only use `lap_place`, `lap_lead_place` and `lap_leader_place` (no `{time}`), and by lap times only `lap_time`; brackets add `through`, `to_losers`, `eliminated` and `ace_win` (Event setup). One is picked at random, never the one said last. Words in braces are filled in: `{pilot} {lap} {time} {place} {gate} {margin} {ahead} {behind} {next}`; a line whose words aren't known for that call is skipped for another (so "{pilot} is down at {gate}" is only said when the gate is). Missing kinds fall back to plain defaults. |
 | `pilots.yaml` | pilot cards: `callsign` exactly as in FPVTrackside, `say_it_like` (how the voice should say it — try it with *Test*), `new: true` for a new or young pilot (kinder lines, `kind_new`) |
 | `tracks/<track>.yaml` | a track: what to call its gates (`4: {say: "the dive gate", crash_spot: true}`, numbered as the event's learned track numbers them, 1 = start/finish) and the expected lap time. Pick it in the window before the race. |
-| `talk.yaml` | the talk between races (*Talk between races* in the Announcer window): for each moment, several ways to say it, with the facts filled in. A line that uses more of the known facts wins over a shorter one. When it talks: **▶ Opening** (about 10 minutes: welcome, the day's plan, safety, the track from the analysed section times, the rules of qualifying and the brackets with examples, the points, the season, meet the field); each race's preview (standings, a section tip such as "if X takes gate 5 to 6 like Pennz, that's half a second a lap", what's at stake, the pick, the final walk-out) and wrap (standings, the pick's verdict); the qualifying results; the champion; filler in a quiet gap; and the closing when **Places & points** shows final results. Never during a race: it stops at the start call, and every race call and FPVTrackside line goes first. |
+| `talk.yaml` | the talk between races (*Talk between races* in the Announcer window): for each moment, several ways to say it, with the facts filled in. A line that uses more of the known facts wins over a shorter one. When it talks: **▶ Opening** (about 10 minutes: welcome, the day's plan, safety, the track from the analysed section times, the rules of qualifying and the brackets with examples, the points, the season, meet the field); each race's preview (standings, a section tip such as "if X takes gate 5 to 6 like Pennz, that's half a second a lap", what's at stake, the pick, the final walk-out) and wrap (in qualifying, who moved up the seeding; in a bracket, who stays on the winners side, who drops to the losers bracket, who's in the final, and how many races until they fly again; the pick's verdict; then **next up**: the next race's pilots, with the time to the start when the Auto Runner is on, and the race after it); the qualifying results; the champion; filler in a quiet gap; and the closing when **Places & points** shows final results. Never during a race: it stops at the start call, and every race call and FPVTrackside line goes first. |
 | `seasons.yaml` | the season standings the talk uses: a finished season's table, and this season's events' points (**Places & points → Save to the season** adds an event's; never a test event's) |
-| the countdown | with FPVTrackside's **Auto Runner** on and its **Announce next race in** on, the app follows its countdown ("{time} until the race start", read from FPVTrackside's log) and calls it in the club's words (`start_in`, `start_in_first`, `start_in_last` in `lines.yaml`): every step in the first qualifying round, with the pilots told to the start line and to turn their video on, fewer after it. **20 seconds** before the start, a pilot whose picture the live video doesn't have is hurried up by name (`hurry_video`; else `video_ok`) — the live video has to be on. The talk between races stops 35 seconds before the start. |
+| the countdown | with FPVTrackside's **Auto Runner** on and its **Announce next race in** on, the app follows its countdown ("{time} until the race start", read from FPVTrackside's log). Its clock starts when a race ends: the Auto Runner's results time plus its time to the next race (`AutoRunnerConfig.xml`), so the next race's pilots are reminded while the results still show. It calls it in the club's words (`start_in`, `start_in_first`, `start_in_last` in `lines.yaml`): every step in the first qualifying round, with the pilots told to the start line and to turn their video on, fewer after it. **20 seconds** before the start, a pilot whose picture the live video doesn't have is hurried up by name (`hurry_video`; else `video_ok`) — the live video has to be on. The talk between races stops 35 seconds before the start. "Here we go" and "let's go" are only said in the last 20 seconds (or in the opening and closing): any other line with one is skipped, or said without that sentence. |
 
 Keep race calls short (3–8 words, present tense): they're said while the race is flown.
 A `persona.md` next to them is a good place for the style notes the lines follow.
