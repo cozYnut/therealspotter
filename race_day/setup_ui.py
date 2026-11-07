@@ -785,6 +785,10 @@ class BracketsDialog(QDialog):
                 out.append(fin.status)
             except (ApiError, ValueError, KeyError, TypeError) as e:
                 out.append(f"⚠ the first Finals round: {e}")
+        talk = getattr(getattr(self.sdlg.win, "win", self.sdlg.win), "announcer", None)
+        talk = getattr(talk, "talk", None)
+        if talk and talk.enabled and any(self.setup.data["made"]["stages"].get(p.cls["name"]) for p in self.panels):
+            talk.brackets([(p.cls, p.plan) for p in self.panels])     # the announcer explains them
         QMessageBox.information(self, "Brackets", "\n".join(out))
         self.accept()
 

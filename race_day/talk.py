@@ -22,6 +22,9 @@ FPVTrackside's lines and the race calls always go first):
                          after), with the time to the start when the Auto
                          Runner is on
   qualifying is over     the seeds, one line per pilot, and the brackets
+  Make the brackets      every main as created: who's in it, double elimination
+                         or a points series and how that works, each main said
+                         twice
   the first finals race  the bracket explained (shorter before each losers race)
   a main is decided      its champion, with their day and season
   a quiet gap (~40 s)    filler: the format, a pilot, the season, the track,
@@ -86,6 +89,13 @@ class Talk:
         self.active_at = time.time()
         self.jobs.put(("closing", {"results": results}))
 
+    def brackets(self, plan: List[tuple]):
+        """The brackets just made (setup_ui: Make the brackets): plan = [(class, its mains as
+        EventSetup.mains_plan gives them)]."""
+        self.active_at = time.time()
+        self._drop("filler")
+        self.jobs.put(("brackets", {"plan": plan}))
+
     def stop(self):
         """Everything waiting and being said is dropped."""
         self.gen += 1
@@ -117,7 +127,7 @@ class Talk:
     # ── speaking ───────────────────────────────────────────────
 
     def line(self, kind: str, **words) -> Optional[str]:
-        go = self.what_job in ("opening", "closing") or (hasattr(self.a, "go_now") and self.a.go_now())
+        go = self.what_job in ("opening", "closing", "brackets") or (hasattr(self.a, "go_now") and self.a.go_now())
         return self.a.style.talk_line(kind, go=go, **words)
 
     def _say(self, gen: int, lines: List[Optional[str]], energy: int = 3) -> bool:
@@ -587,6 +597,51 @@ class Talk:
                          time=f.style.countdown(left) if left and left > TALK_QUIET_S else None)]
         if len(ups) > 1:
             out.append(self.line("on_deck", pilots=self._list([self._p(f, p) for p in ups[1]["pilots"]])))
+        return out
+
+    # ── the brackets are made ──────────────────────────────────
+
+    def _brackets(self, gen, f, plan: List[tuple]):
+        """Each class, each main: who's in it and how it's raced; then each main once more, so every pilot hears
+        where they are twice."""
+        plan = [(c, ms) for c, ms in plan if ms]
+        if not plan:
+            return
+        if not self._say(gen, [self.line("brk_intro")], 4):
+            return
+        for c, mains in plan:
+            fi = c.get("finals") or {}
+            lines = [self.line("brk_class", cls=c["name"], n=sum(len(m["pilots"]) for m in mains),
+                               mains=len(mains) if len(mains) > 1 else None,
+                               letters=self._list([m["main"] for m in mains]) if len(mains) > 1 else None)]
+            for m in mains:
+                lines += self._brk_main(f, c, fi, m)
+            lines.append(self.line("brk_again", cls=c["name"]))
+            for m in mains:
+                lines.append(self._brk_who(f, c, m, again=True))
+            if not self._say(gen, lines, 4):
+                return
+        self.did["bracket_explained"] = True
+        self._say(gen, [self.line("brk_outro")] + self._next_up(f), 4)
+
+    def _brk_who(self, f, c, m, again: bool = False) -> Optional[str]:
+        kind = "series" if m["kind"] == "series" else "bracket"
+        return self.line(f"brk_{'again' if again else 'main'}_{kind}", cls=c["name"], main=m["main"],
+                         n=len(m["pilots"]), pilots=self._list([self._p(f, p["name"]) for p in m["pilots"]]))
+
+    def _brk_main(self, f, c, fi, m) -> List[Optional[str]]:
+        out = [self._brk_who(f, c, m)]
+        if m["kind"] == "series":
+            return out + [self.line("brk_series_how", races=fi.get("series_races") or 5, n=len(m["pilots"]))]
+        out.append(self.line("brk_bracket_how", per=fi.get("per_race") or 4, adv=fi.get("advance") or 2))
+        out.append(self.line("rules_bracket_rounds"))
+        final = "chase" if m["main"] == (fi.get("chase_main") or "") else (fi.get("final") or "single")
+        if final == "chase":
+            out.append(self.line("brk_end_chase", main=m["main"], wins=fi.get("ace_wins") or 2))
+        elif final == "grand-final":
+            out.append(self.line("brk_end_grand", main=m["main"]))
+        else:
+            out.append(self.line("brk_end_single", main=m["main"]))
         return out
 
     def _qualifying_results(self, gen, f):

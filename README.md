@@ -182,6 +182,10 @@ the three steps that make things in FPVTrackside.
     race** (the club's way), a chase the ace too, or the Seeder's classic grand final (a
     2-pilot winners final and more rounds).
 
+  With the announcer on, it then explains the brackets just made, class by class: each main,
+  who's in it, and whether it's a double elimination or a points series and how that works.
+  Then it says each main and its pilots once more, so every pilot hears where they are twice.
+
   The Seeder would put each stage's races in a round of its own, so the app places them
   itself (`race_day/finals.py`). Once every class has its brackets, the races whose
   line-up is known go into shared rounds **"Finals 1", "Finals 2"…**, one race per main
