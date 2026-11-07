@@ -160,13 +160,15 @@ the three steps that make things in FPVTrackside.
   never touched.
 - **Make the brackets…** (top of the window, once for the whole event, when qualifying is done) takes every
   class's qualifying order from FPVTrackside, one tab per class:
-  the best *Seeded by* consecutive laps over the class's qualifying rounds, with pilots
+  the best *Seeded by* consecutive laps over the class's qualifying rounds (also any time trial round the
+  race director added by hand in FPVTrackside), with pilots
   without a time last. It cuts that order into mains, A being the fastest:
   - mains of *Mains* pilots;
   - a remainder of at least *Own bracket from* pilots gets a main of its own;
   - a smaller remainder follows *Leftover*: a **series main** that races *Series main*
-    times for points (3 pilots or more; fewer join the last main), **join the last
-    main**, or **spread** the pilots so the mains are about equal;
+    times for points (3 pilots or more; with fewer, the slowest of the last main make up the 3 when that
+    main keeps *Own bracket from* pilots — 17 pilots by 8 make 8, 6 and a series of 3 — else they join it),
+    **join the last main**, or **spread** the pilots so the mains are about equal;
   - a whole class smaller than *Own bracket from* (2 pilots, say) races a **series main**, whatever the
     *Leftover* rule: a bracket needs more pilots than that;
   - pinned pilots keep their main, and the rest fill up around them in qualifying order.

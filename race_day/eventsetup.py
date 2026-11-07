@@ -234,12 +234,15 @@ class EventSetup:
         return [{"pilot": p, **({"channel": chans[j]} if j < len(chans) else {})} for j, p in enumerate(pilots)]
 
     def qualifying_round_ids(self, cls: dict, rounds: List[dict]) -> List[str]:
-        """FPVTrackside's IDs of the class's qualifying rounds (from GET /rounds): those the app made, else time
-        trials named after the class, else every time trial (an event set up by hand)."""
+        """FPVTrackside's IDs of the class's qualifying rounds (from GET /rounds): those the app made plus any
+        time trial added by hand (the race director's extra round: the seeding is by pilot, so another class's
+        heats change nothing), else time trials named after the class, else every time trial."""
         made = set(self.data["made"]["qualifying"].get(cls["name"], []))
         mine = [r["id"] for r in rounds if r.get("externalId") in made]
         if mine:
-            return mine
+            ours = {x for c in self.data["made"]["qualifying"].values() for x in c}
+            return mine + [r["id"] for r in rounds if r.get("eventType") == "TimeTrial" and r["id"] not in mine
+                           and r.get("externalId") not in ours]
         named = [r["id"] for r in rounds if r.get("eventType") == "TimeTrial"
                  and ((r.get("name") or "").lower().startswith(cls["name"].lower())
                       or (r.get("stage") or "").lower().startswith(cls["name"].lower()))]
@@ -371,6 +374,10 @@ def main_sizes(n: int, size: int, min_bracket: int, leftover: str) -> List[int]:
         return [base + (1 if i < extra else 0) for i in range(k)]
     if rem >= min_bracket or (leftover == "series" and rem >= MIN_SERIES):
         return [size] * full + [rem]
+    if leftover == "series" and size - (MIN_SERIES - rem) >= min_bracket:
+        # too few for a series: the slowest of the last main make it up (17 by 8 → 8, 6, 3), as long as that
+        # main keeps enough pilots for a bracket
+        return [size] * (full - 1) + [size - (MIN_SERIES - rem), MIN_SERIES]
     return [size] * (full - 1) + [size + rem]           # "join": the last main takes them
 
 
