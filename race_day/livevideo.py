@@ -11,11 +11,16 @@ light pipeline — not the full analysis (no camera motion, no pass scorer):
     YOLO (Core ML, Neural Engine) → tracker → pass detector → a pass
     a pass → CLIP of the gate (a few frames before it fired) → online_decoder → G1…GN
 
-All in one process of its own, so the app never waits on it. It analyses
+All in a process of its own, so the app never waits on it; or, with procs > 1, the pilots split between
+that many analysis processes (2 pilots each with 2 processes for a 2×2), fed by one process that reads the
+card and shares its newest frame (shared memory). It analyses
 `fps` frames a second, always the NEWEST frame: a slower Mac drops frames (and
 says how many), so a gate is named a little late but the delay never grows.
 Clock times are the Mac's own, the same clock FPVTrackside stamps its events
 with. While no race runs, frames are read but not analysed.
+
+With `keep` (a folder), each race's detections are kept there for the heat analysis, which then runs YOLO
+only where the live video didn't (race_day/livedets.py).
 
 What it sends back (on_event(dict)):
     {"type": "gate", "channel", "gate", "t", "conf", "laps"}   a pass named (gate 0: judged not a real pass)
@@ -40,6 +45,7 @@ FPS = 15                  # frames analysed a second, per pilot (the card gives 
 EMBED_BACK = 4            # the gate's picture is taken this many 30-fps frames before the pass fired, as offline
 GRAY_HOLD_S = 2.0         # a picture gray this long is lost (and back once it isn't)
 STATS_EVERY = 2.0
+MAX_PROCS = 6             # analysis processes at most (procs)
 LIVE_PASSDET = {"high_conf_top_tol": 0.2}   # a gate flown through fast and centred (gilboash's live finding)
 
 
@@ -113,17 +119,132 @@ class _Feed:
             return item
 
 
+class _SharedFeed:
+    """In an analysis process (procs > 1): the newest frame the reading process shared, as _Feed gives it."""
+
+    def __init__(self, shared: dict):
+        import numpy as np
+        from multiprocessing import shared_memory
+        self.shm = shared_memory.SharedMemory(name=shared["name"])
+        self.view = np.ndarray(shared["shape"], dtype=np.uint8, buffer=self.shm.buf)
+        self.seq, self.t, self.lock, self.end = shared["seq"], shared["t"], shared["lock"], shared["ended"]
+        self.last, self.read, self.dropped, self.ended = 0, 0, 0, False
+        import os
+        self.parent, self._ppid = os.getppid(), os.getppid
+
+    def get(self, timeout: float = 1.0):
+        until = time.time() + timeout
+        while self.seq.value == self.last:
+            if self.end.value or self._ppid() != self.parent:     # done, or the reading process is gone
+                self.ended = True
+                return None
+            if time.time() > until:
+                return None
+            time.sleep(0.002)
+        with self.lock:
+            seq, t, frame = self.seq.value, self.t.value, self.view.copy()
+        if self.last:
+            self.dropped += max(0, seq - self.last - 1)
+        self.read += seq - self.last if self.last else 1
+        self.last = seq
+        return frame, t
+
+
 def _main(cfg: dict, out_q, ctl_q):
     import contextlib
     import os
     try:
         with open(os.devnull, "w") as quiet, contextlib.redirect_stdout(quiet):   # the pass detector's chatter
-            _run(cfg, out_q, ctl_q)
+            if cfg.get("shared"):
+                _run(cfg, out_q, ctl_q, _SharedFeed(cfg["shared"]))
+            elif _parts(cfg) > 1:
+                _run_parts(cfg, out_q, ctl_q)
+            else:
+                _run(cfg, out_q, ctl_q)
     except Exception as e:                       # noqa: BLE001 — the app shows it
-        out_q.put({"type": "error", "error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc(limit=4)})
+        out_q.put({"type": "error", "error": f"{type(e).__name__}: {e}", "trace": traceback.format_exc(limit=4),
+                   "part": cfg.get("part")})
 
 
-def _run(cfg: dict, out_q, ctl_q):
+def _parts(cfg: dict) -> int:
+    return max(1, min(int(cfg.get("procs") or 1), len(cfg["rects"]), MAX_PROCS))
+
+
+def _run_parts(cfg: dict, out_q, ctl_q):
+    """procs > 1: this process reads the card and shares each newest frame; the analysis processes each take
+    some of the pilots (in turn: with 2, channels 1 and 3, and 2 and 4)."""
+    import numpy as np
+    from multiprocessing import shared_memory
+    feed = _Feed(cfg["source"], cfg.get("clock"))
+    first = None
+    while first is None:
+        first = feed.get(1.0)
+        if first is None and feed.ended:
+            out_q.put({"type": "ended"})
+            return
+    frame, t = first
+    ctx = mp.get_context("spawn")
+    shm = shared_memory.SharedMemory(create=True, size=frame.nbytes)
+    view = np.ndarray(frame.shape, dtype=np.uint8, buffer=shm.buf)
+    shared = {"name": shm.name, "shape": frame.shape, "seq": ctx.Value("q", 0, lock=False),
+              "t": ctx.Value("d", 0.0, lock=False), "lock": ctx.Lock(), "ended": ctx.Value("b", 0, lock=False)}
+    n = _parts(cfg)
+    chans = list(cfg["rects"])
+    procs, ctls = [], []
+    for i in range(n):
+        sub = {ch: cfg["rects"][ch] for ch in chans[i::n]}
+        c = ctx.Queue()
+        p = ctx.Process(target=_main, args=({**cfg, "rects": sub, "shared": shared, "part": i, "procs": 1}, out_q, c),
+                        daemon=True, name=f"live-video-{i + 1}")
+        p.start()
+        procs.append(p)
+        ctls.append(c)
+
+    def publish(frame, t):
+        with shared["lock"]:
+            np.copyto(view, frame) if frame.shape == view.shape else None
+            shared["t"].value = t
+            shared["seq"].value += 1
+
+    import os
+    app = os.getppid()
+    try:
+        publish(frame, t)
+        while True:
+            if os.getppid() != app:              # the app is gone
+                return
+            try:
+                while True:
+                    c = ctl_q.get_nowait()
+                    for q in ctls:
+                        q.put(c)
+                    if c[0] == "stop":
+                        return
+            except queue.Empty:
+                pass
+            if not all(p.is_alive() for p in procs):
+                return                           # one failed: its error is already on the way to the app
+            item = feed.get(0.5)
+            if item is None:
+                if feed.ended:
+                    shared["ended"].value = 1
+                    for p in procs:
+                        p.join(timeout=5)
+                    out_q.put({"type": "ended"})
+                    return
+                continue
+            publish(*item)
+    finally:
+        shared["ended"].value = 1
+        for p in procs:
+            p.join(timeout=3)
+            if p.is_alive():
+                p.terminate()
+        shm.close()
+        shm.unlink()
+
+
+def _run(cfg: dict, out_q, ctl_q, feed=None):
     import cv2
     import numpy as np
     import torch
@@ -141,7 +262,8 @@ def _run(cfg: dict, out_q, ctl_q):
     names = dict(det.names)
     det(np.zeros((540, 960, 3), np.uint8), conf=0.25, max_det=50, verbose=False)          # warm-up
     clip = ClipEmbedder(device="cpu")
-    feed = _Feed(cfg["source"], cfg.get("clock"))
+    feed = feed or _Feed(cfg["source"], cfg.get("clock"))
+    part = cfg.get("part")                       # which analysis process (procs > 1), or None
     pc = pipeline_cfg.load()
     tkw, pkw = frame_step_kwargs(pipeline_cfg.tracker_kwargs(pc), {**pipeline_cfg.gates_passdet_kwargs(pc), **LIVE_PASSDET},
                                  30.0 / fps)
@@ -153,7 +275,24 @@ def _run(cfg: dict, out_q, ctl_q):
                      "recent": deque(maxlen=back), "decoder": od.OnlineDecoder(cfg["memory"], cfg.get("timing"))}
                 for ch in rects}
 
+    keep = cfg.get("keep")                       # a folder: the detections kept for the heat analysis (livedets)
+    recs: Dict[str, object] = {}
+
+    def save_recs():
+        from race_day.livedets import Recorder
+        for ch, r in list(recs.items()):
+            try:
+                r.save(keep, ch)
+            except Exception as e:               # noqa: BLE001 — the heat analysis runs YOLO itself then
+                out_q.put({"type": "error", "error": f"keeping the detections: {type(e).__name__}: {e}"})
+        recs.clear()
+
+    def new_recs():
+        from race_day.livedets import Recorder
+        return {ch: Recorder() for ch in rects} if keep else {}
+
     pilots, racing = fresh(), bool(cfg.get("racing"))
+    recs = new_recs() if racing else {}
     gray = {ch: [False, None] for ch in rects}   # shown state, gray since
     jobs: "queue.Queue" = queue.Queue()
 
@@ -169,7 +308,7 @@ def _run(cfg: dict, out_q, ctl_q):
             out_q.put({"type": "gate", "channel": ch, "gate": evs[0]["gate_id"], "t": t, "conf": evs[0]["conf"],
                        "laps": len(dec.laps)})
     threading.Thread(target=namer, daemon=True).start()
-    out_q.put({"type": "ready", "names": list(names.values())[:5]})
+    out_q.put({"type": "ready", "names": list(names.values())[:5], "part": part})
 
     done, det_s, lags, next_t, w0 = 0, 0.0, deque(maxlen=60), 0.0, time.time()
     w_read, w_drop, w_done = 0, 0, 0
@@ -178,18 +317,24 @@ def _run(cfg: dict, out_q, ctl_q):
             while True:
                 c = ctl_q.get_nowait()
                 if c[0] == "stop":
+                    save_recs()
                     jobs.put(None)
                     return
                 if c[0] == "race":
+                    if racing and not c[1]:
+                        save_recs()             # the race is over: its detections for the heat analysis
                     racing = bool(c[1])
                     if racing:
                         pilots = fresh()
+                        recs = new_recs()
         except queue.Empty:
             pass
         item = feed.get(0.5)
         if item is None:
             if feed.ended:
-                out_q.put({"type": "ended"})
+                save_recs()
+                if part is None:                 # with procs > 1, the reading process says so
+                    out_q.put({"type": "ended"})
                 jobs.put(None)
                 return
             continue
@@ -215,6 +360,8 @@ def _run(cfg: dict, out_q, ctl_q):
             t0 = time.time()
             res = det(img, conf=0.25, max_det=50, verbose=False)[0]
             det_s += time.time() - t0
+            if ch in recs:
+                recs[ch].add(t, img, res)
             typed = []
             for b in res.boxes:
                 x1, y1, x2, y2 = map(int, b.xyxy[0])
@@ -239,7 +386,7 @@ def _run(cfg: dict, out_q, ctl_q):
         now = time.time()
         if now - w0 >= STATS_EVERY:
             dt = now - w0
-            out_q.put({"type": "stats", "fps": round((done - w_done) / dt, 1), "racing": racing,
+            out_q.put({"type": "stats", "part": part, "fps": round((done - w_done) / dt, 1), "racing": racing,
                        "dropped": round(100 * (feed.dropped - w_drop) / max(1, feed.read - w_read)),
                        "delay_ms": round(1000 * float(np.median(lags))) if lags else None,
                        "detector_ms": round(1000 * det_s / max(1, (done - w_done) * len(rects)))})
@@ -257,15 +404,26 @@ class LiveVideo:
         self.status = {"running": False, "error": None, "stats": None, "source": None}
 
     def start(self, source, rects: Dict[str, tuple], model: str, memory: str, timing: Optional[str],
-              fps: float = FPS, clock: Optional[dict] = None, racing: bool = False):
+              fps: float = FPS, clock: Optional[dict] = None, racing: bool = False, procs: int = 1,
+              keep: Optional[str] = None):
+        """procs: analysis processes, the pilots split between them (1 to MAX_PROCS, at most one per pilot).
+        keep: a folder to keep each race's detections in, for the heat analysis (race_day/livedets.py)."""
         self.stop()
         ctx = mp.get_context("spawn")
         self.out_q, self.ctl_q = ctx.Queue(), ctx.Queue()
         cfg = {"source": source, "rects": {k: tuple(v) for k, v in rects.items()}, "model": model, "memory": memory,
-               "timing": timing, "fps": fps, "clock": clock, "racing": racing}
-        self.proc = ctx.Process(target=_main, args=(cfg, self.out_q, self.ctl_q), daemon=True, name="live-video")
+               "timing": timing, "fps": fps, "clock": clock, "racing": racing, "procs": procs,
+               "keep": keep}
+        self.parts = _parts(cfg)
+        self._stats: Dict[object, dict] = {}
+        self._ready: set = set()
+        # with procs > 1 it starts the analysis processes itself, which a daemon process may not: it watches
+        # for the app going away instead (_run_parts)
+        self.proc = ctx.Process(target=_main, args=(cfg, self.out_q, self.ctl_q), daemon=self.parts == 1,
+                                name="live-video")
         self.proc.start()
-        self.status = {"running": True, "error": None, "stats": None, "source": source, "ready": False}
+        self.status = {"running": True, "error": None, "stats": None, "source": source, "ready": False,
+                       "procs": self.parts}
         threading.Thread(target=self._pump, args=(self.proc, self.out_q), daemon=True).start()
 
     def _pump(self, proc, out_q):
@@ -275,9 +433,11 @@ class LiveVideo:
             except (queue.Empty, OSError, EOFError):
                 continue
             if e.get("type") == "stats":
-                self.status["stats"] = e
+                self._stats[e.get("part")] = e
+                self.status["stats"] = self._merged()
             elif e.get("type") == "ready":
-                self.status["ready"] = True
+                self._ready.add(e.get("part"))
+                self.status["ready"] = len(self._ready) >= self.parts
             elif e.get("type") == "error":
                 self.status["error"] = e["error"]
                 self.log(f"live video: {e['error']}")
@@ -289,6 +449,17 @@ class LiveVideo:
                 self.log(f"live video: {type(ex).__name__}: {ex}")
         self.status["running"] = False
 
+    def _merged(self) -> dict:
+        """The analysis processes' stats as one: the slowest's fps and delay, the most dropped."""
+        ss = list(self._stats.values())
+        if len(ss) == 1:
+            return ss[0]
+        val = lambda k: [x[k] for x in ss if x.get(k) is not None]
+        return {"type": "stats", "racing": any(x.get("racing") for x in ss), "parts": len(ss),
+                "fps": min(val("fps"), default=None), "dropped": max(val("dropped"), default=None),
+                "delay_ms": max(val("delay_ms"), default=None),
+                "detector_ms": round(sum(val("detector_ms")) / len(val("detector_ms"))) if val("detector_ms") else None}
+
     def set_race(self, on: bool):
         """A race started (on: everything starts afresh) or ended (frames are no longer analysed)."""
         if self.proc and self.proc.is_alive():
@@ -297,7 +468,7 @@ class LiveVideo:
     def stop(self):
         if self.proc and self.proc.is_alive():
             self.ctl_q.put(("stop",))
-            self.proc.join(timeout=3)
+            self.proc.join(timeout=3 + 3 * (getattr(self, "parts", 1) > 1))
             if self.proc.is_alive():
                 self.proc.terminate()
         self.proc = None

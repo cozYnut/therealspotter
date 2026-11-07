@@ -6,7 +6,7 @@ The announcer's settings window (the FPVTrackside screen's "Announcer…").
     │ Club [fril ▾]  Track [wingate ▾]          (clubs/<club>/: its words)
     │ Voice [Samantha ▾]  Speed [normal]  [Test]                       │
     │ FPVTrackside's own voice: on   [Turn it off]                     │
-    │ ☑ Mid-lap positions from the video  Card [USB Video ▾]  15 fps   │
+    │ ☑ Mid-lap positions from the video  Card [USB Video ▾]  15 fps  × 1 processes │
     │   live video: 14.8 fps · 0 % dropped · 60 ms behind              │
     │ [▶ Replay the selected heat]                                     │
     │ FPVTrackside → the app: Notifier ExtensionMode, NotificationURL  │
@@ -123,7 +123,24 @@ class AnnouncerDialog(QDialog):
         self.fps.setToolTip("Frames analysed a second per pilot. Fewer: lighter on the Mac, gates named a little later.")
         self.fps.valueChanged.connect(self._video)
         row.addWidget(self.fps)
+        self.procs = QSpinBox()
+        self.procs.setRange(1, 6)
+        self.procs.setPrefix("× ")
+        self.procs.setSuffix(" processes")
+        self.procs.setValue(int(st.get("live_video_procs") or 1))
+        self.procs.setToolTip("How many processes analyse the live video, the pilots split between them (2 with a 2×2:\n"
+                              "two pilots each). More: keeps up at a higher fps, but each takes ~0.9 GB more memory.\n"
+                              "At most one per pilot. On an 8 GB M1: 1 or 2.")
+        self.procs.valueChanged.connect(self._video)
+        row.addWidget(self.procs)
         v.addLayout(row)
+        self.keep = QCheckBox("Keep the detections for the heat analysis (test)")
+        self.keep.setChecked(bool(st.get("live_video_keep")))
+        self.keep.setToolTip("Each race's YOLO boxes from the live video are kept, and the heat analysis after the race\n"
+                             "uses them instead of running YOLO again, for every frame whose picture matches the\n"
+                             "recording (the rest it runs itself). Quicker results after a race; best at 30 fps.")
+        self.keep.toggled.connect(self._video)
+        v.addWidget(self.keep)
         self.video_state = QLabel("")
         self.video_state.setStyleSheet("color:#888")
         v.addWidget(self.video_state)
@@ -212,7 +229,8 @@ class AnnouncerDialog(QDialog):
 
     def _video(self, *_):
         self.save(live_video_on=self.video.isChecked(), live_video_device=self.device.currentData(),
-                  live_video_fps=self.fps.value())
+                  live_video_fps=self.fps.value(), live_video_procs=self.procs.value(),
+                  live_video_keep=self.keep.isChecked())
         why = self.win.start_live_video()
         if why and self.video.isChecked():
             self.video_state.setText(f"live video: {why}")
@@ -250,6 +268,7 @@ class AnnouncerDialog(QDialog):
             what = "replaying a heat" if replaying else "on the capture card"
             self.video_state.setText(f"live video ({what}): " + (
                 f"{s.get('fps')} fps a pilot · {s.get('dropped')} % of frames dropped · {s.get('delay_ms')} ms behind"
+                + (f" · {live.get('procs')} processes" if (live.get("procs") or 1) > 1 else "")
                 if s.get("racing") else "waiting for the race to start" if live.get("ready") else "loading…"))
         elif not self.video.isChecked():
             self.video_state.setText("")

@@ -597,7 +597,8 @@ class Main(QMainWindow):
         if not self.event_day or not isinstance(self.event_day.event, trackside.Event):
             return "open the FPVTrackside event first"
         why = start_live(self.live, self.announcer, self.event_day.event, self.event_day.tp,
-                         int(st.get("live_video_device") or 0), float(st.get("live_video_fps") or 15))
+                         int(st.get("live_video_device") or 0), float(st.get("live_video_fps") or 15),
+                         int(st.get("live_video_procs") or 1), bool(st.get("live_video_keep")))
         if why:
             self._log(f"live video: {why}")
         return why
@@ -618,7 +619,9 @@ class Main(QMainWindow):
             return "pick a heat on the FPVTrackside screen first"
         self.live.stop()
         self.replay = HeatReplay(self.announcer, self.live, str(self.event_day.event.dir), hid,
-                                 float(_app_settings().get("live_video_fps") or 15), self._log)
+                                 float(_app_settings().get("live_video_fps") or 15), self._log,
+                                 int(_app_settings().get("live_video_procs") or 1),
+                                 bool(_app_settings().get("live_video_keep")))
         why = self.replay.start()
         if why:
             self.replay = None

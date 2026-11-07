@@ -54,7 +54,8 @@ def _model() -> str:
     return str(m or DEFAULT_DET_MODEL)
 
 
-def start_live(live: LiveVideo, announcer, event, tp: TrackPaths, device: int, fps: float = FPS) -> Optional[str]:
+def start_live(live: LiveVideo, announcer, event, tp: TrackPaths, device: int, fps: float = FPS,
+               procs: int = 1, keep: bool = False) -> Optional[str]:
     """The live video on capture device `device` for this event. None, or why it can't start."""
     n, lap, legs = track_of(tp)
     if not n or not tp.gate_memory.exists():
@@ -64,13 +65,21 @@ def start_live(live: LiveVideo, announcer, event, tp: TrackPaths, device: int, f
         return "no heat of this event has recorded the 2×2 layout yet"
     announcer.set_track(n, lap, legs)
     live.start(device, rects, _model(), str(tp.gate_memory), str(tp.learned_timing), fps=fps,
-               racing=announcer.running)
+               racing=announcer.running, procs=procs, keep=_keep_dir(event) if keep else None)
     return None
+
+
+def _keep_dir(event) -> str:
+    """Where the live video keeps each race's detections for the heat analysis (race_day/livedets.py)."""
+    from race_day.livedets import SUBDIR
+    return str(TrackPaths(event.data_dir).dir / SUBDIR)
 
 
 class HeatReplay:
     def __init__(self, announcer, live: LiveVideo, event_dir: str, heat_id: str, fps: float = FPS,
-                 log: Callable[[str], None] = print):
+                 log: Callable[[str], None] = print, procs: int = 1, keep=False):
+        """keep: True — the race's detections kept for the heat analysis (live/<heat id>/); a folder — kept
+        there instead (race_day/live_test.py)."""
         from race_day import ftreplay
         self.announcer, self.live, self.log = announcer, live, log
         self.event = trackside.Event(event_dir)
@@ -81,7 +90,7 @@ class HeatReplay:
         from race_day.eventsetup import EventSetup
         setup = EventSetup(TrackPaths(self.event.data_dir).dir)
         self.tp = setup.layout_paths(setup.layout_of(self.heat))   # the heat's class's track layout
-        self.fps = fps
+        self.fps, self.procs, self.keep = fps, procs, keep
         self.video, self.clock = None, None       # the heat's 2×2 video and the replay's clock, once started
         self._stop = threading.Event()
         self.done = threading.Event()
@@ -101,7 +110,9 @@ class HeatReplay:
         self.announcer.set_track(n, lap, legs)
         self.video, self.clock = str(video), {"from": max(0.0, v0 - 5.0), "video": v0, "wall": t0}
         self.live.start(self.video, layout(self.event, h), _model(), str(self.tp.gate_memory), str(self.tp.learned_timing),
-                        fps=self.fps, clock=self.clock)
+                        fps=self.fps, clock=self.clock, procs=self.procs,
+                        keep=(self.keep if isinstance(self.keep, str) else
+                              str(Path(_keep_dir(self.event)) / h.id) if self.keep else None))
         threading.Thread(target=self._play, args=(t0,), daemon=True).start()
         return None
 
@@ -140,6 +151,8 @@ def main():
     ap.add_argument("--club", default=None)
     ap.add_argument("--track", default=None)
     ap.add_argument("--fps", type=float, default=FPS)
+    ap.add_argument("--procs", type=int, default=1, help="analysis processes, the pilots split between them")
+    ap.add_argument("--keep", action="store_true", help="keep the race's detections for the heat analysis")
     ap.add_argument("--speak", action="store_true", help="say the calls (default: print them only)")
     a = ap.parse_args()
     ann = Announcer(enabled=a.speak, club=a.club, track=a.track)
@@ -147,8 +160,8 @@ def main():
     stats = {}
 
     def on_video(e):
-        if e.get("type") == "stats":
-            stats.update(e)
+        if e.get("type") == "stats" and e.get("racing"):
+            stats[e.get("part")] = {k: e.get(k) for k in ("fps", "dropped", "delay_ms", "detector_ms")}
         elif e.get("type") == "gate" and e.get("gate"):
             print(f"   video  {e['channel']:4} G{e['gate']:<2} lap {e['laps']}  ({time.time() - e['t']:.2f} s late)")
         elif e.get("type") in ("error", "picture", "ready"):
@@ -157,7 +170,7 @@ def main():
 
     live = LiveVideo(on_video)
     ann.on_race = live.set_race
-    r = HeatReplay(ann, live, a.event_dir, a.heat_id, fps=a.fps)
+    r = HeatReplay(ann, live, a.event_dir, a.heat_id, fps=a.fps, procs=a.procs, keep=a.keep)
     why = r.start()
     if why:
         raise SystemExit(why)

@@ -358,11 +358,29 @@ Neural Engine → tracker → pass detector → CLIP → the live gate decoder
   video's lead and gap calls were right every time; "moves up to second" only about
   half the time, so it's off unless a club turns it on (`video_places: true`).
 - About 1.5 GB of memory (its own YOLO and CLIP).
+- **× processes** (1 to 6, at most one per pilot) splits the pilots between that many
+  analysis processes (2 with a 2×2: two pilots each), so it keeps up at a higher fps. With
+  more than one, one more process reads the card and shares each newest frame with them.
+  Each analysis process takes about 0.9 GB more. On an 8 GB M1: 1 or 2.
+- **Keep the detections for the heat analysis (test)** keeps each race's YOLO boxes
+  (`<event data>/live/`, `race_day/livedets.py`). The heat analysis after the race then
+  runs YOLO only for the frames the live video didn't analyse; everything else runs on
+  the recording as always. A live frame is used only if it's the same moment as the
+  recorded frame and its picture matches; the analysis first lines the live frames up
+  with the recording from a second of the race. The log says how many frames came from
+  the live video. Best at 30 fps (the analysis keeps 30 frames a second).
 - **▶ Replay the selected heat** plays the heat picked on the FPVTrackside screen to
   the announcer as if it were being raced — its video for the capture card, its
   crossings for FPVTrackside's events — to try it all at home. Nothing goes to fril.
   The same from the command line, printing the calls:
   `venv/bin/python -m race_day.heatreplay <event folder> <heat> --club <club> --track <track>`
+  (`--fps 30 --procs 2` to try a speed, `--keep` to keep the detections)
+- **A race-day rehearsal** to see how a Mac keeps up: `venv/bin/python -m race_day.live_test`
+  races 4 heats of the Race 1 Season 2027 event again, one every 4 minutes, with 1 and then 2
+  live processes. Each heat's analysis runs after its race, paused while the next one races,
+  using the kept detections. At the end every heat is also analysed the normal way to compare.
+  The results go to `live_test_results/<date>/results.md`; nothing is written to the event.
+  About 45 minutes; close FPVTrackside first.
   (add `--speak` to hear them). `race_day.ftreplay` plays only the crossings, through the
   app's port.
 

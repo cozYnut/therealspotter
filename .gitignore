@@ -19,3 +19,4 @@ gate_annotations/
 # a club's own announcer files stay on this computer (pilots' names); only the example is shared
 clubs/*
 !clubs/example/
+live_test_results/

@@ -29,6 +29,9 @@ one call instead.
   analyse_heat(video, runs, det_model, n_gates, device, clip_device, window=…)
       runs: [{"stem", "rect", "out_json", "log"}] — the pilots to analyse
       window: (start, end) in video seconds — the part to analyse (None: all)
+      live: the live video's kept detections (race_day/livedets.py), or None:
+            {"paths": {stem: npz}, "secs": [every frame's video s], "start_v": the race start (video s)}
+            — YOLO's boxes come from there for the frames the live video analysed
       → {stem: {"seconds", "device", "picture"} or {"error"}}
 
 Each pilot keeps its own log (<stem>.analysis.log) and its own result file; a
@@ -214,7 +217,8 @@ class PilotDetector:
 class Detector:
     """YOLO for every pilot's picture of every moment (see the module doc)."""
 
-    def __init__(self, model_path: str, device):
+    def __init__(self, model_path: str, device, live: Optional[dict] = None):
+        self.live = live or {}                   # pilot index → LiveDets
         from ultralytics import YOLO
         self.yolo = YOLO(model_path, task="detect")
         # what extract_race reads the class names from (det.model.names). A Core ML YOLO's .model is only its
@@ -247,7 +251,15 @@ class Detector:
                     break
                 grays = {i: no_picture(crops[i]) for i in live}
                 todo = [i for i in live if not feeds[i].idle(crops[i], grays[i], t)]
-                results = dict(zip(todo, self.detect([crops[i] for i in todo])))
+                results = {}
+                if self.live:                        # the live video's boxes, where it analysed this frame
+                    for i in todo:
+                        if i in self.live:
+                            r = self.live[i].lookup(t, crops[i])
+                            if r is not None:
+                                results[i] = r
+                rest = [i for i in todo if i not in results]
+                results.update(zip(rest, self.detect([crops[i] for i in rest])))
                 for i in live:
                     feeds[i].put((t, crops[i], grays[i], results.get(i, _NoBoxes())))
         except BaseException as e:               # every pilot gets the failure
@@ -330,7 +342,7 @@ class _PerThreadOutput:
 
 
 def analyse_heat(video: str, runs: List[dict], det_model: str, n_gates: int, device="mps",
-                 clip_device: str = "mps", blank_memory=None, window=None) -> Dict[str, dict]:
+                 clip_device: str = "mps", blank_memory=None, window=None, live: Optional[dict] = None) -> Dict[str, dict]:
     """Analyse the pilots `runs` of one video together (see the module doc).
     blank_memory(n_gates) → a gate memory file for one pilot (deleted after)."""
     from extract_race import run_race_extraction
@@ -346,8 +358,10 @@ def analyse_heat(video: str, runs: List[dict], det_model: str, n_gates: int, dev
     if times and len(times) != n_frames:            # the index and the decoder disagree: OpenCV reads it
         times = None
     i0, i1 = _kept(n_frames, times, src_fps, step, window)
+    dets = _live(video, runs, live, step) if live else {}   # the same frames are kept as without it: only those
+    dets.pop("_phase", None)                                 # the live video analysed too get its boxes
     feeds = [Feed(r["rect"], src_fps / step, (i1 - i0) // step + 1, step) for r in runs]
-    det = Detector(det_model, device)
+    det = Detector(det_model, device, dets)
     clip = SharedClip(clip_device)
     results: Dict[str, dict] = {}
     out, err = _PerThreadOutput(sys.stdout), _PerThreadOutput(sys.stderr)
@@ -380,6 +394,12 @@ def analyse_heat(video: str, runs: List[dict], det_model: str, n_gates: int, dev
             if mem:
                 os.unlink(mem)
 
+    def live_summary():
+        for i, r in enumerate(runs):
+            d = dets.get(i)
+            if d is not None and r["stem"] in results and "error" not in results[r["stem"]]:
+                results[r["stem"]]["live"] = {"hits": d.hits, "misses": d.misses}
+
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         threads = [threading.Thread(target=pilot, args=(r, f), daemon=True) for r, f in zip(runs, feeds)]
         threads.append(threading.Thread(target=det.run, args=(moments, feeds, stopped), daemon=True))
@@ -390,4 +410,25 @@ def analyse_heat(video: str, runs: List[dict], det_model: str, n_gates: int, dev
         finally:
             for th in threads:
                 th.join()
+    live_summary()
     return results
+
+
+def _live(video: str, runs: List[dict], live: dict, step: int) -> dict:
+    """{pilot index: LiveDets, "_phase": phase}; {} when nothing matches."""
+    from race_day.livedets import LiveDets, calibrate
+    dets = {}
+    for i, r in enumerate(runs):
+        p = (live.get("paths") or {}).get(r["stem"])
+        if p and os.path.exists(p):
+            try:
+                dets[i] = LiveDets(p)
+            except Exception as e:                # noqa: BLE001 — a bad file: YOLO for that pilot
+                print(f"live detections {p}: {e}")
+    if not dets:
+        return {}
+    phase = calibrate(video, [r["rect"] for r in runs], dets, np.asarray(live["secs"], float),
+                      float(live["start_v"]), step)
+    if phase is None:
+        return {}
+    return {**dets, "_phase": phase}

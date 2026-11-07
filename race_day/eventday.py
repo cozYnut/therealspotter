@@ -723,13 +723,40 @@ class EventDay:
                 tp = self.layout_tp(lay)
                 runs = [{"stem": h.stem(q.channel), "rect": q.rect, "out_json": tp.race_data(h.stem(q.channel))}
                         for q in quads]
-                fut = self.pool.submit_heat(video, runs, self._n_gates(lay), self._race_window(h, quads[0].video))
+                live = self._live_dets(h, quads, runs)
+                fut = self.pool.submit_heat(video, runs, self._n_gates(lay), self._race_window(h, quads[0].video), live)
                 for q in quads:
                     stem = h.stem(q.channel)
                     self.jobs[f"a:{stem}"] = ("analyse", h.id, fut, {"stem": stem, "channel": q.channel})
                     hs.setdefault("runs", {})[q.channel] = {"stem": stem, "status": "analysing", "kind": q.kind}
                     if hs.get("status") in (None, "new"):
                         hs["status"] = "analysing"
+
+    def _live_dets(self, h, quads, runs) -> Optional[dict]:
+        """The live video's detections kept for this heat's pilots (race_day/livedets.py), for the analysis to
+        use in place of running YOLO where it can; None without them."""
+        from race_day import livedets
+        if not isinstance(self.event, trackside.Event) or not h.start or not h.end:
+            return None
+        folder = self.tp.dir / livedets.SUBDIR
+        if not folder.is_dir():
+            return None
+        paths = {}
+        for q, r in zip(quads, runs):         # a replay of this heat (its own folder), else the race by its time
+            p = (livedets.find(folder / h.id, q.channel, 0, float("inf")) if (folder / h.id).is_dir()
+                 else livedets.find(folder, q.channel, float(h.start), float(h.end)))
+            if p:
+                paths[r["stem"]] = p
+        if not paths:
+            return None
+        try:
+            secs, _ = self.event.frame_times(quads[0].video)
+            start_v = float(self.event.to_video(quads[0].video, h.start))
+        except Exception:                          # noqa: BLE001 — no frame times: YOLO as usual
+            return None
+        self.log(f"heat {h.number}: the live video's detections for {len(paths)} pilot(s) — YOLO only where it "
+                 "has none")
+        return {"paths": paths, "secs": [float(x) for x in secs], "start_v": start_v}
 
     RACE_BEFORE_S, RACE_AFTER_S = 5.0, 30.0       # analysed around an FPVTrackside race (as the lap check looks)
 
@@ -768,6 +795,10 @@ class EventDay:
                     run.update(status="failed" if err else "analysed", error=err, analysis=res)
                     if err:
                         self.log(f"{info['stem']}: analysis failed — {err}")
+                    elif res.get("live"):
+                        lv = res["live"]
+                        self.log(f"{info['stem']}: analysed in {res.get('seconds')}s — YOLO from the live video for "
+                                 f"{lv['hits']} frames, run here for {lv['misses']}")
             if kind == "analyse":
                 self._after_analysis(hid)
             elif kind == "label":
