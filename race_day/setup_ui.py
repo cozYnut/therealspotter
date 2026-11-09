@@ -680,7 +680,8 @@ class BracketPanel(QWidget):
         return self.setup.data["made"]["stages"].get(self.cls["name"]) or {}
 
     def todo(self) -> List[dict]:
-        return [m for m in self.plan if m["main"] not in self.made()]
+        """Every main: "Create" always makes them all (again), like making the qualifying."""
+        return list(self.plan)
 
     def _fill(self):
         self.plan = self.setup.mains_plan(self.cls, self.seeded)
@@ -761,13 +762,32 @@ class BracketsDialog(QDialog):
 
     def _create(self):
         todo = [(p.cls, m) for p in self.panels for m in p.todo()]
+        old = {p.cls["name"]: dict(p.made()) for p in self.panels if p.made()}
+        again = (f"<br><br><b>Made again:</b> the {sum(len(v) for v in old.values())} Seeder stages made before "
+                 "are deleted and made anew, and the finals rounds start over from Finals 1 (the same rounds in "
+                 "FPVTrackside are filled again). Races already flown there stay — to start clean, delete the "
+                 "Finals rounds in FPVTrackside first.") if old else ""
         if not _confirm(self, "Create in FPVTrackside",
                         f"Make {len(todo)} Seeder stage{'s' if len(todo) != 1 else ''} in FPVTrackside, every class? "
                         "Then the first Finals round goes in: one race per main in turn.",
                         "<br>".join(f"{c['name']} {m['main']} main: " + ", ".join(p['name'] for p in m['pilots'])
-                                    for c, m in todo), "Create"):
+                                    for c, m in todo) + again, "Create"):
             return
         out = []
+        for name, made in old.items():                 # the brackets made before: out of the Seeder
+            for main, sid in made.items():
+                try:
+                    self.api._call("DELETE", f"/api/v1/stages/{sid}")
+                except ApiError as e:
+                    if getattr(e, "status", 0) != 404:
+                        out.append(f"{name} {main} main (made before): couldn't delete it — {e}")
+            self.setup.data["made"]["stages"][name] = {}
+        if old:                                        # the finals start over: Finals 1, its races placed again
+            self.setup.data["made"]["finals"] = {"races": {}, "next": 1}
+            fin = getattr(self.sdlg.day, "finals", None)
+            if fin:
+                fin._sent_hash = None
+            self.setup.save()
         for cls, m in todo:
             made = self.setup.data["made"]["stages"].setdefault(cls["name"], {})
             try:

@@ -303,7 +303,8 @@ class EventSetup:
             n = max(len(pilots), 1)
             return {"name": name, "format": "mains", "pilots": pilots, "seatChannels": chans, "autoSend": False,
                     "setup": {"mains": [main["main"]], "rounds": int(f["series_races"]),
-                              "pilotsPerRace": n, "pointsTable": list(range(n, 0, -1))}}
+                              # the Seeder takes it as place → points
+                              "pilotsPerRace": n, "pointsTable": {str(i): n + 1 - i for i in range(1, n + 1)}}}
         final = "chase-the-ace" if main["main"] == (f.get("chase_main") or "") else (f.get("final") or "single")
         setup = {"eliminationType": "double", "pilotsPerRace": int(f["per_race"]),
                  "pilotsToAdvance": int(f["advance"])}
