@@ -131,11 +131,12 @@ class FPVTrackside:
 
     def race_control(self) -> dict:
         """{state: none|ready|starting|running|finished, race: id or None,
-        next: id or None, elapsed: s}."""
+        next: id or None, elapsed: s, round/number: the selected race's round and race numbers}."""
         d = self._call("GET", "/api/v1/race-control") or {}
         cur, nxt = _key(d, "currentRace") or {}, _key(d, "nextRace") or {}
         return {"state": _key(d, "state", "none"), "race": (_key(cur, "id") or "").lower() or None,
-                "next": (_key(nxt, "id") or "").lower() or None, "elapsed": _key(d, "elapsedSeconds", 0.0)}
+                "next": (_key(nxt, "id") or "").lower() or None, "elapsed": _key(d, "elapsedSeconds", 0.0),
+                "round": _key(cur, "roundNumber"), "number": _key(cur, "raceNumber")}
 
     def laps(self, race_id: str) -> List[dict]:
         """Every lap of a race: [{detection, pilot, number, valid, race_time}]."""

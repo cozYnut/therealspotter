@@ -8,7 +8,10 @@ and every race to come (race_day/schedule.py), as one UpcomingRaces event:
 
   {"type": "UpcomingRaces", "ts": "…Z", "source": "lazy-spotter", "event": "…",
    "current": <race or null>,
-   "races": [<race>, …]}             the races to come, next first
+   "races": [<race>, …],             the races to come, next first
+   "start": {"at": "…Z", "paused", "round", "race"} or null}
+                                     FPVTrackside's Auto Runner counting down to that
+                                     race's start (GET /api/v1/app), or null
   race = {"label", "stage", "round", "race", "raceType",
           "pilots": [{"name", "channel": {"label", "band", "number",
                                           "frequency", "colorR", "colorG", "colorB"}}]}
@@ -76,10 +79,14 @@ def _race(r: dict) -> dict:
 def payload(schedule: dict) -> dict:
     """The UpcomingRaces event for a schedule (race_day/schedule.py)."""
     cur = schedule.get("current")
+    st = schedule.get("start")                   # FPVTrackside's Auto Runner, counting down to a race's start
+    start = {"at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(st["at"])) + f".{int(st['at'] % 1 * 1000):03d}Z",
+             "paused": bool(st.get("paused")), "round": st.get("round"), "race": st.get("race")} if st else None
     return {"type": "UpcomingRaces", "ts": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
             "source": "lazy-spotter", "event": schedule.get("event"),
             "current": _race(cur) if cur else None,
-            "races": [_race(r) for r in schedule.get("upcoming", [])[:MAX_RACES]]}
+            "races": [_race(r) for r in schedule.get("upcoming", [])[:MAX_RACES]],
+            "start": start}
 
 
 def _names(lst) -> list:

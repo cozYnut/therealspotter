@@ -551,7 +551,7 @@ class EventDay:
         """The API's level, whether FPVTrackside has this event open, and its
         race control (what's selected, whether it's running)."""
         from race_day import ftapi
-        st = {"level": "none", "serves": False, "race": None, "running": False, "error": None}
+        st = {"level": "none", "serves": False, "race": None, "running": False, "error": None, "start": None}
         if self.ft:
             try:
                 st["level"] = self.ft.level()
@@ -559,9 +559,26 @@ class EventDay:
                 if st["serves"]:
                     rc = self.ft.race_control()
                     st["race"], st["running"] = rc["race"], rc["state"] in ("starting", "running")
+                    st["start"] = self._start_clock(rc)
             except ftapi.ApiError as e:
                 st["error"] = str(e)
         self.ft_state = st
+
+    def _start_clock(self, rc: dict) -> Optional[dict]:
+        """FPVTrackside's Auto Runner counting down to the selected race's start (GET /api/v1/app:
+        autoRunnerState WaitingRaceStart, autoRunnerTimerSeconds = what its screen shows): {at (epoch s),
+        paused, round, race}, or None when it isn't counting. `at` only moves when it's off by more than 2 s,
+        so the same countdown isn't sent to fril again and again."""
+        app = self.ft.get("/app") or {}
+        if app.get("autoRunnerState") != "WaitingRaceStart" or not rc.get("race"):
+            self._start_at = None
+            return None
+        at = time.time() + float(app.get("autoRunnerTimerSeconds") or 0)
+        prev = getattr(self, "_start_at", None)
+        if prev is None or abs(at - prev) > 2:
+            self._start_at = prev = at
+        return {"at": prev, "paused": bool(app.get("autoRunnerPaused")),
+                "round": rc.get("round"), "race": rc.get("number")}
 
     def _fill_finals(self, force: bool = False):
         """The finals rounds in FPVTrackside (race_day/finals.py): the results of the races just flown to the
@@ -606,6 +623,8 @@ class EventDay:
         self._fill_finals(force=bool(r["new"] or r["changed"]))
         if self.fril:                                 # the running order on fril.co.il/live (sent on a change)
             sched = self.race_day()
+            if sched is not None:
+                sched = dict(sched, start=self.ft_state.get("start"))
             self.fril.update(sched)
             self._send_brackets(sched, force=bool(r["new"] or r["changed"]))
         if self.ft_state["running"]:                  # FPVTrackside's own race control says so
