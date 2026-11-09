@@ -43,6 +43,7 @@ from race_day.eventsetup import MAIN, EventSetup
 from race_day.models import DEFAULT_DET_MODEL
 
 REFRESH_S = 3.0            # look at the event folder (stat only) this often between races
+BRACKETS_S = 10.0         # the brackets on fril.co.il/live: the Seeder's mains looked at this often
 FINALS_S = 6.0            # the finals rounds: looked at this often between races (and as a race's file is saved)
 RACE_REFRESH_S = 5.0       # while a race runs: only to see it end
 DEFAULT_GATES = 10         # gate count used for analysis before the track is learned
@@ -103,6 +104,7 @@ class EventDay:
         self.ft_state = {"level": "none", "serves": False, "race": None, "running": False, "error": None}
         self.finals = None                                # race_day/finals.py: the finals rounds, filled after each race
         self._fin_at, self._fin_err = 0.0, None
+        self._brk_at, self._brk_err = 0.0, None
 
     # ── lifecycle ──────────────────────────────────────────────
 
@@ -579,12 +581,33 @@ class EventDay:
                 self.log(f"finals: {e}")
             self._fin_err = str(e)
 
+    def _send_brackets(self, sched: Optional[dict], force: bool = False):
+        """The finals' mains, as FPVTrackside's Seeder has them, to fril.co.il/live (race_day/fril.py):
+        looked at every BRACKETS_S, and as a race's file is saved; sent when something changed."""
+        from race_day import ftapi
+        from race_day.fril import brackets_payload
+        if not self.finals or not self.ft_state["serves"]:
+            return
+        if not force and _now() - self._brk_at < BRACKETS_S:
+            return
+        self._brk_at = _now()
+        try:
+            mains = [(c, m, self.ft.stage(sid)) for c, m, sid in self.finals.mains()]
+            self.fril.update_brackets(brackets_payload(mains, sched))
+            self._brk_err = None
+        except (ftapi.ApiError, ValueError, KeyError, TypeError) as e:
+            if str(e) != self._brk_err:
+                self.log(f"fril live: couldn't read the brackets — {e}")
+            self._brk_err = str(e)
+
     def _refresh(self):
         r = self.event.refresh()
         self._poll_fpvtrackside()
         self._fill_finals(force=bool(r["new"] or r["changed"]))
         if self.fril:                                 # the running order on fril.co.il/live (sent on a change)
-            self.fril.update(self.race_day())
+            sched = self.race_day()
+            self.fril.update(sched)
+            self._send_brackets(sched, force=bool(r["new"] or r["changed"]))
         if self.ft_state["running"]:                  # FPVTrackside's own race control says so
             r["running"] = r["running"] or self.ft_state["race"] or "fpvtrackside"
         what = "Recording" if self.mode == "capture" else "Race running in FPVTrackside"

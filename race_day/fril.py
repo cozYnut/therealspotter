@@ -15,14 +15,29 @@ and every race to come (race_day/schedule.py), as one UpcomingRaces event:
 
 It is sent whenever that changes (a race starts or ends, a race or a line-up
 changes in FPVTrackside) and again every RESEND_S, because fril keeps its live
-board in memory only and shows the list only while it is fresh. It carries
+board in memory only and shows the list only while it is fresh.
+
+Once the brackets are made, the finals' mains go the same way, as one
+Brackets event (brackets_payload): every main as FPVTrackside's Seeder has it
+(GET /api/v1/stages/{id}: its diagram, races and standings), with the race on
+now and the next one marked, so fril.co.il/live can draw them like the
+Seeder's page. fril keeps them until its board is reset; an empty list takes
+them back off.
+
+  {"type": "Brackets", "ts": "…Z", "source": "lazy-spotter", "event": "…",
+   "stages": [{"name", "className", "main", "format", "formatName", "layout",
+               "isComplete", "champion", "raceCount", "racesDone",
+               "races": [{"id", "round", "group", "title", "state", "live", "pilots", "winners"}],
+               "diagrams": [{"title", "nodes": [{"id", "column", "lane", "label",
+                             "seats": [{"name", "position", "advanced", "fromRace", "fromRank"}]}],
+                             "edges": [{"from", "to", "ranks"}]}],
+               "standings": [{"rank", "name", "detail", "tied"}]}]} It carries
 no "seq": that is FPVTrackside's, and fril uses it to notice FPVTrackside
 restarting. Sending runs on its own thread: a slow or unreachable fril never
 holds up the app.
 """
 
 import json
-import queue
 import threading
 import time
 import urllib.error
@@ -67,6 +82,48 @@ def payload(schedule: dict) -> dict:
             "races": [_race(r) for r in schedule.get("upcoming", [])[:MAX_RACES]]}
 
 
+def _names(lst) -> list:
+    return [p if isinstance(p, str) else (p or {}).get("name") for p in (lst or [])
+            if (p if isinstance(p, str) else (p or {}).get("name"))]
+
+
+def _stage(cls: str, main: str, st: dict, now_id: str, next_id: str) -> dict:
+    def live(r):
+        fid = (r.get("fpvRaceId") or "").lower()
+        return "now" if fid and fid == now_id else "next" if fid and fid == next_id else None
+    races = [{"id": r.get("id"), "round": r.get("round"), "group": r.get("group"), "title": r.get("title"),
+              "state": r.get("state"), "live": live(r), "pilots": _names(r.get("pilots")),
+              "winners": _names(r.get("winners"))} for r in st.get("races") or []]
+    diagrams = [{"title": d.get("title"),
+                 "nodes": [{"id": n.get("id"), "column": n.get("column"), "lane": n.get("lane"),
+                            "label": n.get("label"),
+                            "seats": [{"name": x.get("name"), "position": x.get("position"),
+                                       "advanced": bool(x.get("advanced")), "fromRace": x.get("fromRace"),
+                                       "fromRank": x.get("fromRank")} for x in n.get("seats") or []]}
+                           for n in d.get("nodes") or []],
+                 "edges": [{"from": e.get("from"), "to": e.get("to"), "ranks": e.get("ranks") or []}
+                           for e in d.get("edges") or []]} for d in st.get("diagrams") or []]
+    return {"name": st.get("name") or f"{cls} {main} main", "className": cls, "main": main,
+            "format": st.get("format"), "formatName": st.get("formatName"), "layout": st.get("layout"),
+            "isComplete": bool(st.get("isComplete")), "champion": st.get("champion"),
+            "raceCount": st.get("raceCount"), "racesDone": st.get("racesDone"),
+            "races": races, "diagrams": diagrams,
+            "standings": [{"rank": x.get("rank"), "name": x.get("name"), "detail": x.get("detail"),
+                           "tied": bool(x.get("tied"))} for x in st.get("standings") or [] if x.get("name")]}
+
+
+def brackets_payload(mains: list, schedule: Optional[dict]) -> dict:
+    """The Brackets event: mains = [(class, main, stage dict from GET /stages/{id})], in running order.
+    The schedule (race_day/schedule.py) says which FPVTrackside race is on now and which is next."""
+    schedule = schedule or {}
+    now_id = ((schedule.get("current") or {}).get("id") or "").lower()
+    nxt = (schedule.get("upcoming") or [None])[0] or {}
+    next_id = (nxt.get("id") or "").lower()
+    return {"type": "Brackets", "ts": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+            "source": "lazy-spotter", "event": schedule.get("event"),
+            "stages": [_stage(c, m, st, now_id, next_id) for c, m, st in mains if st]}
+
+
 def _key(p: dict) -> str:
     """What fril shows: everything but the send time."""
     return json.dumps({k: v for k, v in p.items() if k != "ts"}, sort_keys=True)
@@ -78,7 +135,10 @@ class FrilLive:
         self.last_ok: Optional[float] = None
         self.error: Optional[str] = None
         self._key, self._sent_at = None, 0.0
-        self._q: "queue.Queue" = queue.Queue(maxsize=1)
+        self._bkey, self._bsent_at = None, 0.0        # the brackets: what was last sent, when
+        self._pending: dict = {}                      # type → the newest event of that type to send
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
         threading.Thread(target=self._worker, daemon=True).start()
 
     def update(self, schedule: Optional[dict]):
@@ -91,35 +151,62 @@ class FrilLive:
         if key == self._key and time.time() - self._sent_at < RESEND_S:
             return
         self._key, self._sent_at = key, time.time()
-        try:                                     # only the newest list matters
-            self._q.get_nowait()
-        except queue.Empty:
-            pass
-        self._q.put_nowait(p)
+        self._put(p)
+
+    def update_brackets(self, p: Optional[dict]):
+        """Called with the Brackets event (brackets_payload) after each look at the Seeder: sends when it
+        changed, or when the last send is RESEND_S old. An empty list is sent once, to take them off fril."""
+        if p is None:
+            return
+        key = _key(p)
+        if not p["stages"] and self._bkey is None:
+            return                               # never sent any: nothing to take back
+        if key == self._bkey and time.time() - self._bsent_at < RESEND_S:
+            return
+        if not p["stages"] and key == self._bkey:
+            return                               # taken back already
+        self._bkey, self._bsent_at = key, time.time()
+        self._put(p)
+
+    def _put(self, p: dict):
+        with self._lock:                         # only the newest of each kind matters
+            self._pending[p["type"]] = p
+        self._wake.set()
 
     def _worker(self):
         while True:
-            p = self._q.get()
-            req = urllib.request.Request(self.url, data=json.dumps(p).encode(), method="PUT",
-                                         headers={"Content-Type": "application/json; charset=utf-8",
-                                                  "User-Agent": USER_AGENT})
-            try:
-                with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-                    r.read()
-                if self.error:
-                    self.log("fril live: sending again")
-                self.last_ok, self.error = time.time(), None
-            except urllib.error.HTTPError as e:
-                self._failed("the token was refused (HTTP 401)" if e.code == 401 else
-                             "blocked by fril's firewall (HTTP 403)" if e.code == 403 else f"HTTP {e.code}")
-            except (urllib.error.URLError, OSError) as e:
-                self._failed(str(getattr(e, "reason", e)))
+            self._wake.wait()
+            with self._lock:
+                todo, self._pending = list(self._pending.values()), {}
+                self._wake.clear()
+            for p in todo:
+                self._send(p)
 
-    def _failed(self, why: str):
+    def _send(self, p: dict):
+        req = urllib.request.Request(self.url, data=json.dumps(p).encode(), method="PUT",
+                                     headers={"Content-Type": "application/json; charset=utf-8",
+                                              "User-Agent": USER_AGENT})
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                r.read()
+            if self.error:
+                self.log("fril live: sending again")
+            self.last_ok, self.error = time.time(), None
+        except urllib.error.HTTPError as e:
+            self._failed(p, "the token was refused (HTTP 401)" if e.code == 401 else
+                         "blocked by fril's firewall (HTTP 403)" if e.code == 403 else f"HTTP {e.code}")
+        except (urllib.error.URLError, OSError) as e:
+            self._failed(p, str(getattr(e, "reason", e)))
+
+    def _failed(self, p: dict, why: str):
         if why != self.error:
-            self.log(f"fril live: couldn't send the next races — {why}")
+            what = "the brackets" if p["type"] == "Brackets" else "the next races"
+            self.log(f"fril live: couldn't send {what} — {why}")
         self.error = why
-        self._sent_at = time.time() - RESEND_S + RETRY_S      # try again in RETRY_S
+        if p["type"] == "Brackets":       # sent again at the next look at the Seeder (an empty list too)
+            self._bkey = ""
+        else:                             # try again in RETRY_S
+            self._sent_at = time.time() - RESEND_S + RETRY_S
 
     def status(self) -> dict:
         return {"url": self.url, "last_ok": self.last_ok, "error": self.error}

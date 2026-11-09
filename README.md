@@ -301,7 +301,11 @@ For an **FPVTrackside event** it also follows the race day, from FPVTrackside's 
 live ingest address with its token — the same one FPVTrackside's notifier sends to,
 `https://fril.co.il/api/live/ingest?token=…`. The app then sends the race on now and
 every race to come there (one `UpcomingRaces` event, `race_day/fril.py`) whenever that
-changes, and once a minute; fril.co.il/live shows them as **המרוצים הבאים**. The top bar
+changes, and once a minute; fril.co.il/live shows them as **המרוצים הבאים**. Once the
+brackets are made, it also sends the finals' mains (one `Brackets` event: each main as
+FPVTrackside's Seeder has it, read from <http://localhost:8080> every 10 s and as each race
+ends, with the race on now and the next one marked), and fril.co.il/live switches to its
+finals order: next up, then every main's bracket like the Seeder's page. The top bar
 says when it was last sent, or why it couldn't be.
 
 The race being run is never read from disk; its laps show when it ends — or live, if
