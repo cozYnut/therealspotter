@@ -298,9 +298,12 @@ class EventSetup:
         pilots = [p["name"] for p in main["pilots"]]
         name = f"{cls['name']} {main['main']} main"
         if main["kind"] == "series":
+            # every round is one race of the whole main, and its points come from the place in it:
+            # 1st = N, 2nd = N-1 … last = 1 (N = pilots in the race) — not the Seeder's default 25/18/15…
+            n = max(len(pilots), 1)
             return {"name": name, "format": "mains", "pilots": pilots, "seatChannels": chans, "autoSend": False,
                     "setup": {"mains": [main["main"]], "rounds": int(f["series_races"]),
-                              "pilotsPerRace": max(len(pilots), 1)}}
+                              "pilotsPerRace": n, "pointsTable": list(range(n, 0, -1))}}
         final = "chase-the-ace" if main["main"] == (f.get("chase_main") or "") else (f.get("final") or "single")
         setup = {"eliminationType": "double", "pilotsPerRace": int(f["per_race"]),
                  "pilotsToAdvance": int(f["advance"])}
