@@ -39,6 +39,7 @@ import os
 import queue
 import re
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
@@ -48,7 +49,9 @@ from xml.etree import ElementTree as ET
 
 from race_day.clubstyle import ClubStyle
 
-FT_HOME = Path.home() / "Documents" / "FPVTrackside"     # FPVTrackside's working folder on a Mac
+FT_HOME = Path.home() / "Documents" / "FPVTrackside"     # FPVTrackside's working folder on a Mac (on Windows its
+                                                         # Hello event names the real one: _hello)
+WINDOWS = sys.platform == "win32"
 P_START, P_LAP, P_PLACE, P_INFO, P_TALK = 0, 1, 2, 3, 4   # speaking order (talk: between races, race_day/talk.py)
 MAX_WAIT = {P_START: 6.0, P_LAP: 4.0, P_PLACE: 3.0, P_INFO: 10.0, P_TALK: 120.0}   # said this late at most
 STALE_S = 5.0            # an event older than this (FPVTrackside's own clock) is history, not news
@@ -130,9 +133,42 @@ def channel_label(ch) -> Optional[str]:
 
 
 # ── speaking ───────────────────────────────────────────────────
+#
+# On a Mac the lines are said with `say`. On Windows with Windows' own speech (SAPI, through PowerShell's
+# System.Speech): one PowerShell per line, the text on its input (no quoting), the voice and rate in its
+# environment. Stopping the process stops the voice mid-sentence, as with `say`.
+
+_WIN_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+_WIN_SPEAK = ("$ErrorActionPreference='SilentlyContinue';"
+              "[Console]::InputEncoding=[Text.Encoding]::UTF8;"
+              "Add-Type -AssemblyName System.Speech;"
+              "$s=New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+              "if($env:LS_VOICE){$s.SelectVoice($env:LS_VOICE)};"
+              "if($env:LS_RATE){$s.Rate=[int]$env:LS_RATE};"
+              "$s.Speak([Console]::In.ReadToEnd())")
+_WIN_VOICES = ("Add-Type -AssemblyName System.Speech;"
+               "(New-Object System.Speech.Synthesis.SpeechSynthesizer).GetInstalledVoices()|"
+               "%{$_.VoiceInfo.Name+'|'+$_.VoiceInfo.Culture.Name}")
+
+
+def _powershell(script: str) -> List[str]:
+    return ["powershell", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script]
+
+
+def _sapi_rate(wpm: Optional[int]) -> Optional[int]:
+    """`say`'s words a minute (about 180 normal) as SAPI's rate, -10 … 10 (0 normal)."""
+    return None if not wpm else max(-10, min(10, round((wpm - 180) / 20)))
+
 
 def english_voices() -> List[str]:
-    """The Mac's English voices, as `say -v ?` lists them."""
+    """The English voices: the Mac's, as `say -v ?` lists them; Windows', as its speech lists them."""
+    if WINDOWS:
+        try:
+            out = subprocess.run(_powershell(_WIN_VOICES), capture_output=True, text=True, timeout=20,
+                                 creationflags=_WIN_NO_WINDOW).stdout
+        except (OSError, subprocess.SubprocessError):
+            return []
+        return [n.strip() for n, _, c in (l.partition("|") for l in out.splitlines()) if c.lower().startswith("en")]
     try:
         out = subprocess.run(["say", "-v", "?"], capture_output=True, text=True, timeout=10).stdout
     except (OSError, subprocess.SubprocessError):
@@ -209,11 +245,20 @@ class Speaker:
                 rate = self.rate or (180 if rate_x != 1.0 else None)
                 if rate and rate_x != 1.0:
                     rate = int(rate * rate_x)
-                cmd = ["say"] + (["-v", self.voice] if self.voice else []) + (["-r", str(rate)] if rate else [])
                 self.speaking, self.last = True, text
                 try:
                     self._prio = prio
-                    self._proc = subprocess.Popen(cmd + [text])
+                    if WINDOWS:
+                        env = dict(os.environ, LS_VOICE=self.voice or "", LS_RATE=str(_sapi_rate(rate) or ""))
+                        self._proc = subprocess.Popen(_powershell(_WIN_SPEAK), stdin=subprocess.PIPE, env=env,
+                                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                                      creationflags=_WIN_NO_WINDOW)
+                        self._proc.stdin.write(text.encode("utf-8"))
+                        self._proc.stdin.close()
+                    else:
+                        cmd = ["say"] + (["-v", self.voice] if self.voice else []) + \
+                            (["-r", str(rate)] if rate else [])
+                        self._proc = subprocess.Popen(cmd + [text])
                     self._proc.wait(timeout=60)
                 except (OSError, subprocess.SubprocessError):
                     if self._proc and self._proc.poll() is None:
@@ -333,6 +378,13 @@ _VOL = re.compile(r"(<TextToSpeechVolume>)(\d+)(</TextToSpeechVolume>)")
 
 
 def ft_running() -> bool:
+    if WINDOWS:                                  # FPVTrackside's .exe in the task list
+        try:
+            out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, timeout=10,
+                                 creationflags=_WIN_NO_WINDOW).stdout
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return "fpvtrackside" in out.lower()
     return subprocess.run(["pgrep", "-f", "FPVTrackside.app/Contents/MacOS"], capture_output=True).returncode == 0
 
 
@@ -434,7 +486,11 @@ class Announcer:
             return
         path = Path(f) if os.path.isabs(f) else FT_HOME / f
         if path.exists():
-            subprocess.Popen(["afplay", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if WINDOWS:                              # Windows' own player, for FPVTrackside's .wav sounds
+                import winsound
+                winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC)
+            else:
+                subprocess.Popen(["afplay", str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def test(self):
         self.speaker.say(self.style.line("lap_lead", pilot="Pennz", lap=2, time=self.style.lap_time(21.96))

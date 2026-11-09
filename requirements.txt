@@ -1,20 +1,11 @@
-# Core vision + ML
+# Lazy Spotter for Windows: event management and the announcer, without the video analysis.
+#   py -m venv venv
+#   venv\Scripts\pip install -r requirements.txt
+#
+# The video analysis (YOLO, CLIP: ultralytics, torch, torchvision, open-clip-torch, Pillow) is left out on
+# purpose: the app starts and runs without it. The announcer's mid-lap positions and "Analyse" need it.
+
 numpy
 opencv-python
-ultralytics
-Pillow
-
-# PyTorch — install the right build for your hardware FIRST, then pip install -r requirements.txt
-#   Apple MPS:  pip install torch torchvision          (MPS included on macOS ≥ 12)
-#   CPU only:   pip install torch torchvision
-#   CUDA:       pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-torch
-torchvision
-
-# CLIP embeddings (gate pictures: tracking.ClipEmbedder)
-open-clip-torch
-
-# The desktop app (lazy_spotter_v2.py)
 PyQt6
-
-# The dataset / YOLO tools (gate_annotator …) moved to the FPV_YOLO_tool repo
+PyYAML

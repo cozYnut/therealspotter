@@ -34,7 +34,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
-DEFAULT_DATA_ROOT = "/Users/eyalcozac/Codes and apps/FPVdatasets"
+import sys
+
+# The data folder when FPV_DATA_ROOT and local_config.json don't name one. On Windows: Documents\FPVdatasets.
+DEFAULT_DATA_ROOT = (str(Path.home() / "Documents" / "FPVdatasets") if sys.platform == "win32"
+                     else "/Users/eyalcozac/Codes and apps/FPVdatasets")
 VIDEO_FILTER = "Video Files (*.mp4 *.avi *.mov *.mkv *.MP4 *.MOV)"
 SIM_DIR = "velocidrone"
 TRAINING_DIR = "training"

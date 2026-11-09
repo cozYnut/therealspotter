@@ -10,6 +10,44 @@ version: https://www.youtube.com/watch?v=6A2gmpzc6iU
 
 ---
 
+## This branch: Windows (event management and the announcer)
+
+This is the `windows` branch. It runs the event side on a Windows laptop next to
+FPVTrackside:
+
+- the setup: qualifying, brackets, the finals rounds filling by themselves, places and points;
+- the announcer, with Windows' own voices (Settings → Time & language → Speech adds more);
+- fril.co.il/live: the next races, the brackets, the start countdown, FPVTrackside's events passed on.
+
+**Not on this branch:** the video analysis (YOLO, CLIP) and the announcer's mid-lap
+positions, which need it. Their packages aren't installed, so leave *Analyse* and the
+live video off.
+
+**Install** (Python 3.11 or newer from python.org, "Add to PATH" ticked):
+
+```
+git clone -b windows https://github.com/cozYnut/therealspotter.git
+cd therealspotter
+py -m venv venv
+venv\Scripts\pip install -r requirements.txt
+```
+
+**Run:** `venv\Scripts\python lazy_spotter_v2.py` · **Update:** `git pull`
+
+**Once on the laptop:**
+- **The club:** a club's own folder (pilots, the announcer's lines, seasons, tracks) isn't in
+  git. Copy it into `clubs\` by hand, e.g. `clubs\fril\` with its `club.yaml`; `clubs\example\`
+  shows the layout.
+- **The data folder:** the app asks for one on the first start (`Documents\FPVdatasets` by default).
+- **FPVTrackside 2.79 or newer:**
+  - its web server on (*Application Settings → Web → Auto start HTTP Server*, port 8080);
+  - its notifier pointing at the app (*Notifier = ExtensionMode*, *NotificationURL* as the app's
+    announcer settings show).
+- **fril live…:** fril's ingest address with its token. It's kept in the laptop's own settings
+  file, never in the code.
+
+---
+
 ## Install
 
 ```bash
